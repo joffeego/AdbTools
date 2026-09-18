@@ -1,0 +1,1970 @@
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
+
+#include "core/render/text.h"
+#include "core/render/render_backend.h"
+
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <initializer_list>
+#include <memory>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace core {
+
+namespace {
+
+constexpr const char* kDefaultUiFontFile = "JingNanJunJunTi-JinNanJunJunTi-Bold-2.ttf";
+constexpr const char* kDefaultIconFontFile = "Font Awesome 7 Free-Solid-900.otf";
+constexpr int kGrayAtlasSize = 2048;
+constexpr int kColorAtlasSize = 1024;
+constexpr FT_Int32 kGlyphLoadFlags = FT_LOAD_DEFAULT | FT_LOAD_COLOR | FT_LOAD_NO_SVG | FT_LOAD_TARGET_LIGHT;
+
+struct FontFace {
+    std::string path;
+    FT_Face face = nullptr;
+    float size = 16.0f;
+    float ascent = 0.0f;
+    float descent = 0.0f;
+    float lineGap = 0.0f;
+    float glyphScale = 1.0f;
+    bool colored = false;
+
+    FontFace() = default;
+    FontFace(const FontFace&) = delete;
+    FontFace& operator=(const FontFace&) = delete;
+
+    FontFace(FontFace&& other) noexcept {
+        *this = std::move(other);
+    }
+
+    FontFace& operator=(FontFace&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        if (face) {
+            FT_Done_Face(face);
+        }
+        path = std::move(other.path);
+        face = other.face;
+        size = other.size;
+        ascent = other.ascent;
+        descent = other.descent;
+        lineGap = other.lineGap;
+        glyphScale = other.glyphScale;
+        colored = other.colored;
+        other.face = nullptr;
+        return *this;
+    }
+
+    ~FontFace() {
+        if (face) {
+            FT_Done_Face(face);
+        }
+    }
+};
+
+struct FontInfoHolder {
+    std::vector<FontFace> faces;
+    std::vector<std::string> lazyFallbackPaths;
+};
+
+constexpr std::size_t kFontStackCacheCapacity = 16;
+constexpr std::size_t kTextSizeCacheCapacity = 1024;
+
+struct FontStackCacheEntry {
+    std::shared_ptr<FontInfoHolder> holder;
+    std::uint64_t lastUsed = 0;
+};
+
+struct FontStackCache {
+    std::unordered_map<std::string, FontStackCacheEntry> entries;
+    std::uint64_t accessTick = 0;
+};
+
+FontStackCache& sharedFontStackCache() {
+    static FontStackCache cache;
+    return cache;
+}
+
+struct TextSizeCacheKey {
+    std::string text;
+    std::string fontFamily;
+    float fontSize = 0.0f;
+    float maxWidth = 0.0f;
+    float lineHeight = 0.0f;
+    int fontWeight = 0;
+    bool wrap = false;
+
+    bool operator==(const TextSizeCacheKey& other) const {
+        return text == other.text &&
+               fontFamily == other.fontFamily &&
+               fontSize == other.fontSize &&
+               maxWidth == other.maxWidth &&
+               lineHeight == other.lineHeight &&
+               fontWeight == other.fontWeight &&
+               wrap == other.wrap;
+    }
+};
+
+struct TextSizeCacheKeyHash {
+    std::size_t operator()(const TextSizeCacheKey& key) const {
+        std::size_t value = std::hash<std::string>{}(key.text);
+        const auto combine = [&](std::size_t part) {
+            value ^= part + 0x9e3779b9u + (value << 6u) + (value >> 2u);
+        };
+        combine(std::hash<std::string>{}(key.fontFamily));
+        combine(std::hash<float>{}(key.fontSize));
+        combine(std::hash<float>{}(key.maxWidth));
+        combine(std::hash<float>{}(key.lineHeight));
+        combine(std::hash<int>{}(key.fontWeight));
+        combine(std::hash<bool>{}(key.wrap));
+        return value;
+    }
+};
+
+struct TextSizeCacheEntry {
+    Vec2 size;
+    std::uint64_t lastUsed = 0;
+};
+
+struct TextSizeCache {
+    std::unordered_map<TextSizeCacheKey, TextSizeCacheEntry, TextSizeCacheKeyHash> entries;
+    std::uint64_t accessTick = 0;
+};
+
+TextSizeCache& sharedTextSizeCache() {
+    static TextSizeCache cache;
+    return cache;
+}
+
+void clearSharedFontStackCache() {
+    FontStackCache& cache = sharedFontStackCache();
+    cache.entries.clear();
+    cache.accessTick = 0;
+
+    TextSizeCache& sizeCache = sharedTextSizeCache();
+    sizeCache.entries.clear();
+    sizeCache.accessTick = 0;
+}
+
+struct AtlasPage {
+    int width = 0;
+    int height = 0;
+    int channels = 1;
+    int x = 1;
+    int y = 1;
+    int rowHeight = 0;
+    std::uint64_t generation = 0;
+    std::vector<unsigned char> pixels;
+    std::unordered_map<std::string, TextPrimitive::Glyph> glyphs;
+};
+
+struct SharedTextAtlas {
+    AtlasPage gray;
+    AtlasPage color;
+    int references = 0;
+};
+
+unsigned int readUtf8Codepoint(const std::string& text, size_t& index);
+
+FT_Library sharedFreeTypeLibrary() {
+    static FT_Library library = [] {
+        FT_Library created = nullptr;
+        return FT_Init_FreeType(&created) == 0 ? created : nullptr;
+    }();
+    return library;
+}
+
+SharedTextAtlas& sharedTextAtlas() {
+    static SharedTextAtlas atlas;
+    return atlas;
+}
+
+std::uint64_t& textAtlasGenerationCounter() {
+    static std::uint64_t generation = 0;
+    return generation;
+}
+
+std::uint64_t& defaultFontGenerationCounter() {
+    static std::uint64_t generation = 0;
+    return generation;
+}
+
+bool ensureAtlasPage(AtlasPage& page, int width, int height, int channels) {
+    if (!page.pixels.empty()) {
+        return true;
+    }
+
+    page.width = width;
+    page.height = height;
+    page.channels = channels;
+    page.x = 1;
+    page.y = 1;
+    page.rowHeight = 0;
+    page.generation = ++textAtlasGenerationCounter();
+    page.pixels.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * static_cast<std::size_t>(channels), 0);
+    return !page.pixels.empty();
+}
+
+bool retainSharedTextAtlas() {
+    SharedTextAtlas& atlas = sharedTextAtlas();
+    ++atlas.references;
+    if (ensureAtlasPage(atlas.gray, kGrayAtlasSize, kGrayAtlasSize, 1)) {
+        return true;
+    }
+    atlas.references = std::max(0, atlas.references - 1);
+    return false;
+}
+
+void releaseAtlasPage(AtlasPage& page) {
+    page = {};
+}
+
+void releaseSharedTextAtlas() {
+    SharedTextAtlas& atlas = sharedTextAtlas();
+    atlas.references = std::max(0, atlas.references - 1);
+    if (atlas.references > 0) {
+        return;
+    }
+
+    releaseAtlasPage(atlas.gray);
+    releaseAtlasPage(atlas.color);
+}
+
+std::uint64_t makeGlyphKey(size_t faceIndex, unsigned int glyphIndex) {
+    return ((static_cast<std::uint64_t>(faceIndex) + 1ULL) << 32) | static_cast<std::uint64_t>(glyphIndex);
+}
+
+size_t faceIndexFromGlyphKey(std::uint64_t key) {
+    return static_cast<size_t>((key >> 32) - 1ULL);
+}
+
+unsigned int glyphIndexFromGlyphKey(std::uint64_t key) {
+    return static_cast<unsigned int>(key & 0xffffffffULL);
+}
+
+std::string glyphCacheKey(const FontFace& face, float fontSize, unsigned int glyphIndex, bool colored) {
+    return face.path + "#" +
+           std::to_string(static_cast<int>(std::round(fontSize * 64.0f))) + "#" +
+           (colored ? "color#" : "gray#") +
+           std::to_string(glyphIndex);
+}
+
+std::string existingPath(const std::filesystem::path& path) {
+    std::error_code error;
+    if (std::filesystem::exists(path, error)) {
+        return path.string();
+    }
+    return {};
+}
+
+std::string firstExistingPath(std::initializer_list<const char*> paths) {
+    for (const char* path : paths) {
+        if (path == nullptr || path[0] == '\0') {
+            continue;
+        }
+        if (const std::string existing = existingPath(path); !existing.empty()) {
+            return existing;
+        }
+    }
+    return {};
+}
+
+std::string& defaultUiFontFileOverride() {
+    static std::string value;
+    return value;
+}
+
+std::string& defaultIconFontFileOverride() {
+    static std::string value;
+    return value;
+}
+
+std::string resolveFontFilePath(const std::string& path);
+
+std::string resolveSystemUiFontPath() {
+#ifdef _WIN32
+    return firstExistingPath({
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/arial.ttf"
+    });
+#elif defined(__APPLE__)
+    return firstExistingPath({
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf"
+    });
+#else
+    return firstExistingPath({
+        // Debian / Ubuntu layout
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        // Fedora / RHEL family (static packages)
+        "/usr/share/fonts/google-noto-sans/NotoSans-Regular.ttf",
+        "/usr/share/fonts/google-noto-sans-fonts/NotoSans-Regular.ttf",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-sans-cjk/NotoSansCJK-Regular.ttc",
+        // Fedora 38+ variable-font packages
+        "/usr/share/fonts/google-noto-vf/NotoSans[wght].ttf",
+        "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf"
+    });
+#endif
+}
+
+std::string resolveSystemIconFontPath() {
+#ifdef _WIN32
+    return firstExistingPath({
+        "C:/Windows/Fonts/seguisym.ttf",
+        "C:/Windows/Fonts/SegMDL2.ttf",
+        "C:/Windows/Fonts/seguiemj.ttf",
+        "C:/Windows/Fonts/segoeui.ttf"
+    });
+#elif defined(__APPLE__)
+    return firstExistingPath({
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Helvetica.ttc"
+    });
+#else
+    return firstExistingPath({
+        // Debian / Ubuntu layout
+        "/usr/share/fonts/fontawesome/fa-solid-900.ttf",
+        "/usr/share/fonts/TTF/fa-solid-900.ttf",
+        "/usr/share/fonts/truetype/font-awesome/fa-solid-900.ttf",
+        "/usr/share/fonts/opentype/font-awesome/Font Awesome 6 Free-Solid-900.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        // Fedora / RHEL family (static packages)
+        "/usr/share/fonts/google-noto-sans-symbols2/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/google-noto-sans-symbols-fonts/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/google-noto-sans-symbols/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        // Fedora 38+ variable-font packages
+        "/usr/share/fonts/google-noto-vf/NotoSansSymbols[wght].ttf"
+    });
+#endif
+}
+
+std::string resolveSystemEmojiFontPath() {
+#ifdef _WIN32
+    return firstExistingPath({
+        "C:/Windows/Fonts/seguiemj.ttf",
+        "C:/Windows/Fonts/seguisym.ttf"
+    });
+#elif defined(__APPLE__)
+    return firstExistingPath({
+        "/System/Library/Fonts/Apple Color Emoji.ttc"
+    });
+#else
+    return firstExistingPath({
+        // Debian / Ubuntu layout
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/google-noto/NotoColorEmoji.ttf",
+        // Fedora / RHEL family
+        "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
+        "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf"
+    });
+#endif
+}
+
+std::string resolveSystemMonospaceFontPath() {
+#ifdef _WIN32
+    return firstExistingPath({
+        "C:/Windows/Fonts/CascadiaMono.ttf",
+        "C:/Windows/Fonts/CascadiaCode.ttf",
+        "C:/Windows/Fonts/consola.ttf",
+        "C:/Windows/Fonts/cour.ttf"
+    });
+#elif defined(__APPLE__)
+    return firstExistingPath({
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/System/Library/Fonts/Supplemental/Menlo.ttc",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.ttf"
+    });
+#else
+    return firstExistingPath({
+        // Debian / Ubuntu layout
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/TTF/Hack-Regular.ttf",
+        // Fedora / RHEL family (static packages)
+        "/usr/share/fonts/google-noto-sans-mono/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/google-noto-sans-mono-fonts/NotoSansMono-Regular.ttf",
+        // Fedora 38+ variable-font packages
+        "/usr/share/fonts/google-noto-vf/NotoSansMono[wght].ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/liberation-mono-fonts/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/source-foundry-hack-fonts/Hack-Regular.ttf"
+    });
+#endif
+}
+
+std::filesystem::path executableDirectory() {
+#ifdef _WIN32
+    std::vector<char> buffer(MAX_PATH);
+    DWORD length = 0;
+    while (true) {
+        length = GetModuleFileNameA(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            return {};
+        }
+        if (length < buffer.size() - 1) {
+            break;
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+    return std::filesystem::path(buffer.data()).parent_path();
+#elif defined(__APPLE__)
+    std::vector<char> buffer(4096);
+    uint32_t size = static_cast<uint32_t>(buffer.size());
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        buffer.resize(size);
+        if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+            return {};
+        }
+    }
+    std::error_code error;
+    return std::filesystem::absolute(std::filesystem::path(buffer.data()), error).parent_path();
+#elif defined(__linux__)
+    std::vector<char> buffer(4096);
+    const ssize_t length = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+    if (length <= 0) {
+        return {};
+    }
+    buffer[static_cast<size_t>(length)] = '\0';
+    std::error_code error;
+    return std::filesystem::absolute(std::filesystem::path(buffer.data()), error).parent_path();
+#else
+    return {};
+#endif
+}
+
+std::string resolveProjectAssetPath(const std::string& filename) {
+    const std::filesystem::path exeDir = executableDirectory();
+    const std::filesystem::path candidates[] = {
+        exeDir / "assets" / filename,
+        std::filesystem::path("assets") / filename,
+        std::filesystem::path("..") / "assets" / filename,
+        std::filesystem::path("..") / ".." / "assets" / filename
+    };
+
+    for (const auto& candidate : candidates) {
+        if (const std::string path = existingPath(candidate); !path.empty()) {
+            return path;
+        }
+    }
+    return {};
+}
+
+std::string resolveDefaultUiFontPath() {
+    const std::string& override = defaultUiFontFileOverride();
+    const std::string path = override.empty() ? resolveProjectAssetPath(kDefaultUiFontFile) : resolveFontFilePath(override);
+    if (const std::string existing = existingPath(path); !existing.empty()) {
+        return existing;
+    }
+    return resolveSystemUiFontPath();
+}
+
+std::string resolveDefaultIconFontPath() {
+    const std::string& override = defaultIconFontFileOverride();
+    const std::string path = override.empty() ? resolveProjectAssetPath(kDefaultIconFontFile) : resolveFontFilePath(override);
+    if (const std::string existing = existingPath(path); !existing.empty()) {
+        return existing;
+    }
+    return resolveSystemIconFontPath();
+}
+
+std::string resolveFontFilePath(const std::string& path) {
+    const std::filesystem::path raw(path);
+    if (const std::string existing = existingPath(raw); !existing.empty()) {
+        return existing;
+    }
+
+    const std::filesystem::path exeDir = executableDirectory();
+    const std::filesystem::path candidates[] = {
+        exeDir / "assets" / raw.filename(),
+        exeDir / raw,
+        std::filesystem::path("assets") / raw.filename(),
+        std::filesystem::path("..") / "assets" / raw.filename(),
+        std::filesystem::path("..") / ".." / "assets" / raw.filename()
+    };
+
+    for (const auto& candidate : candidates) {
+        if (const std::string existing = existingPath(candidate); !existing.empty()) {
+            return existing;
+        }
+    }
+    return path;
+}
+
+bool isEmojiFontPath(const std::string& path) {
+    const std::string filename = std::filesystem::path(path).filename().string();
+    return filename.find("Emoji") != std::string::npos ||
+           filename.find("emoji") != std::string::npos ||
+           filename.find("seguiemj") != std::string::npos;
+}
+
+bool loadFontFace(const std::string& path, float fontSize, FontFace& face) {
+    FT_Library library = sharedFreeTypeLibrary();
+    if (!library) {
+        return false;
+    }
+
+    FT_Face loadedFace = nullptr;
+    if (FT_New_Face(library, path.c_str(), 0, &loadedFace) != 0 || !loadedFace) {
+        return false;
+    }
+
+    const bool emojiFont = isEmojiFontPath(path);
+    float pixelHeightScale = 1.0f;
+    if (loadedFace->units_per_EM > 0 && loadedFace->ascender != loadedFace->descender) {
+        const float designHeight = static_cast<float>(loadedFace->ascender - loadedFace->descender);
+        pixelHeightScale = static_cast<float>(loadedFace->units_per_EM) / designHeight;
+    }
+    const float scaledFontSize = std::max(1.0f, fontSize * pixelHeightScale);
+
+    FT_Error sizeError = 1;
+    float glyphScale = 1.0f;
+    if ((emojiFont || FT_HAS_COLOR(loadedFace)) && loadedFace->num_fixed_sizes > 0) {
+        const float targetPpem = scaledFontSize * 64.0f;
+        int bestStrike = 0;
+        float bestDistance = std::numeric_limits<float>::max();
+        for (int i = 0; i < loadedFace->num_fixed_sizes; ++i) {
+            const float strikePpem = static_cast<float>(loadedFace->available_sizes[i].y_ppem);
+            const float distance = std::fabs(strikePpem - targetPpem);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestStrike = i;
+            }
+        }
+        sizeError = FT_Select_Size(loadedFace, bestStrike);
+        const float strikePpem = static_cast<float>(loadedFace->available_sizes[bestStrike].y_ppem) / 64.0f;
+        if (strikePpem > 0.0f) {
+            glyphScale = fontSize / strikePpem;
+        }
+    }
+    if (sizeError != 0) {
+        sizeError = FT_Set_Char_Size(
+            loadedFace,
+            0,
+            static_cast<FT_F26Dot6>(std::lround(scaledFontSize * 64.0f)),
+            72,
+            72);
+        if (sizeError != 0) {
+            const FT_UInt pixelSize = static_cast<FT_UInt>(std::max(1.0f, std::round(scaledFontSize)));
+            sizeError = FT_Set_Pixel_Sizes(loadedFace, 0, pixelSize);
+        }
+    }
+    if (sizeError != 0) {
+        FT_Done_Face(loadedFace);
+        return false;
+    }
+
+    face.path = path;
+    face.face = loadedFace;
+    face.size = fontSize;
+    face.glyphScale = glyphScale;
+    face.colored = emojiFont || FT_HAS_COLOR(loadedFace);
+    if (loadedFace->size && loadedFace->size->metrics.y_ppem > 0) {
+        face.ascent = static_cast<float>(loadedFace->size->metrics.ascender) / 64.0f * glyphScale;
+        face.descent = static_cast<float>(loadedFace->size->metrics.descender) / 64.0f * glyphScale;
+        const float height = static_cast<float>(loadedFace->size->metrics.height) / 64.0f * glyphScale;
+        face.lineGap = height - (face.ascent - face.descent);
+    } else {
+        face.ascent = fontSize * 0.8f;
+        face.descent = -fontSize * 0.2f;
+        face.lineGap = 0.0f;
+    }
+    return true;
+}
+
+std::string fontStackCacheKey(const std::string& fontPath, float fontSize) {
+    return fontPath + "#" + std::to_string(static_cast<int>(std::round(fontSize * 64.0f)));
+}
+
+std::shared_ptr<FontInfoHolder> loadSharedFontStack(const std::string& fontPath, float fontSize) {
+    const std::string cacheKey = fontStackCacheKey(fontPath, fontSize);
+    FontStackCache& cache = sharedFontStackCache();
+    const auto existing = cache.entries.find(cacheKey);
+    if (existing != cache.entries.end()) {
+        existing->second.lastUsed = ++cache.accessTick;
+        return existing->second.holder;
+    }
+
+    auto holder = std::make_shared<FontInfoHolder>();
+
+    auto addLoadedFace = [&](const std::string& path) {
+        if (path.empty()) {
+            return false;
+        }
+        const bool alreadyLoaded = std::any_of(holder->faces.begin(), holder->faces.end(),
+                                               [&](const FontFace& loadedFace) {
+                                                   return loadedFace.path == path;
+                                               });
+        if (alreadyLoaded) {
+            return true;
+        }
+        FontFace face;
+        if (!loadFontFace(path, fontSize, face)) {
+            return false;
+        }
+        holder->faces.push_back(std::move(face));
+        return true;
+    };
+
+    if (!addLoadedFace(fontPath) &&
+        !addLoadedFace(resolveDefaultUiFontPath()) &&
+        !addLoadedFace(resolveSystemUiFontPath())) {
+        return {};
+    }
+
+    auto addLazyFallback = [&](const std::string& fallbackPath) {
+        if (fallbackPath.empty() || fallbackPath == fontPath) {
+            return;
+        }
+        if (std::find(holder->lazyFallbackPaths.begin(), holder->lazyFallbackPaths.end(), fallbackPath) == holder->lazyFallbackPaths.end()) {
+            holder->lazyFallbackPaths.push_back(fallbackPath);
+        }
+    };
+
+    addLazyFallback(resolveDefaultUiFontPath());
+    addLazyFallback(resolveDefaultIconFontPath());
+    addLazyFallback(resolveSystemUiFontPath());
+    addLazyFallback(resolveSystemIconFontPath());
+    addLazyFallback(resolveSystemEmojiFontPath());
+
+#ifdef _WIN32
+    addLazyFallback("C:/Windows/Fonts/seguiemj.ttf");
+    addLazyFallback("C:/Windows/Fonts/seguisym.ttf");
+    addLazyFallback("C:/Windows/Fonts/msyh.ttc");
+    addLazyFallback("C:/Windows/Fonts/simhei.ttf");
+#elif defined(__APPLE__)
+    addLazyFallback("/System/Library/Fonts/Apple Color Emoji.ttc");
+    addLazyFallback("/System/Library/Fonts/Supplemental/Arial Unicode.ttf");
+    addLazyFallback("/System/Library/Fonts/Supplemental/Arial.ttf");
+#else
+    // Debian / Ubuntu layout
+    addLazyFallback("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf");
+    addLazyFallback("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc");
+    addLazyFallback("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+    // Fedora / RHEL family
+    addLazyFallback("/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf");
+    addLazyFallback("/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf");
+    addLazyFallback("/usr/share/fonts/google-noto-sans-cjk/NotoSansCJK-Regular.ttc");
+    addLazyFallback("/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc");
+    addLazyFallback("/usr/share/fonts/dejavu/DejaVuSans.ttf");
+#endif
+
+    if (cache.entries.size() >= kFontStackCacheCapacity) {
+        const auto oldest = std::min_element(cache.entries.begin(), cache.entries.end(),
+                                             [](const auto& left, const auto& right) {
+                                                 return left.second.lastUsed < right.second.lastUsed;
+                                             });
+        if (oldest != cache.entries.end()) {
+            cache.entries.erase(oldest);
+        }
+    }
+
+    const auto inserted = cache.entries.emplace(cacheKey, FontStackCacheEntry{holder, ++cache.accessTick});
+    return inserted.first->second.holder;
+}
+
+bool isCombiningMark(unsigned int codepoint) {
+    return (codepoint >= 0x0300 && codepoint <= 0x036F) ||
+           (codepoint >= 0x1AB0 && codepoint <= 0x1AFF) ||
+           (codepoint >= 0x1DC0 && codepoint <= 0x1DFF) ||
+           (codepoint >= 0x20D0 && codepoint <= 0x20FF) ||
+           (codepoint >= 0xFE20 && codepoint <= 0xFE2F);
+}
+
+bool isEmojiCodepoint(unsigned int codepoint) {
+    return (codepoint >= 0x1F000 && codepoint <= 0x1FAFF) ||
+           (codepoint >= 0x2600 && codepoint <= 0x27BF);
+}
+
+bool nextCodepointIsEmojiPresentation(const std::string& text, size_t index) {
+    if (index >= text.size()) {
+        return false;
+    }
+    const size_t saved = index;
+    const unsigned int next = readUtf8Codepoint(text, index);
+    (void)saved;
+    return next == 0xFE0F;
+}
+
+unsigned int readUtf8Codepoint(const std::string& text, size_t& index) {
+    const unsigned char first = static_cast<unsigned char>(text[index++]);
+    if (first < 0x80) {
+        return first;
+    }
+    if ((first >> 5) == 0x6 && index < text.size()) {
+        return ((first & 0x1F) << 6) | (static_cast<unsigned char>(text[index++]) & 0x3F);
+    }
+    if ((first >> 4) == 0xE && index + 1 < text.size()) {
+        unsigned int cp = (first & 0x0F) << 12;
+        cp |= (static_cast<unsigned char>(text[index++]) & 0x3F) << 6;
+        cp |= static_cast<unsigned char>(text[index++]) & 0x3F;
+        return cp;
+    }
+    if ((first >> 3) == 0x1E && index + 2 < text.size()) {
+        unsigned int cp = (first & 0x07) << 18;
+        cp |= (static_cast<unsigned char>(text[index++]) & 0x3F) << 12;
+        cp |= (static_cast<unsigned char>(text[index++]) & 0x3F) << 6;
+        cp |= static_cast<unsigned char>(text[index++]) & 0x3F;
+        return cp;
+    }
+    return '?';
+}
+
+size_t findFaceForCodepoint(FontInfoHolder& holder, unsigned int codepoint, float fontSize) {
+    if (holder.faces.empty()) {
+        return 0;
+    }
+    if (codepoint == ' ' || codepoint == '\t' || codepoint == 0) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < holder.faces.size(); ++i) {
+        if (FT_Get_Char_Index(holder.faces[i].face, codepoint) != 0) {
+            return i;
+        }
+    }
+
+    for (const std::string& fallbackPath : holder.lazyFallbackPaths) {
+        if (fallbackPath.empty()) {
+            continue;
+        }
+
+        const bool alreadyLoaded = std::any_of(holder.faces.begin(), holder.faces.end(),
+                                               [&](const FontFace& loadedFace) {
+                                                   return loadedFace.path == fallbackPath;
+                                               });
+        if (alreadyLoaded) {
+            continue;
+        }
+
+        FontFace fallback;
+        if (!loadFontFace(fallbackPath, fontSize, fallback)) {
+            continue;
+        }
+
+        const bool hasGlyph = FT_Get_Char_Index(fallback.face, codepoint) != 0;
+        holder.faces.push_back(std::move(fallback));
+        if (hasGlyph) {
+            return holder.faces.size() - 1;
+        }
+    }
+
+    return 0;
+}
+
+size_t findEmojiFaceForCodepoint(FontInfoHolder& holder, unsigned int codepoint, float fontSize) {
+    for (size_t i = 0; i < holder.faces.size(); ++i) {
+        if (holder.faces[i].colored && FT_Get_Char_Index(holder.faces[i].face, codepoint) != 0) {
+            return i;
+        }
+    }
+
+    for (const std::string& fallbackPath : holder.lazyFallbackPaths) {
+        if (fallbackPath.empty() || !isEmojiFontPath(fallbackPath)) {
+            continue;
+        }
+
+        const auto loaded = std::find_if(holder.faces.begin(), holder.faces.end(),
+                                         [&](const FontFace& loadedFace) {
+                                             return loadedFace.path == fallbackPath;
+                                         });
+        if (loaded != holder.faces.end()) {
+            if (FT_Get_Char_Index(loaded->face, codepoint) != 0) {
+                return static_cast<size_t>(std::distance(holder.faces.begin(), loaded));
+            }
+            continue;
+        }
+
+        FontFace fallback;
+        if (!loadFontFace(fallbackPath, fontSize, fallback)) {
+            continue;
+        }
+
+        const bool hasGlyph = FT_Get_Char_Index(fallback.face, codepoint) != 0;
+        holder.faces.push_back(std::move(fallback));
+        if (hasGlyph) {
+            return holder.faces.size() - 1;
+        }
+    }
+
+    return findFaceForCodepoint(holder, codepoint, fontSize);
+}
+
+float loadGlyphAdvance(const FontFace& face,
+                       unsigned int glyphIndex,
+                       unsigned int codepoint,
+                       float fontSize,
+                       float maxGlyphHeight) {
+    if (codepoint == '\t') {
+        return fontSize * 4.0f;
+    }
+    if (isCombiningMark(codepoint)) {
+        return 0.0f;
+    }
+    if (FT_Load_Glyph(face.face, glyphIndex, kGlyphLoadFlags) != 0) {
+        return fontSize * 0.5f;
+    }
+
+    float glyphScale = face.glyphScale;
+    const float glyphHeight = static_cast<float>(face.face->glyph->metrics.height) / 64.0f;
+    if (face.colored && glyphHeight > 0.0f) {
+        glyphScale = std::min(glyphScale, maxGlyphHeight / glyphHeight);
+    }
+    if (FT_IS_SCALABLE(face.face)) {
+        return static_cast<float>(face.face->glyph->linearHoriAdvance) / 65536.0f * glyphScale;
+    }
+    return static_cast<float>(face.face->glyph->advance.x) / 64.0f * glyphScale;
+}
+
+std::vector<TextPrimitive::ShapedGlyph> shapeWithFallback(FontInfoHolder& holder,
+                                                          const std::string& text,
+                                                          float fontSize) {
+    std::vector<TextPrimitive::ShapedGlyph> shaped;
+    const float maxGlyphHeight = holder.faces.front().ascent - holder.faces.front().descent;
+    size_t index = 0;
+    while (index < text.size()) {
+        const size_t start = index;
+        const unsigned int codepoint = readUtf8Codepoint(text, index);
+        const bool preferEmoji = isEmojiCodepoint(codepoint) || nextCodepointIsEmojiPresentation(text, index);
+        const size_t faceIndex = preferEmoji
+            ? findEmojiFaceForCodepoint(holder, codepoint, fontSize)
+            : findFaceForCodepoint(holder, codepoint, fontSize);
+        const FontFace& face = holder.faces[faceIndex];
+        const unsigned int glyphIndex = codepoint == '\t' ? 0 : FT_Get_Char_Index(face.face, codepoint);
+        const float advance = loadGlyphAdvance(face, glyphIndex, codepoint, fontSize, maxGlyphHeight);
+        shaped.push_back({glyphIndex == 0 && codepoint == '\t' ? 0 : makeGlyphKey(faceIndex, glyphIndex),
+                          codepoint,
+                          static_cast<int>(start),
+                          static_cast<int>(index),
+                          advance,
+                          0.0f,
+                          0.0f});
+    }
+    return shaped;
+}
+
+std::vector<TextPrimitive::ShapedGlyph> shapeTextWithFontStack(FontInfoHolder& holder,
+                                                               const std::string& text,
+                                                               float fontSize) {
+    // shapeWithFallback already advances UTF-8 one codepoint at a time, so a
+    // glyph's byteEnd is the next glyph's byteStart.  Avoid rescanning every
+    // glyph to rediscover that boundary; long editable text is measured often.
+    return shapeWithFallback(holder, text, fontSize);
+}
+
+TextPrimitive::TextMetrics makeTextMetrics(const std::string& text,
+                                           const std::vector<TextPrimitive::ShapedGlyph>& shaped) {
+    TextPrimitive::TextMetrics metrics;
+    metrics.byteIndices.reserve(shaped.size() + 1);
+    metrics.caretX.reserve(shaped.size() + 1);
+    auto addStop = [&](int byteIndex, float x) {
+        byteIndex = std::clamp(byteIndex, 0, static_cast<int>(text.size()));
+        if (!metrics.byteIndices.empty() && metrics.byteIndices.back() == byteIndex) {
+            metrics.caretX.back() = x;
+            return;
+        }
+        metrics.byteIndices.push_back(byteIndex);
+        metrics.caretX.push_back(x);
+    };
+
+    addStop(0, 0.0f);
+
+    float cursorX = 0.0f;
+    for (const TextPrimitive::ShapedGlyph& glyph : shaped) {
+        const float startX = cursorX;
+        cursorX += glyph.advance;
+        addStop(glyph.byteStart, startX);
+        addStop(glyph.byteEnd, cursorX);
+    }
+
+    metrics.width = cursorX;
+    addStop(static_cast<int>(text.size()), metrics.width);
+    return metrics;
+}
+
+bool appendToAtlas(AtlasPage& page,
+                   const unsigned char* pixels,
+                   int width,
+                   int height,
+                   int channels,
+                   TextPrimitive::Glyph& glyph) {
+    if (width <= 0 || height <= 0 || pixels == nullptr || channels <= 0 || page.pixels.empty()) {
+        return true;
+    }
+
+    if (page.x + width + 1 >= page.width) {
+        page.x = 1;
+        page.y += page.rowHeight + 1;
+        page.rowHeight = 0;
+    }
+    if (page.y + height + 1 >= page.height) {
+        return false;
+    }
+
+    const int copyChannels = std::min(channels, page.channels);
+    for (int row = 0; row < height; ++row) {
+        const auto dstOffset = (static_cast<std::size_t>(page.y + row) * static_cast<std::size_t>(page.width) +
+                                static_cast<std::size_t>(page.x)) *
+                               static_cast<std::size_t>(page.channels);
+        const auto srcOffset = static_cast<std::size_t>(row) * static_cast<std::size_t>(width) * static_cast<std::size_t>(channels);
+        unsigned char* dst = page.pixels.data() + dstOffset;
+        const unsigned char* src = pixels + srcOffset;
+        for (int x = 0; x < width; ++x) {
+            std::copy(src + static_cast<std::size_t>(x) * static_cast<std::size_t>(channels),
+                      src + static_cast<std::size_t>(x) * static_cast<std::size_t>(channels) + copyChannels,
+                      dst + static_cast<std::size_t>(x) * static_cast<std::size_t>(page.channels));
+        }
+    }
+
+    glyph.u0 = static_cast<float>(page.x) / static_cast<float>(page.width);
+    glyph.v0 = static_cast<float>(page.y) / static_cast<float>(page.height);
+    glyph.u1 = static_cast<float>(page.x + width) / static_cast<float>(page.width);
+    glyph.v1 = static_cast<float>(page.y + height) / static_cast<float>(page.height);
+
+    page.x += width + 1;
+    page.rowHeight = std::max(page.rowHeight, height);
+    page.generation = ++textAtlasGenerationCounter();
+    return true;
+}
+
+std::vector<unsigned char> copyGrayBitmap(const FT_Bitmap& bitmap) {
+    if (bitmap.width == 0 || bitmap.rows == 0 || !bitmap.buffer ||
+        std::abs(bitmap.pitch) < static_cast<int>(bitmap.width)) {
+        return {};
+    }
+    std::vector<unsigned char> compact(static_cast<size_t>(bitmap.width) * bitmap.rows);
+    const int pitch = std::abs(bitmap.pitch);
+    const unsigned char* base = bitmap.pitch >= 0
+        ? bitmap.buffer
+        : bitmap.buffer + static_cast<ptrdiff_t>(bitmap.rows - 1) * pitch;
+    for (unsigned int row = 0; row < bitmap.rows; ++row) {
+        const unsigned char* source = bitmap.pitch >= 0
+            ? base + static_cast<ptrdiff_t>(row) * pitch
+            : base - static_cast<ptrdiff_t>(row) * pitch;
+        std::copy(source, source + bitmap.width, compact.begin() + static_cast<ptrdiff_t>(row) * bitmap.width);
+    }
+    return compact;
+}
+
+std::vector<unsigned char> copyBgraBitmapAsRgba(const FT_Bitmap& bitmap) {
+    if (bitmap.width == 0 || bitmap.rows == 0 || !bitmap.buffer ||
+        std::abs(bitmap.pitch) < static_cast<int>(bitmap.width * 4)) {
+        return {};
+    }
+    std::vector<unsigned char> compact(static_cast<size_t>(bitmap.width) * bitmap.rows * 4);
+    const int pitch = std::abs(bitmap.pitch);
+    const unsigned char* base = bitmap.pitch >= 0
+        ? bitmap.buffer
+        : bitmap.buffer + static_cast<ptrdiff_t>(bitmap.rows - 1) * pitch;
+    for (unsigned int row = 0; row < bitmap.rows; ++row) {
+        const unsigned char* source = bitmap.pitch >= 0
+            ? base + static_cast<ptrdiff_t>(row) * pitch
+            : base - static_cast<ptrdiff_t>(row) * pitch;
+        unsigned char* target = compact.data() + static_cast<ptrdiff_t>(row) * bitmap.width * 4;
+        for (unsigned int x = 0; x < bitmap.width; ++x) {
+            target[x * 4 + 0] = source[x * 4 + 2];
+            target[x * 4 + 1] = source[x * 4 + 1];
+            target[x * 4 + 2] = source[x * 4 + 0];
+            target[x * 4 + 3] = source[x * 4 + 3];
+        }
+    }
+    return compact;
+}
+
+} // namespace
+
+struct TextPrimitive::Impl {
+    struct LaidOutGlyph {
+        Glyph glyph;
+        float x = 0.0f;
+        float y = 0.0f;
+    };
+
+    struct Line {
+        std::vector<LaidOutGlyph> glyphs;
+        float width = 0.0f;
+        float inkTop = 0.0f;
+        float inkBottom = 0.0f;
+        bool hasInk = false;
+    };
+
+    Impl() = default;
+    Impl(float x, float y) : position_{x, y} {}
+
+    bool initialize();
+    void destroy();
+
+    void setPosition(float x, float y);
+    void setText(const std::string& text);
+    void setFontFamily(const std::string& fontFamily);
+    void setFontSize(float fontSize);
+    void setFontWeight(int fontWeight);
+    void setColor(const Color& color);
+    void setMaxWidth(float maxWidth);
+    void setWrap(bool wrap);
+    void setHorizontalAlign(HorizontalAlign align);
+    void setVerticalAlign(VerticalAlign align);
+    void setLineHeight(float lineHeight);
+    void setStyle(const TextStyle& style);
+    void setVisualScale(float originX, float originY, float scale);
+    void setTransform(const Transform& transform, const Rect& frame);
+    void setTransformMatrix(const TransformMatrix& matrix);
+
+    const TextStyle& style() const;
+    Vec2 position() const;
+    Vec2 measuredSize();
+    static float measureTextWidth(const std::string& text,
+                                  const std::string& fontFamily = {},
+                                  float fontSize = 16.0f,
+                                  int fontWeight = 400);
+    static TextMetrics measureTextMetrics(const std::string& text,
+                                          const std::string& fontFamily = {},
+                                          float fontSize = 16.0f,
+                                          int fontWeight = 400);
+    static Vec2 measureTextSize(const TextStyle& style);
+    static void setDefaultFontFiles(const std::string& textFontFile, const std::string& iconFontFile);
+
+    void prepare();
+    void render(int windowWidth, int windowHeight);
+
+    bool loadFont();
+    bool ensureGlyph(const ShapedGlyph& shaped);
+    Glyph* findGlyph(std::uint64_t key);
+    void cacheGlyph(std::uint64_t key, const Glyph& glyph);
+    void invalidateLayout();
+    void invalidateVertices();
+    void rebuildLayout();
+    void rebuildVertices();
+    std::vector<ShapedGlyph> shapeText(const std::string& text);
+    void appendShapedGlyphToLine(Line& line, const ShapedGlyph& shaped, float& cursorX);
+
+    static unsigned int readCodepoint(const std::string& text, size_t& index);
+    static std::string resolveFontPath(const std::string& fontFamily, int fontWeight);
+
+    Vec2 position_;
+    Vec2 visualScaleOrigin_;
+    float visualScale_ = 1.0f;
+    Transform transform_;
+    Rect transformFrame_;
+    TransformMatrix transformMatrix_;
+    bool hasTransformMatrix_ = false;
+    TextStyle style_;
+    std::shared_ptr<void> fontInfoStorage_;
+    float scale_ = 1.0f;
+    float ascent_ = 0.0f;
+    float descent_ = 0.0f;
+    float lineGap_ = 0.0f;
+
+    std::unordered_map<std::uint64_t, Glyph> glyphs_;
+
+    std::vector<Line> lines_;
+    std::vector<float> vertices_;
+    Vec2 measuredSize_;
+    bool layoutDirty_ = true;
+    bool verticesDirty_ = true;
+    bool fontDirty_ = true;
+    std::uint64_t loadedFontGeneration_ = 0;
+};
+
+bool TextPrimitive::Impl::initialize() {
+    if (!loadFont() || !retainSharedTextAtlas()) {
+        return false;
+    }
+
+    return true;
+}
+
+void TextPrimitive::Impl::destroy() {
+    releaseSharedTextAtlas();
+    fontInfoStorage_.reset();
+    glyphs_.clear();
+    lines_.clear();
+    vertices_.clear();
+    measuredSize_ = {};
+    layoutDirty_ = true;
+    verticesDirty_ = true;
+    fontDirty_ = true;
+}
+
+void TextPrimitive::Impl::setPosition(float x, float y) {
+    if (position_.x == x && position_.y == y) {
+        return;
+    }
+    position_ = {x, y};
+    invalidateVertices();
+}
+
+void TextPrimitive::Impl::setText(const std::string& text) {
+    if (style_.text == text) {
+        return;
+    }
+    style_.text = text;
+    invalidateLayout();
+}
+
+void TextPrimitive::Impl::setFontFamily(const std::string& fontFamily) {
+    if (style_.fontFamily == fontFamily) {
+        return;
+    }
+    style_.fontFamily = fontFamily;
+    fontDirty_ = true;
+    invalidateLayout();
+}
+
+void TextPrimitive::Impl::setFontSize(float fontSize) {
+    if (style_.fontSize == fontSize) {
+        return;
+    }
+    style_.fontSize = fontSize;
+    fontDirty_ = true;
+    invalidateLayout();
+}
+
+void TextPrimitive::Impl::setFontWeight(int fontWeight) {
+    if (style_.fontWeight == fontWeight) {
+        return;
+    }
+    style_.fontWeight = fontWeight;
+    fontDirty_ = true;
+    invalidateLayout();
+}
+
+void TextPrimitive::Impl::setColor(const Color& color) {
+    style_.color = color;
+}
+
+void TextPrimitive::Impl::setMaxWidth(float maxWidth) {
+    if (style_.maxWidth == maxWidth) {
+        return;
+    }
+    style_.maxWidth = maxWidth;
+    invalidateLayout();
+}
+
+void TextPrimitive::Impl::setWrap(bool wrap) {
+    if (style_.wrap == wrap) {
+        return;
+    }
+    style_.wrap = wrap;
+    invalidateLayout();
+}
+
+void TextPrimitive::Impl::setHorizontalAlign(HorizontalAlign align) {
+    if (style_.horizontalAlign == align) {
+        return;
+    }
+    style_.horizontalAlign = align;
+    invalidateVertices();
+}
+
+void TextPrimitive::Impl::setVerticalAlign(VerticalAlign align) {
+    if (style_.verticalAlign == align) {
+        return;
+    }
+    style_.verticalAlign = align;
+    invalidateVertices();
+}
+
+void TextPrimitive::Impl::setLineHeight(float lineHeight) {
+    if (style_.lineHeight == lineHeight) {
+        return;
+    }
+    style_.lineHeight = lineHeight;
+    invalidateLayout();
+}
+
+void TextPrimitive::Impl::setVisualScale(float originX, float originY, float scale) {
+    const float nextScale = std::max(0.01f, scale);
+    if (visualScaleOrigin_.x == originX && visualScaleOrigin_.y == originY && visualScale_ == nextScale) {
+        return;
+    }
+    visualScaleOrigin_ = {originX, originY};
+    visualScale_ = nextScale;
+    invalidateVertices();
+}
+
+void TextPrimitive::Impl::setTransform(const Transform& transform, const Rect& frame) {
+    auto close = [](float left, float right) {
+        return std::fabs(left - right) <= 0.0001f;
+    };
+    auto closeVec = [&](const Vec2& left, const Vec2& right) {
+        return close(left.x, right.x) && close(left.y, right.y);
+    };
+    const bool sameTransform =
+        closeVec(transform_.translate, transform.translate) &&
+        close(transform_.translateZ, transform.translateZ) &&
+        closeVec(transform_.scale, transform.scale) &&
+        close(transform_.rotate, transform.rotate) &&
+        close(transform_.rotateX, transform.rotateX) &&
+        close(transform_.rotateY, transform.rotateY) &&
+        closeVec(transform_.origin, transform.origin) &&
+        close(transform_.perspective, transform.perspective);
+    const bool sameFrame =
+        close(transformFrame_.x, frame.x) &&
+        close(transformFrame_.y, frame.y) &&
+        close(transformFrame_.width, frame.width) &&
+        close(transformFrame_.height, frame.height);
+    if (sameTransform && sameFrame) {
+        return;
+    }
+    transform_ = transform;
+    transformFrame_ = frame;
+    hasTransformMatrix_ = false;
+    invalidateVertices();
+}
+
+void TextPrimitive::Impl::setTransformMatrix(const TransformMatrix& matrix) {
+    auto close = [](float left, float right) {
+        return std::fabs(left - right) <= 0.0001f;
+    };
+    const bool same =
+        close(transformMatrix_.m00, matrix.m00) &&
+        close(transformMatrix_.m01, matrix.m01) &&
+        close(transformMatrix_.tx, matrix.tx) &&
+        close(transformMatrix_.m10, matrix.m10) &&
+        close(transformMatrix_.m11, matrix.m11) &&
+        close(transformMatrix_.ty, matrix.ty) &&
+        close(transformMatrix_.px, matrix.px) &&
+        close(transformMatrix_.py, matrix.py) &&
+        close(transformMatrix_.pw, matrix.pw) &&
+        hasTransformMatrix_;
+    if (same) {
+        return;
+    }
+    transformMatrix_ = matrix;
+    hasTransformMatrix_ = true;
+    invalidateVertices();
+}
+
+void TextPrimitive::Impl::setStyle(const TextStyle& style) {
+    const bool fontChanged = style.fontFamily != style_.fontFamily ||
+                             style.fontSize != style_.fontSize ||
+                             style.fontWeight != style_.fontWeight;
+    style_ = style;
+    fontDirty_ = fontDirty_ || fontChanged;
+    invalidateLayout();
+}
+
+const TextStyle& TextPrimitive::Impl::style() const {
+    return style_;
+}
+
+Vec2 TextPrimitive::Impl::position() const {
+    return position_;
+}
+
+Vec2 TextPrimitive::Impl::measuredSize() {
+    if (layoutDirty_) {
+        rebuildLayout();
+    }
+    return measuredSize_;
+}
+
+float TextPrimitive::Impl::measureTextWidth(const std::string& text,
+                                      const std::string& fontFamily,
+                                      float fontSize,
+                                      int fontWeight) {
+    return measureTextMetrics(text, fontFamily, fontSize, fontWeight).width;
+}
+
+TextPrimitive::TextMetrics TextPrimitive::Impl::measureTextMetrics(const std::string& text,
+                                                             const std::string& fontFamily,
+                                                             float fontSize,
+                                                             int fontWeight) {
+    TextMetrics empty;
+    empty.byteIndices = {0};
+    empty.caretX = {0.0f};
+    if (text.empty()) {
+        return empty;
+    }
+
+    const float size = std::max(1.0f, fontSize);
+    const std::string fontPath = resolveFontPath(fontFamily, fontWeight);
+    auto holder = loadSharedFontStack(fontPath, size);
+    if (!holder || holder->faces.empty()) {
+        return empty;
+    }
+
+    return makeTextMetrics(text, shapeTextWithFontStack(*holder, text, size));
+}
+
+Vec2 TextPrimitive::Impl::measureTextSize(const TextStyle& style) {
+    TextSizeCache& cache = sharedTextSizeCache();
+    TextSizeCacheKey cacheKey{
+        style.text,
+        style.fontFamily,
+        style.fontSize,
+        style.wrap ? style.maxWidth : 0.0f,
+        style.lineHeight,
+        style.fontWeight,
+        style.wrap
+    };
+    const auto cached = cache.entries.find(cacheKey);
+    if (cached != cache.entries.end()) {
+        cached->second.lastUsed = ++cache.accessTick;
+        return cached->second.size;
+    }
+
+    const float lineHeight = style.lineHeight > 0.0f ? style.lineHeight : style.fontSize * 1.2f;
+    const float maxWidth = style.wrap && style.maxWidth > 0.0f ? style.maxWidth : 0.0f;
+    float measuredWidth = 0.0f;
+    int lineCount = 0;
+
+    size_t paragraphStart = 0;
+    while (paragraphStart <= style.text.size()) {
+        const size_t newline = style.text.find('\n', paragraphStart);
+        const size_t paragraphEnd = newline == std::string::npos ? style.text.size() : newline;
+        std::string paragraph = style.text.substr(paragraphStart, paragraphEnd - paragraphStart);
+        if (!paragraph.empty() && paragraph.back() == '\r') {
+            paragraph.pop_back();
+        }
+
+        const TextMetrics metrics = measureTextMetrics(paragraph, style.fontFamily, style.fontSize, style.fontWeight);
+        float lineWidth = 0.0f;
+        ++lineCount;
+        for (size_t index = 1; index < metrics.caretX.size(); ++index) {
+            const float advance = metrics.caretX[index] - metrics.caretX[index - 1];
+            if (maxWidth > 0.0f && lineWidth > 0.0f && lineWidth + advance > maxWidth) {
+                measuredWidth = std::max(measuredWidth, lineWidth);
+                lineWidth = 0.0f;
+                ++lineCount;
+            }
+            lineWidth += advance;
+        }
+        measuredWidth = std::max(measuredWidth, lineWidth);
+
+        if (newline == std::string::npos) {
+            break;
+        }
+        paragraphStart = newline + 1;
+    }
+
+    const Vec2 measuredSize{measuredWidth, static_cast<float>(lineCount) * lineHeight};
+    if (cache.entries.size() >= kTextSizeCacheCapacity) {
+        const auto oldest = std::min_element(cache.entries.begin(), cache.entries.end(),
+                                             [](const auto& left, const auto& right) {
+                                                 return left.second.lastUsed < right.second.lastUsed;
+                                             });
+        if (oldest != cache.entries.end()) {
+            cache.entries.erase(oldest);
+        }
+    }
+    cache.entries.emplace(std::move(cacheKey), TextSizeCacheEntry{measuredSize, ++cache.accessTick});
+    return measuredSize;
+}
+
+void TextPrimitive::Impl::setDefaultFontFiles(const std::string& textFontFile, const std::string& iconFontFile) {
+    if (defaultUiFontFileOverride() == textFontFile &&
+        defaultIconFontFileOverride() == iconFontFile) {
+        return;
+    }
+    defaultUiFontFileOverride() = textFontFile;
+    defaultIconFontFileOverride() = iconFontFile;
+    clearSharedFontStackCache();
+    ++defaultFontGenerationCounter();
+}
+
+void TextPrimitive::Impl::prepare() {
+    if (loadedFontGeneration_ != defaultFontGenerationCounter()) {
+        fontDirty_ = true;
+        invalidateLayout();
+    }
+    if (layoutDirty_) {
+        rebuildLayout();
+    }
+    if (verticesDirty_) {
+        rebuildVertices();
+    }
+}
+
+void TextPrimitive::Impl::render(int windowWidth, int windowHeight) {
+    core::render::RenderBackend* backend = core::render::activeRenderBackend();
+    if (backend == nullptr || windowWidth <= 0 || windowHeight <= 0) {
+        return;
+    }
+
+    prepare();
+
+    if (vertices_.empty()) {
+        return;
+    }
+
+    const SharedTextAtlas& atlas = sharedTextAtlas();
+    core::render::TextDrawCommand command{};
+    command.vertices = vertices_.data();
+    command.vertexFloatCount = vertices_.size();
+    command.color = style_.color;
+    command.grayAtlas = {
+        core::render::TextAtlasPageKind::Gray,
+        atlas.gray.width,
+        atlas.gray.height,
+        atlas.gray.channels,
+        atlas.gray.generation,
+        atlas.gray.pixels.empty() ? nullptr : atlas.gray.pixels.data()
+    };
+    command.colorAtlas = {
+        core::render::TextAtlasPageKind::Color,
+        atlas.color.width,
+        atlas.color.height,
+        atlas.color.channels,
+        atlas.color.generation,
+        atlas.color.pixels.empty() ? nullptr : atlas.color.pixels.data()
+    };
+    backend->drawText(command, windowWidth, windowHeight);
+}
+
+bool TextPrimitive::Impl::loadFont() {
+    const std::string fontPath = resolveFontPath(style_.fontFamily, style_.fontWeight);
+    auto holder = loadSharedFontStack(fontPath, style_.fontSize);
+    if (!holder || holder->faces.empty()) {
+        return false;
+    }
+
+    fontInfoStorage_ = holder;
+    scale_ = 1.0f;
+    ascent_ = holder->faces.front().ascent;
+    descent_ = holder->faces.front().descent;
+    lineGap_ = holder->faces.front().lineGap;
+
+    glyphs_.clear();
+
+    loadedFontGeneration_ = defaultFontGenerationCounter();
+    fontDirty_ = false;
+    return true;
+}
+
+bool TextPrimitive::Impl::ensureGlyph(const ShapedGlyph& shaped) {
+    if (shaped.key == 0) {
+        return true;
+    }
+    if (findGlyph(shaped.key)) {
+        return true;
+    }
+
+    if (fontDirty_ && !loadFont()) {
+        return false;
+    }
+
+    auto holder = std::static_pointer_cast<FontInfoHolder>(fontInfoStorage_);
+    if (!holder || holder->faces.empty()) {
+        return false;
+    }
+
+    const size_t faceIndex = faceIndexFromGlyphKey(shaped.key);
+    const unsigned int glyphIndex = glyphIndexFromGlyphKey(shaped.key);
+    if (faceIndex >= holder->faces.size()) {
+        return false;
+    }
+
+    FontFace& face = holder->faces[faceIndex];
+    Glyph glyph;
+    glyph.advance = shaped.advance;
+    glyph.colored = face.colored;
+
+    if (glyphIndex == 0 || shaped.codepoint == ' ' || shaped.codepoint == '\t') {
+        cacheGlyph(shaped.key, glyph);
+        return true;
+    }
+
+    if (FT_Load_Glyph(face.face, glyphIndex, kGlyphLoadFlags) != 0) {
+        cacheGlyph(shaped.key, glyph);
+        return true;
+    }
+
+    FT_GlyphSlot slot = face.face->glyph;
+    glyph.advance = shaped.advance;
+
+    if (slot->format != FT_GLYPH_FORMAT_BITMAP) {
+        if (FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) != 0) {
+            cacheGlyph(shaped.key, glyph);
+            return true;
+        }
+    }
+
+    const FT_Bitmap& bitmap = slot->bitmap;
+    const bool colorBitmap = bitmap.pixel_mode == FT_PIXEL_MODE_BGRA;
+    float glyphScale = face.glyphScale;
+    if (colorBitmap && bitmap.rows > 0) {
+        const float emHeight = ascent_ - descent_;
+        glyphScale = std::min(glyphScale, emHeight / static_cast<float>(bitmap.rows));
+    }
+    glyph.colored = colorBitmap;
+    glyph.xOffset = static_cast<float>(slot->bitmap_left) * glyphScale;
+    glyph.yOffset = ascent_ - static_cast<float>(slot->bitmap_top) * glyphScale;
+    glyph.width = static_cast<float>(bitmap.width) * glyphScale;
+    glyph.height = static_cast<float>(bitmap.rows) * glyphScale;
+    if (colorBitmap) {
+        glyph.yOffset = ascent_ - descent_ - glyph.height;
+    }
+
+    if (bitmap.width == 0 || bitmap.rows == 0 || !bitmap.buffer) {
+        cacheGlyph(shaped.key, glyph);
+        return true;
+    }
+
+    const std::string cacheKey = glyphCacheKey(face, style_.fontSize, glyphIndex, colorBitmap);
+    SharedTextAtlas& atlas = sharedTextAtlas();
+    AtlasPage& page = colorBitmap ? atlas.color : atlas.gray;
+    if (const auto cached = page.glyphs.find(cacheKey); cached != page.glyphs.end()) {
+        glyph.u0 = cached->second.u0;
+        glyph.v0 = cached->second.v0;
+        glyph.u1 = cached->second.u1;
+        glyph.v1 = cached->second.v1;
+        cacheGlyph(shaped.key, glyph);
+        return true;
+    }
+
+    if (colorBitmap) {
+        if (!ensureAtlasPage(atlas.color, kColorAtlasSize, kColorAtlasSize, 4)) {
+            cacheGlyph(shaped.key, glyph);
+            return true;
+        }
+        std::vector<unsigned char> rgba = copyBgraBitmapAsRgba(bitmap);
+        if (rgba.empty()) {
+            cacheGlyph(shaped.key, glyph);
+            return true;
+        }
+        if (!appendToAtlas(atlas.color, rgba.data(), static_cast<int>(bitmap.width), static_cast<int>(bitmap.rows), 4, glyph)) {
+            cacheGlyph(shaped.key, glyph);
+            return true;
+        }
+        atlas.color.glyphs[cacheKey] = glyph;
+    } else if (bitmap.pixel_mode == FT_PIXEL_MODE_GRAY) {
+        std::vector<unsigned char> gray = copyGrayBitmap(bitmap);
+        if (gray.empty()) {
+            cacheGlyph(shaped.key, glyph);
+            return true;
+        }
+        if (!appendToAtlas(atlas.gray, gray.data(), static_cast<int>(bitmap.width), static_cast<int>(bitmap.rows), 1, glyph)) {
+            cacheGlyph(shaped.key, glyph);
+            return true;
+        }
+        atlas.gray.glyphs[cacheKey] = glyph;
+    } else {
+        cacheGlyph(shaped.key, glyph);
+        return true;
+    }
+
+    cacheGlyph(shaped.key, glyph);
+    return true;
+}
+
+TextPrimitive::Glyph* TextPrimitive::Impl::findGlyph(std::uint64_t key) {
+    const auto it = glyphs_.find(key);
+    return it == glyphs_.end() ? nullptr : &it->second;
+}
+
+void TextPrimitive::Impl::cacheGlyph(std::uint64_t key, const Glyph& glyph) {
+    if (key == 0) {
+        return;
+    }
+    glyphs_[key] = glyph;
+}
+
+void TextPrimitive::Impl::invalidateLayout() {
+    layoutDirty_ = true;
+    invalidateVertices();
+}
+
+void TextPrimitive::Impl::rebuildLayout() {
+    if (fontDirty_ && !loadFont()) {
+        // A transient font load failure (rare I/O hiccup, font file briefly
+        // unavailable, etc.) must NOT permanently blank this text primitive.
+        // Keep the layout dirty so it retries on the next frame and recovers
+        // once the font becomes loadable.
+        return;
+    }
+
+    lines_.clear();
+    measuredSize_ = {};
+
+    Line currentLine;
+    float cursorX = 0.0f;
+    const float lineHeight = style_.lineHeight > 0.0f ? style_.lineHeight : style_.fontSize * 1.2f;
+    const float maxWidth = style_.maxWidth > 0.0f ? style_.maxWidth : 0.0f;
+
+    size_t paragraphStart = 0;
+    while (paragraphStart <= style_.text.size()) {
+        const size_t newline = style_.text.find('\n', paragraphStart);
+        const size_t paragraphEnd = newline == std::string::npos ? style_.text.size() : newline;
+        std::string paragraph = style_.text.substr(paragraphStart, paragraphEnd - paragraphStart);
+        if (!paragraph.empty() && paragraph.back() == '\r') {
+            paragraph.pop_back();
+        }
+
+        const std::vector<ShapedGlyph> shaped = shapeText(paragraph);
+        for (const ShapedGlyph& glyph : shaped) {
+            const float advance = glyph.advance;
+            if (style_.wrap && maxWidth > 0.0f && cursorX > 0.0f && cursorX + advance > maxWidth) {
+                measuredSize_.x = std::max(measuredSize_.x, currentLine.width);
+                lines_.push_back(currentLine);
+                currentLine = {};
+                cursorX = 0.0f;
+            }
+
+            appendShapedGlyphToLine(currentLine, glyph, cursorX);
+        }
+
+        if (newline == std::string::npos) {
+            break;
+        }
+
+        measuredSize_.x = std::max(measuredSize_.x, currentLine.width);
+        lines_.push_back(currentLine);
+        currentLine = {};
+        cursorX = 0.0f;
+        paragraphStart = newline + 1;
+    }
+
+    measuredSize_.x = std::max(measuredSize_.x, currentLine.width);
+    lines_.push_back(currentLine);
+    measuredSize_.y = lines_.empty() ? 0.0f : static_cast<float>(lines_.size()) * lineHeight;
+    layoutDirty_ = false;
+    invalidateVertices();
+}
+
+void TextPrimitive::Impl::invalidateVertices() {
+    verticesDirty_ = true;
+}
+
+void TextPrimitive::Impl::rebuildVertices() {
+    vertices_.clear();
+    const float lineHeight = style_.lineHeight > 0.0f ? style_.lineHeight : style_.fontSize * 1.2f;
+    const auto close = [](float left, float right) {
+        return std::fabs(left - right) <= 0.0001f;
+    };
+    const bool pixelAlignedMatrix = hasTransformMatrix_ &&
+        close(transformMatrix_.m00, 1.0f) && close(transformMatrix_.m01, 0.0f) &&
+        close(transformMatrix_.m10, 0.0f) && close(transformMatrix_.m11, 1.0f) &&
+        close(transformMatrix_.px, 0.0f) && close(transformMatrix_.py, 0.0f) &&
+        close(transformMatrix_.pw, 1.0f) &&
+        close(transformMatrix_.tx, std::round(transformMatrix_.tx)) &&
+        close(transformMatrix_.ty, std::round(transformMatrix_.ty));
+    float blockYOffset = 0.0f;
+    if (style_.verticalAlign == VerticalAlign::Center) {
+        float inkTop = std::numeric_limits<float>::max();
+        float inkBottom = std::numeric_limits<float>::lowest();
+        for (size_t lineIndex = 0; lineIndex < lines_.size(); ++lineIndex) {
+            const Line& line = lines_[lineIndex];
+            if (!line.hasInk) {
+                continue;
+            }
+            const float lineY = static_cast<float>(lineIndex) * lineHeight;
+            inkTop = std::min(inkTop, lineY + line.inkTop);
+            inkBottom = std::max(inkBottom, lineY + line.inkBottom);
+        }
+        if (inkTop <= inkBottom) {
+            blockYOffset = -(inkTop + inkBottom) * 0.5f;
+        } else {
+            blockYOffset = -measuredSize_.y * 0.5f;
+        }
+    } else if (style_.verticalAlign == VerticalAlign::Bottom) {
+        blockYOffset = -measuredSize_.y;
+    }
+
+    for (size_t lineIndex = 0; lineIndex < lines_.size(); ++lineIndex) {
+        const Line& line = lines_[lineIndex];
+        float lineX = position_.x;
+        if (style_.horizontalAlign == HorizontalAlign::Center) {
+            lineX -= line.width * 0.5f;
+        } else if (style_.horizontalAlign == HorizontalAlign::Right) {
+            lineX -= line.width;
+        }
+
+        const float lineY = position_.y + blockYOffset + static_cast<float>(lineIndex) * lineHeight;
+        for (const LaidOutGlyph& laidOut : line.glyphs) {
+            const Glyph& glyph = laidOut.glyph;
+            const float x0 = lineX + laidOut.x + glyph.xOffset;
+            const float y0 = lineY + laidOut.y + glyph.yOffset;
+            const float x1 = x0 + glyph.width;
+            const float y1 = y0 + glyph.height;
+            const float colored = glyph.colored ? 1.0f : 0.0f;
+            Vec2 p0{x0, y0};
+            Vec2 p1{x1, y0};
+            Vec2 p2{x1, y1};
+            Vec2 p3{x0, y1};
+
+            if (hasTransformMatrix_) {
+                p0 = core::transformPoint(transformMatrix_, p0.x, p0.y);
+                p1 = core::transformPoint(transformMatrix_, p1.x, p1.y);
+                p2 = core::transformPoint(transformMatrix_, p2.x, p2.y);
+                p3 = core::transformPoint(transformMatrix_, p3.x, p3.y);
+            } else if (std::fabs(transform_.translate.x) > 0.0001f ||
+                std::fabs(transform_.translate.y) > 0.0001f ||
+                std::fabs(transform_.scale.x - 1.0f) > 0.0001f ||
+                std::fabs(transform_.scale.y - 1.0f) > 0.0001f ||
+                std::fabs(transform_.rotate) > 0.0001f) {
+                const Vec2 origin{
+                    transformFrame_.x + transformFrame_.width * transform_.origin.x,
+                    transformFrame_.y + transformFrame_.height * transform_.origin.y
+                };
+                const float cosine = std::cos(transform_.rotate);
+                const float sine = std::sin(transform_.rotate);
+                auto transformPoint = [&](Vec2 point) {
+                    const float scaledX = (point.x - origin.x) * transform_.scale.x;
+                    const float scaledY = (point.y - origin.y) * transform_.scale.y;
+                    return Vec2{
+                        origin.x + scaledX * cosine - scaledY * sine + transform_.translate.x,
+                        origin.y + scaledX * sine + scaledY * cosine + transform_.translate.y
+                    };
+                };
+                p0 = transformPoint(p0);
+                p1 = transformPoint(p1);
+                p2 = transformPoint(p2);
+                p3 = transformPoint(p3);
+            }
+
+            if (!hasTransformMatrix_ && std::fabs(visualScale_ - 1.0f) > 0.0001f) {
+                auto scalePoint = [&](Vec2 point) {
+                    return Vec2{
+                        visualScaleOrigin_.x + (point.x - visualScaleOrigin_.x) * visualScale_,
+                        visualScaleOrigin_.y + (point.y - visualScaleOrigin_.y) * visualScale_
+                    };
+                };
+                p0 = scalePoint(p0);
+                p1 = scalePoint(p1);
+                p2 = scalePoint(p2);
+                p3 = scalePoint(p3);
+            }
+
+            if (!glyph.colored && pixelAlignedMatrix) {
+                const float offsetX = std::round(p0.x) - p0.x;
+                const float offsetY = std::round(p0.y) - p0.y;
+                p0 = {p0.x + offsetX, p0.y + offsetY};
+                p1 = {p1.x + offsetX, p1.y + offsetY};
+                p2 = {p2.x + offsetX, p2.y + offsetY};
+                p3 = {p3.x + offsetX, p3.y + offsetY};
+            }
+
+            vertices_.insert(vertices_.end(), {
+                p0.x, p0.y, glyph.u0, glyph.v0, colored,
+                p1.x, p1.y, glyph.u1, glyph.v0, colored,
+                p2.x, p2.y, glyph.u1, glyph.v1, colored,
+                p0.x, p0.y, glyph.u0, glyph.v0, colored,
+                p2.x, p2.y, glyph.u1, glyph.v1, colored,
+                p3.x, p3.y, glyph.u0, glyph.v1, colored
+            });
+        }
+    }
+    verticesDirty_ = false;
+}
+
+std::vector<TextPrimitive::ShapedGlyph> TextPrimitive::Impl::shapeText(const std::string& text) {
+    if (fontDirty_ && !loadFont()) {
+        return {};
+    }
+    auto holder = std::static_pointer_cast<FontInfoHolder>(fontInfoStorage_);
+    if (!holder || holder->faces.empty()) {
+        return {};
+    }
+    return shapeTextWithFontStack(*holder, text, std::max(1.0f, style_.fontSize));
+}
+
+void TextPrimitive::Impl::appendShapedGlyphToLine(Line& line, const ShapedGlyph& shaped, float& cursorX) {
+    if (!ensureGlyph(shaped)) {
+        cursorX += shaped.advance;
+        line.width = cursorX;
+        return;
+    }
+
+    const Glyph* glyph = findGlyph(shaped.key);
+    if (glyph && shaped.key != 0 && shaped.codepoint != ' ' && shaped.codepoint != '\t') {
+        line.glyphs.push_back({*glyph, cursorX + shaped.xOffset, shaped.yOffset});
+        const float top = shaped.yOffset + glyph->yOffset;
+        const float bottom = top + glyph->height;
+        if (!line.hasInk) {
+            line.inkTop = top;
+            line.inkBottom = bottom;
+            line.hasInk = true;
+        } else {
+            line.inkTop = std::min(line.inkTop, top);
+            line.inkBottom = std::max(line.inkBottom, bottom);
+        }
+    }
+    cursorX += shaped.advance;
+    line.width = cursorX;
+}
+
+unsigned int TextPrimitive::Impl::readCodepoint(const std::string& text, size_t& index) {
+    return readUtf8Codepoint(text, index);
+}
+
+std::string TextPrimitive::Impl::resolveFontPath(const std::string& fontFamily, int fontWeight) {
+    if (!fontFamily.empty() && fontFamily.find('.') != std::string::npos) {
+        return resolveFontFilePath(fontFamily);
+    }
+
+    if (fontFamily == "YouSheBiaoTiHei" || fontFamily == "YouShe") {
+        return resolveFontFilePath("YouSheBiaoTiHei-2.ttf");
+    }
+
+    if (fontFamily == "Title" || fontFamily == "PingFang" || fontFamily == "PingFang SC") {
+        return resolveDefaultUiFontPath();
+    }
+
+    if (fontFamily == "FontAwesome" || fontFamily == "Font Awesome" ||
+        fontFamily == "Font Awesome 7 Free" || fontFamily == "Icon") {
+        return resolveDefaultIconFontPath();
+    }
+
+#ifdef _WIN32
+    if (fontFamily == "monospace" || fontFamily == "Mono" ||
+        fontFamily == "Cascadia Mono" || fontFamily == "Cascadia Code") {
+        if (const std::string path = resolveSystemMonospaceFontPath(); !path.empty()) {
+            return path;
+        }
+    }
+    if (fontFamily == "Microsoft YaHei" || fontFamily == "YaHei") {
+        return "C:/Windows/Fonts/msyh.ttc";
+    }
+    if (fontFamily == "Segoe UI Emoji" || fontFamily == "Emoji") {
+        if (const std::string path = resolveSystemEmojiFontPath(); !path.empty()) {
+            return path;
+        }
+        return resolveDefaultUiFontPath();
+    }
+    if (fontFamily == "SimHei") {
+        return "C:/Windows/Fonts/simhei.ttf";
+    }
+    if (fontWeight >= 600) {
+        return resolveDefaultUiFontPath();
+    }
+    return resolveDefaultUiFontPath();
+#elif defined(__APPLE__)
+    if (fontFamily == "monospace" || fontFamily == "Mono" ||
+        fontFamily == "SF Mono" || fontFamily == "Menlo" || fontFamily == "Monaco") {
+        if (const std::string path = resolveSystemMonospaceFontPath(); !path.empty()) {
+            return path;
+        }
+    }
+    if (fontFamily == "Noto Color Emoji" || fontFamily == "Apple Color Emoji" || fontFamily == "Emoji") {
+        if (const std::string path = resolveSystemEmojiFontPath(); !path.empty()) {
+            return path;
+        }
+        return resolveDefaultUiFontPath();
+    }
+    if (fontWeight >= 600) {
+        return resolveDefaultUiFontPath();
+    }
+    return resolveDefaultUiFontPath();
+#else
+    (void)fontWeight;
+    if (fontFamily == "monospace" || fontFamily == "Mono") {
+        if (const std::string path = resolveSystemMonospaceFontPath(); !path.empty()) {
+            return path;
+        }
+        return resolveDefaultUiFontPath();
+    }
+    if (fontFamily == "Noto Color Emoji" || fontFamily == "Emoji") {
+        if (const std::string path = resolveSystemEmojiFontPath(); !path.empty()) {
+            return path;
+        }
+        return resolveDefaultUiFontPath();
+    }
+    return resolveDefaultUiFontPath();
+#endif
+}
+
+TextPrimitive::TextPrimitive()
+    : impl_(std::make_unique<Impl>()) {}
+
+TextPrimitive::TextPrimitive(float x, float y)
+    : impl_(std::make_unique<Impl>(x, y)) {}
+
+TextPrimitive::~TextPrimitive() = default;
+TextPrimitive::TextPrimitive(TextPrimitive&&) noexcept = default;
+TextPrimitive& TextPrimitive::operator=(TextPrimitive&&) noexcept = default;
+
+bool TextPrimitive::initialize() { return impl_->initialize(); }
+void TextPrimitive::destroy() { impl_->destroy(); }
+void TextPrimitive::setPosition(float x, float y) { impl_->setPosition(x, y); }
+void TextPrimitive::setText(const std::string& text) { impl_->setText(text); }
+void TextPrimitive::setFontFamily(const std::string& fontFamily) { impl_->setFontFamily(fontFamily); }
+void TextPrimitive::setFontSize(float fontSize) { impl_->setFontSize(fontSize); }
+void TextPrimitive::setFontWeight(int fontWeight) { impl_->setFontWeight(fontWeight); }
+void TextPrimitive::setColor(const Color& color) { impl_->setColor(color); }
+void TextPrimitive::setMaxWidth(float maxWidth) { impl_->setMaxWidth(maxWidth); }
+void TextPrimitive::setWrap(bool wrap) { impl_->setWrap(wrap); }
+void TextPrimitive::setHorizontalAlign(HorizontalAlign align) { impl_->setHorizontalAlign(align); }
+void TextPrimitive::setVerticalAlign(VerticalAlign align) { impl_->setVerticalAlign(align); }
+void TextPrimitive::setLineHeight(float lineHeight) { impl_->setLineHeight(lineHeight); }
+void TextPrimitive::setStyle(const TextStyle& style) { impl_->setStyle(style); }
+void TextPrimitive::setVisualScale(float originX, float originY, float scale) { impl_->setVisualScale(originX, originY, scale); }
+void TextPrimitive::setTransform(const Transform& transform, const Rect& frame) { impl_->setTransform(transform, frame); }
+void TextPrimitive::setTransformMatrix(const TransformMatrix& matrix) { impl_->setTransformMatrix(matrix); }
+const TextStyle& TextPrimitive::style() const { return impl_->style(); }
+Vec2 TextPrimitive::position() const { return impl_->position(); }
+Vec2 TextPrimitive::measuredSize() { return impl_->measuredSize(); }
+void TextPrimitive::prepare() { impl_->prepare(); }
+float TextPrimitive::measureTextWidth(const std::string& text,
+                                      const std::string& fontFamily,
+                                      float fontSize,
+                                      int fontWeight) {
+    return Impl::measureTextWidth(text, fontFamily, fontSize, fontWeight);
+}
+TextPrimitive::TextMetrics TextPrimitive::measureTextMetrics(const std::string& text,
+                                                             const std::string& fontFamily,
+                                                             float fontSize,
+                                                             int fontWeight) {
+    return Impl::measureTextMetrics(text, fontFamily, fontSize, fontWeight);
+}
+
+Vec2 TextPrimitive::measureTextSize(const TextStyle& style) {
+    return Impl::measureTextSize(style);
+}
+void TextPrimitive::setDefaultFontFiles(const std::string& textFontFile, const std::string& iconFontFile) {
+    Impl::setDefaultFontFiles(textFontFile, iconFontFile);
+}
+void TextPrimitive::render(int windowWidth, int windowHeight) { impl_->render(windowWidth, windowHeight); }
+
+} // namespace core

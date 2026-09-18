@@ -1,0 +1,147 @@
+# ADB 文件浏览器（AdbTools）
+
+一个基于 [EUI-NEO](https://github.com/sudoevolve/EUI-NEO) 框架、用 C++17 编写的 **Android ADB 文件管理器 + 工具箱**。自带设备文件浏览、上传/下载、截图、APK 安装、应用管理、实时 logcat、scrcpy 投屏，以及 adb / scrcpy 的版本检测与一键更新。
+
+- 界面：自绘无边框窗口 + 圆角 + 深色/浅色主题 + 自定义主题色 + 字体/字号/缩放设置
+- 平台：Windows 10/11（MinGW-w64 编译）
+
+---
+
+## 功能特性
+
+- **设备管理**：自动探测 adb（SDK / PATH / 程序目录），列出并选择连接的设备，断线自动检测
+- **文件管理**：浏览设备文件系统、多选、上传/下载、重命名、删除、新建文件夹、复制/移动（设备内剪贴板）、拖拽上传
+- **路径导航**：可编辑路径栏、目录自动补全、后退/前进、快捷路径（书签）、显示隐藏文件、按名称/大小/日期排序
+- **常用命令**：内置「adb shell」与「宿主命令」两类常用命令，可自定义增删
+- **截图 / 安装 APK / 设备信息 / 无线连接**
+- **应用管理**：列出第三方应用、卸载、清除数据
+- **文本 / 图片预览**：直接预览设备上的文本和图片
+- **实时 logcat**：持续滚动、默认清空历史、大小写不敏感的正则过滤
+- **scrcpy 投屏**：内嵌到独立手机样式窗口，圆角、主题联动、窗口大小记忆
+- **更新检测**：检测并一键更新 adb（Google 官方源）与 scrcpy（GitHub 官方源）
+- **个性化**：深色/浅色主题、6 种主题色、系统字体/字重/字号、界面缩放（含动画）
+
+---
+
+## 下载与安装
+
+> 本项目为**便携版**，无需安装。到 [Releases](../../releases) 页面下载 `AdbFileBrowser-windows-x64.zip`，解压后双击 `adb_browser.exe` 即可运行。
+
+解压后的目录结构：
+
+```
+AdbFileBrowser-windows-x64/
+├── adb_browser.exe        # 主程序
+├── assets/                # 界面字体 / 图标字体
+└── scrcpy/                # 内置 scrcpy.exe、adb.exe、scrcpy-server 及依赖 DLL
+```
+
+运行前提：
+
+1. Windows 10/11；
+2. 手机开启「开发者选项 → USB 调试」，用数据线连接电脑并授权；
+3. 也可以使用无线调试（`adb connect <IP>:<端口>`）。
+
+> 说明：程序会自动寻找 adb。若你已安装 Android SDK / platform-tools，会优先使用系统中的 adb；否则使用内置在 `scrcpy/` 里的 adb。
+
+---
+
+## 从源码编译
+
+### 依赖
+
+- [MinGW-w64](https://www.mingw-w64.org/)（GCC **12 或更新**，含 `mingw32-make`）；推荐 [WinLibs](https://winlibs.com/) 或 MSYS2
+- [CMake](https://cmake.org/) 3.14+
+- Git
+
+### 编译步骤
+
+```bash
+# 1. 克隆仓库
+git clone --recursive https://github.com/<你的用户名>/AdbTools.git
+cd AdbTools
+
+# 2. 配置（生成 MinGW Makefiles）
+cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+# 3. 编译（并行）
+cmake --build build --parallel
+```
+
+编译产物为 `build/adb_browser.exe`，字体资源会自动拷贝到 `build/assets/`。
+
+> `3rd/EUI-NEO/` 是**已随仓库一起分发的框架源码**（含本项目的少量定制修改），CMake 使用 `EUI_DEPS_MODE=bundled` 全离线编译，不需要联网拉取依赖。
+
+### 运行
+
+```bash
+# 直接运行（会使用 PATH / SDK 中的 adb；若无则用内置 adb）
+./build/adb_browser.exe
+
+# 若要把内置 scrcpy/adb 放到程序目录（投屏与 adb 探测需要）：
+./scripts/fetch_scrcpy.ps1 -Version latest -OutDir build/scrcpy
+```
+
+---
+
+## 目录结构
+
+```
+AdbTools/
+├── main.cpp                # 应用主体（全部界面与逻辑）
+├── regex_wrap.cpp          # std::regex 的异常隔离封装（logcat 过滤用）
+├── CMakeLists.txt          # 构建脚本
+├── LICENSE                 # Apache-2.0
+├── THIRD_PARTY_NOTICES.md  # 第三方组件与许可
+├── scripts/
+│   └── fetch_scrcpy.ps1    # 下载并解压 scrcpy（内含 adb）
+├── .github/workflows/      # CI 自动构建 / 发版
+└── 3rd/EUI-NEO/            # 框架源码（bundled，含少量定制修改）
+```
+
+---
+
+## 更新机制
+
+「检查更新」对话框（标题栏最左侧下载图标）会检测并更新三样东西：
+
+- **本软件**：从你配置的 GitHub 仓库 `releases/latest` 获取最新版本，点击「更新到 X」会下载、解压并替换 `adb_browser.exe`（更新完成后重启生效）；
+- **adb**：从 Google 官方仓库 `dl.google.com/.../repository2-1.xml` 解析最新 platform-tools 版本；
+- **scrcpy**：从 GitHub Releases API 获取最新版本（更新前会先关闭投屏释放文件占用）。
+
+> ⚠️ **发布前必改**：本软件的自更新需要知道你的 GitHub 仓库地址，请在 `main.cpp` 顶部修改
+> `constexpr const char* kAppUpdateRepo = "yourname/AdbTools";` 为你的真实 `用户名/仓库名`，
+> 并同步把 `kAppVersion` 改成你本次发布的版本号。
+>
+> 若网络无法访问 GitHub，对应行会显示「最新版本：未知」，不影响其它项。
+
+---
+
+## 快捷键
+
+| 按键 | 功能 |
+| --- | --- |
+| F5 | 刷新当前目录 |
+| F2 | 重命名 |
+| Backspace | 返回上级目录 |
+| Enter | 进入选中的文件夹 |
+| Delete | 删除选中项 |
+| Ctrl+L | 编辑路径 |
+| Esc | 关闭当前弹窗 |
+
+---
+
+## 第三方组件与许可
+
+本软件以 **Apache License 2.0** 开源。它使用了以下第三方组件（详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）：
+
+- [EUI-NEO](https://github.com/sudoevolve/EUI-NEO)（Apache-2.0）—— UI 框架
+- [scrcpy](https://github.com/Genymobile/scrcpy)（Apache-2.0）—— 投屏（运行时下载，不随源码分发）
+- [Android SDK Platform-Tools (adb)](https://developer.android.com/tools/releases/platform-tools)（Apache-2.0）—— 调试桥（运行时下载，不随源码分发）
+- 字体：Font Awesome 7 Free、JingNanJunJunTi、YouSheBiaoTiHei
+
+---
+
+## 免责声明
+
+本项目仅供学习与合法的设备调试使用。请勿将其用于违反相关法律法规或侵犯他人权益的用途。使用本软件产生的一切后果由使用者自行承担。

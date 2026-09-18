@@ -1,0 +1,139 @@
+#pragma once
+
+#include "eui/app.h"
+#include "eui/async.h"
+
+#include <functional>
+#include <string>
+#include <utility>
+
+namespace app {
+
+struct DslAppConfig {
+    std::string titleValue = "App";
+    std::string pageIdValue = "app";
+    eui::Color clearColorValue = {0.16f, 0.18f, 0.20f, 1.0f};
+    int windowWidthValue = 800;
+    int windowHeightValue = 600;
+    float uiScaleValue = 1.0f;
+#ifndef NDEBUG
+    bool showDebugStatsInTitleValue = true;
+#else
+    bool showDebugStatsInTitleValue = false;
+#endif
+    double fpsValue = 90.0;
+    std::string iconPathValue = "assets/icon.png";
+    std::string textFontFileValue;
+    std::string iconFontFileValue;
+    bool trayEnabledValue = false;
+    std::string trayTitleValue;
+    std::string trayIconPathValue;
+    std::function<void(const eui::KeyEvent&)> keyEventHandler;
+
+    DslAppConfig& title(std::string value) { titleValue = std::move(value); return *this; }
+    DslAppConfig& pageId(std::string value) { pageIdValue = std::move(value); return *this; }
+    DslAppConfig& clearColor(const eui::Color& value) { clearColorValue = value; return *this; }
+    DslAppConfig& background(const eui::Color& value) { return clearColor(value); }
+    DslAppConfig& windowSize(int width, int height) {
+        windowWidthValue = width;
+        windowHeightValue = height;
+        return *this;
+    }
+    DslAppConfig& windowWidth(int value) { windowWidthValue = value; return *this; }
+    DslAppConfig& windowHeight(int value) { windowHeightValue = value; return *this; }
+    DslAppConfig& uiScale(float value) {
+        uiScaleValue = value > 0.0f ? value : 1.0f;
+        return *this;
+    }
+    DslAppConfig& showDebugStatsInTitle(bool value = true) {
+        showDebugStatsInTitleValue = value;
+        return *this;
+    }
+    DslAppConfig& fps(double value) { fpsValue = value; return *this; }
+    DslAppConfig& iconPath(std::string value) { iconPathValue = std::move(value); return *this; }
+    DslAppConfig& textFont(std::string value) { textFontFileValue = std::move(value); return *this; }
+    DslAppConfig& iconFont(std::string value) { iconFontFileValue = std::move(value); return *this; }
+    DslAppConfig& fonts(std::string textFont, std::string iconFont = {}) {
+        textFontFileValue = std::move(textFont);
+        iconFontFileValue = std::move(iconFont);
+        return *this;
+    }
+    DslAppConfig& tray(bool value = true) {
+        trayEnabledValue = value;
+        return *this;
+    }
+    DslAppConfig& trayTitle(std::string value) {
+        trayTitleValue = std::move(value);
+        return *this;
+    }
+    DslAppConfig& trayIcon(std::string value) {
+        trayIconPathValue = std::move(value);
+        return *this;
+    }
+    DslAppConfig& onKeyEvent(std::function<void(const eui::KeyEvent&)> handler) {
+        keyEventHandler = std::move(handler);
+        return *this;
+    }
+};
+
+struct DslWindowConfig {
+    std::string titleValue = "Window";
+    std::string pageIdValue = "window";
+    eui::Color clearColorValue = {0.16f, 0.18f, 0.20f, 1.0f};
+    int windowWidthValue = 640;
+    int windowHeightValue = 420;
+    bool modalValue = false;
+    std::function<void(const eui::KeyEvent&)> keyEventHandler;
+
+    DslWindowConfig& title(std::string value) { titleValue = std::move(value); return *this; }
+    DslWindowConfig& pageId(std::string value) { pageIdValue = std::move(value); return *this; }
+    DslWindowConfig& clearColor(const eui::Color& value) { clearColorValue = value; return *this; }
+    DslWindowConfig& background(const eui::Color& value) { return clearColor(value); }
+    DslWindowConfig& windowSize(int width, int height) {
+        windowWidthValue = width;
+        windowHeightValue = height;
+        return *this;
+    }
+    DslWindowConfig& windowWidth(int value) { windowWidthValue = value; return *this; }
+    DslWindowConfig& windowHeight(int value) { windowHeightValue = value; return *this; }
+    DslWindowConfig& modal(bool value = true) { modalValue = value; return *this; }
+    DslWindowConfig& onKeyEvent(std::function<void(const eui::KeyEvent&)> handler) {
+        keyEventHandler = std::move(handler);
+        return *this;
+    }
+};
+
+const DslAppConfig& dslAppConfig();
+void compose(eui::Ui& ui, const eui::Screen& screen);
+
+void openWindow(const DslWindowConfig& config, DslWindowCompose composeFn);
+void openWindow(const char* title, int width, int height, DslWindowCompose composeFn);
+
+// Frameless custom title-bar window controls (implemented by the GLFW app entry).
+void minimizeWindow();
+void toggleMaximizeWindow();
+void closeWindow();
+bool isWindowMaximized();
+void startWindowDrag();
+void* mainWindowHwnd();
+void setWindowSize(int width, int height);
+
+// Runtime UI configuration (settings dialog).
+void setUiScale(float scale);
+void setFontScale(float scale);
+void setDefaultTextFont(const std::string& fontPath);
+
+// Programmatically move keyboard focus to an element id (e.g. an input's hit
+// rect) so controls that appear after a click can be typed into immediately.
+void requestFocus(const std::string& id);
+
+// Register a handler for files dropped onto the window (drag & drop upload).
+void setDropHandler(std::function<void(const std::vector<std::string>&)> handler);
+void dispatchDroppedFiles(const std::vector<std::string>& files);
+
+// Configure the mirror (投屏) child window: lock its aspect ratio to the device
+// and register a callback that runs while the window is being resized.
+void setMirrorAspectRatio(int width, int height);
+void setMirrorResizeHandler(std::function<void()> handler);
+
+} // namespace app

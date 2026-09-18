@@ -1,0 +1,212 @@
+# 动画系统
+
+动画系统位于 `core/animation.h`，并由 `core::dsl::Runtime` 接入 DSL。页面和组件只声明目标状态，Runtime 负责插值、重绘节奏和脏区标记。
+
+## 核心类型
+
+```cpp
+enum class Ease {
+    Linear,
+    InQuad,
+    OutQuad,
+    InOutQuad,
+    OutCubic,
+    InOutCubic,
+    OutExpo,
+    OutBack
+};
+```
+
+```cpp
+struct Transition {
+    bool enabled;
+    float durationSeconds;
+    float delaySeconds;
+    Ease ease;
+    AnimProperty properties;
+};
+```
+
+```cpp
+template <typename T>
+class AnimatedValue;
+
+template <typename T>
+class SmoothedValue;
+```
+
+- `AnimatedValue<T>`：用于 DSL 属性从旧目标值过渡到新目标值。
+- `SmoothedValue<T>`：用于 hover / press 这种持续朝目标靠近的交互状态。
+
+`OutExpo` 是很强的缓出曲线，适合侧边栏、抽屉、底部面板这类需要“先快速出现，再慢慢收住”的交互动画。当前个人觉得这类抽屉交互用 `OutExpo` 配合约 `0.92s` 的时长手感最好：速度变化明显，但没有回弹。
+
+## 全局速率
+
+`core/animation.h` 提供全局 transition 时长缩放：
+
+```cpp
+core::setGlobalTransitionDurationScale(0.5f);
+float scale = core::globalTransitionDurationScale();
+```
+
+缩放只影响 `AnimatedValue::setTarget(...)` 收到的 `Transition`，会同时缩放 `durationSeconds` 和 `delaySeconds`；已经开始运行的动画不会被追溯改写。`Transition::none()` 仍保持无动画。缩放值会被限制在 `0.05f - 8.0f`，避免误传 `0` 或极端值导致动画系统不可控。
+
+Gallery 的 Settings 页面用 `Animation speed` 滑动条控制这个值：UI 显示的是速度倍率，底层写入的是时长缩放 `1.0f / speed`，所以 `2.0x` 表示动画时长减半。
+
+## DSL 写法
+
+```cpp
+ui.rect("actor")
+    .x(active ? 420.0f : 40.0f)
+    .opacity(active ? 0.42f : 1.0f)
+    .rotate(active ? 0.36f : 0.0f)
+    .transition(0.42f, core::Ease::OutBack)
+    .build();
+```
+
+也可以传完整 transition：
+
+```cpp
+core::Transition t = core::Transition::make(0.24f, core::Ease::OutCubic)
+    .animate(core::AnimProperty::Color | core::AnimProperty::Opacity);
+
+ui.rect("panel")
+    .color(nextColor)
+    .opacity(nextOpacity)
+    .transition(t)
+    .build();
+```
+
+## 可动画属性
+
+`Rect`：
+
+- `Frame`
+- `Color`
+- `Opacity`
+- `Radius`
+- `Border`
+- `Shadow`
+- `Blur`
+- `Transform`
+
+`Text`：
+
+- `Frame`
+- `TextColor`
+- `Opacity`
+- `Transform`
+
+`Image`：
+
+- `Frame`
+- `Color`
+- `Opacity`
+- `Radius`
+- `Transform`
+
+Gallery 的 Animation 页面包含 `Flip X`、`Flip Y`、`Depth` 三个矩阵变换示例按钮，分别用于检查 `rotateX` 卡片翻转、`rotateY` 卡片翻转、`translateZ + perspective` 透视动画。
+
+## 2.5D 变换
+
+Transform 支持 2D 和 2.5D API：
+
+```cpp
+ui.stack("card")
+    .size(220.0f, 132.0f)
+    .rotateY(flipped ? 3.14159f : 0.0f)
+    .translateZ(flipped ? 40.0f : 0.0f)
+    .perspective(520.0f)
+    .transformOrigin(0.5f, 0.5f)
+    .transition(0.42f, core::Ease::OutBack)
+    .animate(core::AnimProperty::Transform)
+    .build();
+```
+
+- `.rotateX(radians)`：绕元素局部 X 轴翻转，适合上下翻牌。
+- `.rotateY(radians)`：绕元素局部 Y 轴翻转，适合左右翻牌。
+- `.rotateZ(radians)` / `.rotate(radians)`：屏幕平面内旋转。
+- `.translate3d(x, y, z)` / `.translateZ(z)`：声明 Z 方向位移。
+- `.perspective(distance)`：设置透视距离，值越小透视越强，`0` 表示关闭透视。
+
+当前 2.5D 是 UI 平面投影，不是完整 3D 场景：绘制顺序仍由 DSL 树顺序和 `zIndex` 决定，不启用真实 depth buffer；默认 hit-test 按未 transform 的布局 frame 计算，需要跟随视觉投影时开启 `.transformedHitTest()`。
+
+## Hover / Press 动画
+
+交互矩形通过 `states` 开启：
+
+```cpp
+ui.rect("button.bg")
+    .states(normal, hover, pressed)
+    .onClick(callback)
+    .build();
+```
+
+Runtime 会维护：
+
+- `hoverBlend`
+- `pressBlend`
+
+颜色混合路径：
+
+```text
+normal -> hover -> pressed
+```
+
+按钮按压缩放通过 `visualStateFrom` 共享某个交互 rect 的 press 状态：
+
+```cpp
+ui.stack("button")
+    .size(w, h)
+    .visualStateFrom("button.bg", 0.965f)
+    .content([&] {
+        ui.rect("button.bg")
+            .size(w, h)
+            .states(normal, hover, pressed)
+            .build();
+    });
+```
+
+## 动画与 compose
+
+动画不是通过每帧改 DSL 树实现的。
+
+推荐模式：
+
+1. app 状态改变。
+2. compose 声明新的目标属性。
+3. Runtime 发现目标值变化。
+4. `AnimatedValue<T>` 从当前值插到新目标值。
+5. 每帧只标记相关 dirty rect。
+
+hover / press 是 Runtime 内部状态变化，不会触发重新 compose。
+
+click 回调可能修改 app 状态，所以 Runtime 会设置 `composeRequested()`，`include/eui/dsl_app.h` 再重新 compose。
+
+## 动画与脏区
+
+动画推进时，Runtime 会计算：
+
+```text
+dirty = union(oldVisualRect, newVisualRect)
+```
+
+对 `Rect`，visual rect 会考虑：
+
+- frame
+- shadow
+- blur
+- transform
+
+对 `Text`，dirty rect 默认使用文本 frame；声明 transform 时会使用 transform 后的文本 frame 外接矩形。父容器的 transform 会以投影矩阵继承到子树，所以整体缩放、旋转、2.5D 翻转、位移动画也会扩大对应子元素的保守脏区。
+
+然后 Runtime 使用 framebuffer cache + scissor 只重绘脏区。
+
+## 当前限制
+
+- 没有 timeline / keyframe API。
+- 没有 repeat / yoyo。
+- 没有动画完成回调。
+- 没有独立动画对象句柄。
+- shadow / blur 动画虽然支持，但成本较高，建议谨慎使用。
+- 当前脏区会保守扩大，优先保证正确性。

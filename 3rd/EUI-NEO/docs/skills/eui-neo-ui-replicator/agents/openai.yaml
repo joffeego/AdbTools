@@ -1,0 +1,4 @@
+interface:
+  display_name: "EUI-NEO UI Designer"
+  short_description: "Design or replicate polished desktop UI in EUI-NEO"
+  default_prompt: "Use $eui-neo-ui-replicator to design or recreate this desktop interface as an apps/ EUI-NEO app, with top-down readable UI code, concise section comments, built-in components first, Bing image placeholders when needed, and short non-looping transitions."

@@ -1,0 +1,66 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (MinGW-w64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+          update: true
+
+      - name: Configure
+        shell: msys2 {0}
+        run: cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --parallel
+
+      - name: Fetch scrcpy + adb
+        shell: pwsh
+        run: ./scripts/fetch_scrcpy.ps1 -Version latest -OutDir build/scrcpy
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $dist = "dist/AdbFileBrowser-windows-x64"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "build/adb_browser.exe" $dist/ -Force
+          Copy-Item -Recurse "build/assets"      "$dist/assets" -Force
+          Copy-Item -Recurse "build/scrcpy"      "$dist/scrcpy" -Force
+          Copy-Item "LICENSE"                    $dist/ -Force
+          Copy-Item "THIRD_PARTY_NOTICES.md"     $dist/ -Force
+          Compress-Archive -Path "$dist/*" -DestinationPath "dist/AdbFileBrowser-windows-x64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdbFileBrowser-windows-x64
+          path: dist/AdbFileBrowser-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AdbFileBrowser-windows-x64.zip
+          generate_release_notes: true
