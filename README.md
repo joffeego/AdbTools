@@ -7,6 +7,14 @@
 
 ---
 
+## 截图
+
+主界面（深色主题）：
+
+![ADB 文件浏览器主界面](screenshots/adbtools.png)
+
+---
+
 ## 功能特性
 
 - **设备管理**：自动探测 adb（SDK / PATH / 程序目录），列出并选择连接的设备，断线自动检测
@@ -58,7 +66,7 @@ AdbFileBrowser-windows-x64/
 
 ```bash
 # 1. 克隆仓库
-git clone --recursive https://github.com/<你的用户名>/AdbTools.git
+git clone --recursive https://github.com/joffeego/AdbTools.git
 cd AdbTools
 
 # 2. 配置（生成 MinGW Makefiles）
@@ -95,6 +103,7 @@ AdbTools/
 ├── THIRD_PARTY_NOTICES.md  # 第三方组件与许可
 ├── scripts/
 │   └── fetch_scrcpy.ps1    # 下载并解压 scrcpy（内含 adb）
+├── screenshots/            # README 截图
 ├── .github/workflows/      # CI 自动构建 / 发版
 └── 3rd/EUI-NEO/            # 框架源码（bundled，含少量定制修改）
 ```
@@ -109,9 +118,8 @@ AdbTools/
 - **adb**：从 Google 官方仓库 `dl.google.com/.../repository2-1.xml` 解析最新 platform-tools 版本；
 - **scrcpy**：从 GitHub Releases API 获取最新版本（更新前会先关闭投屏释放文件占用）。
 
-> ⚠️ **发布前必改**：本软件的自更新需要知道你的 GitHub 仓库地址，请在 `main.cpp` 顶部修改
-> `constexpr const char* kAppUpdateRepo = "yourname/AdbTools";` 为你的真实 `用户名/仓库名`，
-> 并同步把 `kAppVersion` 改成你本次发布的版本号。
+> 📌 **发版时同步版本号**：`kAppUpdateRepo` 已指向本仓库 `joffeego/AdbTools`，自更新地址无需再改；
+> 每次发版只需把 `main.cpp` 顶部的 `kAppVersion` 改成新版本号，提交后打 `vX.Y.Z` 标签推送即可自动发版。
 >
 > 若网络无法访问 GitHub，对应行会显示「最新版本：未知」，不影响其它项。
 
