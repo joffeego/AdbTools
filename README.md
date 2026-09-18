@@ -9,7 +9,7 @@
 
 ## 截图
 
-主界面（深色主题）：
+主界面（浅色主题）：
 
 ![ADB 文件浏览器主界面](screenshots/adbtools.png)
 
