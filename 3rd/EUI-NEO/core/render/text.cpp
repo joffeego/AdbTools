@@ -206,6 +206,14 @@ std::uint64_t& textAtlasGenerationCounter() {
     return generation;
 }
 
+// Incremented whenever the shared glyph atlas is cleared and repacked. Text
+// primitives track this so they can drop their stale glyph UV caches and
+// re-rasterize instead of rendering garbage after an atlas reset.
+std::uint64_t& textAtlasResetCounter() {
+    static std::uint64_t reset = 0;
+    return reset;
+}
+
 std::uint64_t& defaultFontGenerationCounter() {
     static std::uint64_t generation = 0;
     return generation;
@@ -239,6 +247,20 @@ bool retainSharedTextAtlas() {
 
 void releaseAtlasPage(AtlasPage& page) {
     page = {};
+}
+
+// Clear a page in place (keep its dimensions/pixels allocated) so glyph packing
+// can restart from the top-left. Text primitives re-rasterize via the reset
+// counter, so dropping the old UV coordinates here is safe.
+void resetAtlasPage(AtlasPage& page) {
+    page.x = 1;
+    page.y = 1;
+    page.rowHeight = 0;
+    page.glyphs.clear();
+    if (!page.pixels.empty()) {
+        std::fill(page.pixels.begin(), page.pixels.end(), 0);
+    }
+    page.generation = ++textAtlasGenerationCounter();
 }
 
 void releaseSharedTextAtlas() {
@@ -1114,6 +1136,7 @@ struct TextPrimitive::Impl {
     bool verticesDirty_ = true;
     bool fontDirty_ = true;
     std::uint64_t loadedFontGeneration_ = 0;
+    std::uint64_t atlasResetGeneration_ = 0;
 };
 
 bool TextPrimitive::Impl::initialize() {
@@ -1419,6 +1442,13 @@ void TextPrimitive::Impl::prepare() {
         fontDirty_ = true;
         invalidateLayout();
     }
+    if (atlasResetGeneration_ != textAtlasResetCounter()) {
+        // The shared glyph atlas was cleared and repacked, so our cached glyph
+        // UV coordinates are stale. Drop them and re-rasterize.
+        glyphs_.clear();
+        atlasResetGeneration_ = textAtlasResetCounter();
+        invalidateLayout();
+    }
     if (layoutDirty_) {
         rebuildLayout();
     }
@@ -1575,8 +1605,13 @@ bool TextPrimitive::Impl::ensureGlyph(const ShapedGlyph& shaped) {
             return true;
         }
         if (!appendToAtlas(atlas.color, rgba.data(), static_cast<int>(bitmap.width), static_cast<int>(bitmap.rows), 4, glyph)) {
-            cacheGlyph(shaped.key, glyph);
-            return true;
+            // Atlas full: clear and repack so we never permanently drop a glyph.
+            resetAtlasPage(atlas.color);
+            ++textAtlasResetCounter();
+            if (!appendToAtlas(atlas.color, rgba.data(), static_cast<int>(bitmap.width), static_cast<int>(bitmap.rows), 4, glyph)) {
+                cacheGlyph(shaped.key, glyph);
+                return true;
+            }
         }
         atlas.color.glyphs[cacheKey] = glyph;
     } else if (bitmap.pixel_mode == FT_PIXEL_MODE_GRAY) {
@@ -1586,8 +1621,13 @@ bool TextPrimitive::Impl::ensureGlyph(const ShapedGlyph& shaped) {
             return true;
         }
         if (!appendToAtlas(atlas.gray, gray.data(), static_cast<int>(bitmap.width), static_cast<int>(bitmap.rows), 1, glyph)) {
-            cacheGlyph(shaped.key, glyph);
-            return true;
+            // Atlas full: clear and repack so we never permanently drop a glyph.
+            resetAtlasPage(atlas.gray);
+            ++textAtlasResetCounter();
+            if (!appendToAtlas(atlas.gray, gray.data(), static_cast<int>(bitmap.width), static_cast<int>(bitmap.rows), 1, glyph)) {
+                cacheGlyph(shaped.key, glyph);
+                return true;
+            }
         }
         atlas.gray.glyphs[cacheKey] = glyph;
     } else {

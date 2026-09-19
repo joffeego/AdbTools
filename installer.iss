@@ -6,7 +6,7 @@
 ;   iscc installer.iss /DMyAppVersion=0.9.2
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.9.3"
+  #define MyAppVersion "0.9.4"
 #endif
 
 #define MyAppName "ADB 文件浏览器"

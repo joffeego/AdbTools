@@ -86,7 +86,7 @@ constexpr float kMirrorWindowWidth = 320.0f;
 constexpr float kMirrorWindowHeight = 640.0f;
 
 // Application version and the GitHub repo used for the app's own update check.
-constexpr const char* kAppVersion = "0.9.3";
+constexpr const char* kAppVersion = "0.9.4";
 constexpr const char* kAppUpdateRepo = "joffeego/AdbTools";
 
 constexpr float kScrollbarWidth = 10.0f;
@@ -707,6 +707,7 @@ struct AppState {
 
     // File search filter + filtered view.
     std::string fileFilter;
+    bool searchOpen = false;   // search box visible (toggled with Ctrl+F)
     std::vector<FsEntry> displayEntries;
 
     // App management.
@@ -3713,6 +3714,12 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
             break;
         }
         case eui::InputKey::Delete: confirmDelete(); break;
+        case eui::InputKey::F:
+            if (ev.modifiers.control) {
+                state.searchOpen = true;
+                app::requestFocus("list.search.input.hit");
+            }
+            break;
         case eui::InputKey::L:
             if (ev.modifiers.control) {
                 state.pathInput = state.currentPath;
@@ -3728,6 +3735,14 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
             if (ev.modifiers.control) {
                 state.selectedSet.clear();
                 for (const FsEntry& e : state.entries) state.selectedSet.insert(e.name);
+            }
+            break;
+        case eui::InputKey::Escape:
+            if (state.searchOpen) {
+                state.fileFilter.clear();
+                state.searchOpen = false;
+                applyFileFilter();
+                resetListScroll();
             }
             break;
         default: break;
@@ -4000,15 +4015,15 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
             .build();
     }
 
-    // Floating search box at the top-right of the list.
-    if (!state.fileFilter.empty() || !state.entries.empty()) {
+    // Floating search box at the top-right of the list (Ctrl+F to show, X to hide).
+    if (state.searchOpen) {
         ui.stack("list.search.wrap")
-            .x(x + w - 216.0f).y(y + 4.0f).size(200.0f, 32.0f)
+            .x(x + w - 244.0f).y(y + 4.0f).size(228.0f, 32.0f)
             .zIndex(20)
             .content([&] {
                 components::input(ui, "list.search.input")
                     .theme(themeTokens())
-                    .size(200.0f, 32.0f)
+                    .size(192.0f, 32.0f)
                     .fontSize(13.0f)
                     .fontFamily("")
                     .placeholder("搜索文件…")
@@ -4018,6 +4033,25 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
                         applyFileFilter();
                         resetListScroll();
                     })
+                    .build();
+                ui.rect("list.search.close")
+                    .x(196.0f).y(0.0f).size(32.0f, 32.0f)
+                    .states(kClear, kSurfaceHover, kSurfaceAct)
+                    .radius(6.0f)
+                    .onClick([] {
+                        state.fileFilter.clear();
+                        state.searchOpen = false;
+                        applyFileFilter();
+                        resetListScroll();
+                    })
+                    .build();
+                ui.text("list.search.close.icon")
+                    .x(196.0f).y(0.0f).size(32.0f, 32.0f)
+                    .icon(0xF00D)
+                    .fontSize(12.0f).lineHeight(12.0f)
+                    .color(kMuted)
+                    .horizontalAlign(eui::HorizontalAlign::Center)
+                    .verticalAlign(eui::VerticalAlign::Center)
                     .build();
             })
             .build();
