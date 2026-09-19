@@ -15,7 +15,7 @@
 
 [Setup]
 ; A stable GUID: keep it unchanged across releases so upgrades replace cleanly.
-AppId={{B7A2C9E4-1D5F-4A3B-8C6E-0F9D2A5B7C1E}
+AppId={{B7A2C9E4-1D5F-4A3B-8C6E-0F9D2A5B7C1E}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
