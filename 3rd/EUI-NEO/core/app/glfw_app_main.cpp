@@ -668,8 +668,10 @@ int eui_app_run() {
         const float scale = (sx + sy) * 0.5f;
         int w = static_cast<int>(app::initialWindowWidth() * scale);
         int h = static_cast<int>(app::initialWindowHeight() * scale);
-        if (workW > 0 && w > workW) w = workW;
-        if (workH > 0 && h > workH) h = workH;
+        // Leave a small desktop margin so the window never literally fills the
+        // whole work-area height/width.
+        if (workW > 0 && w > workW - 32) w = std::max(0, workW - 32);
+        if (workH > 0 && h > workH - 48) h = std::max(0, workH - 48);
         windowRequest.width = w;
         windowRequest.height = h;
     }

@@ -581,7 +581,7 @@ struct AppSettings {
     int mirrorW = 320;
     int mirrorH = 640;
     int windowW = 1000;
-    int windowH = 680;
+    int windowH = 520;
 };
 
 struct AppState {
@@ -1073,8 +1073,10 @@ void clampToWorkArea(int& w, int& h) {
         const int maxW = wa.right - wa.left;
         const int maxH = wa.bottom - wa.top;
         if (maxW > 0 && maxH > 0) {
-            if (w > maxW) w = maxW;
-            if (h > maxH) h = maxH;
+            // Leave a small desktop margin so the window never literally fills
+            // the whole work-area height/width.
+            if (w > maxW - 32) w = std::max(0, maxW - 32);
+            if (h > maxH - 48) h = std::max(0, maxH - 48);
         }
     }
 #endif
@@ -5841,7 +5843,7 @@ const DslAppConfig& dslAppConfig() {
         .title("ADB 文件浏览器")
         .pageId("adb_file_browser")
         .clearColor(kBackground)
-        .windowSize(1000, 680)
+        .windowSize(1000, 520)
         .textFont("C:/Windows/Fonts/msyh.ttc")
         .fps(90.0)
         .onKeyEvent([](const eui::KeyEvent& ev) { handleGlobalKey(ev); });
@@ -5869,7 +5871,7 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
         {
             const float ms = windowDpiScale();
             app::setMinWindowSize(static_cast<int>(940.0f * ms),
-                                  static_cast<int>(480.0f * ms));
+                                  static_cast<int>(440.0f * ms));
         }
         fetchAdbVersion();
         refreshDevices();
