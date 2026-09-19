@@ -86,7 +86,7 @@ constexpr float kMirrorWindowWidth = 320.0f;
 constexpr float kMirrorWindowHeight = 640.0f;
 
 // Application version and the GitHub repo used for the app's own update check.
-constexpr const char* kAppVersion = "0.9.5";
+constexpr const char* kAppVersion = "0.9.6";
 constexpr const char* kAppUpdateRepo = "joffeego/AdbTools";
 
 constexpr float kScrollbarWidth = 10.0f;
@@ -883,7 +883,9 @@ void onTitleBarPress() {
 // Settings (system font family / weight / UI scale)
 // =============================================================================
 std::string settingsFilePath() {
-    return "adb_file_browser_settings.txt";
+    // Store next to the executable (not the CWD) so settings survive updates
+    // and are consistent regardless of how the app is launched.
+    return executableDir() + "\\adb_file_browser_settings.txt";
 }
 
 void saveSettings() {
@@ -1241,8 +1243,8 @@ struct CommandEntry {
 std::vector<Bookmark> bookmarks;
 std::vector<CommandEntry> commands;
 
-std::string bookmarksFilePath() { return "adb_file_browser_bookmarks.txt"; }
-std::string commandsFilePath() { return "adb_file_browser_commands.txt"; }
+std::string bookmarksFilePath() { return executableDir() + "\\adb_file_browser_bookmarks.txt"; }
+std::string commandsFilePath() { return executableDir() + "\\adb_file_browser_commands.txt"; }
 
 void saveBookmarks() {
     std::ofstream out(bookmarksFilePath(), std::ios::trunc);
@@ -1293,7 +1295,7 @@ void loadCommands() {
     }
 }
 
-std::string lastPathsFilePath() { return "adb_file_browser_lastpaths.txt"; }
+std::string lastPathsFilePath() { return executableDir() + "\\adb_file_browser_lastpaths.txt"; }
 
 void saveLastPaths() {
     std::ofstream out(lastPathsFilePath(), std::ios::trunc);
@@ -4292,7 +4294,7 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
                [] { doScreenshot(); });
     composeHoverTip(ui, "topbar.screenshot.tip", "topbar.screenshot.bg", "截图", ssX + h * 0.5f, y + h + 4.0f);
     const float apkX = ssX + h + 6.0f;
-    toolButton(ui, "topbar.install", apkX, y, h, h, 0xF17B, "", false, !state.selectedDevice.empty(),
+    toolButton(ui, "topbar.install", apkX, y, h, h, 0xF50D, "", false, !state.selectedDevice.empty(),
                [] { doInstallApk(); });
     composeHoverTip(ui, "topbar.install.tip", "topbar.install.bg", "安装 APK", apkX + h * 0.5f, y + h + 4.0f);
     const float infoX = apkX + h + 6.0f;
@@ -4300,7 +4302,7 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
                [] { openDeviceInfo(); });
     composeHoverTip(ui, "topbar.info.tip", "topbar.info.bg", "设备信息", infoX + h * 0.5f, y + h + 4.0f);
     const float logcatX = infoX + h + 6.0f;
-    toolButton(ui, "topbar.logcat", logcatX, y, h, h, 0xF0F6, "", false, !state.selectedDevice.empty(),
+    toolButton(ui, "topbar.logcat", logcatX, y, h, h, 0xF15C, "", false, !state.selectedDevice.empty(),
                [] { openLogcat(); });
     composeHoverTip(ui, "topbar.logcat.tip", "topbar.logcat.bg", "logcat", logcatX + h * 0.5f, y + h + 4.0f);
     const float hiddenX = logcatX + h + 6.0f;
