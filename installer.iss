@@ -6,7 +6,7 @@
 ;   iscc installer.iss /DMyAppVersion=0.9.2
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.9.1"
+  #define MyAppVersion "0.9.3"
 #endif
 
 #define MyAppName "ADB 文件浏览器"
@@ -33,6 +33,7 @@ WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
+Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
