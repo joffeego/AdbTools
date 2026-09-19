@@ -86,7 +86,7 @@ constexpr float kMirrorWindowWidth = 320.0f;
 constexpr float kMirrorWindowHeight = 640.0f;
 
 // Application version and the GitHub repo used for the app's own update check.
-constexpr const char* kAppVersion = "0.9.4";
+constexpr const char* kAppVersion = "0.9.5";
 constexpr const char* kAppUpdateRepo = "joffeego/AdbTools";
 
 constexpr float kScrollbarWidth = 10.0f;
@@ -3009,6 +3009,29 @@ bool downloadFile(const std::string& url, const std::wstring& outPath, std::stri
     return ok;
 }
 
+// GitHub (github.com and its release CDN) is often unreachable in some regions.
+// If a direct download fails, retry through common GitHub mirror prefixes.
+bool downloadFileWithFallback(const std::string& url, const std::wstring& outPath, std::string& err) {
+    if (downloadFile(url, outPath, err)) {
+        return true;
+    }
+    if (url.find("github.com") == std::string::npos &&
+        url.find("githubusercontent.com") == std::string::npos) {
+        return false;
+    }
+    static const char* kProxies[] = {
+        "https://ghfast.top/",
+        "https://gh-proxy.com/",
+        "https://gh.con.sh/",
+    };
+    for (const char* proxy : kProxies) {
+        if (downloadFile(std::string(proxy) + url, outPath, err)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void stopScrcpyIfRunning() {
     if (state.scrcpyOpen) closeMirrorWindow();
     if (g_scrcpyProcess != nullptr) {
@@ -3029,7 +3052,7 @@ app::async::Result<std::string> installScrcpyWorker(const std::string& url, cons
     std::string err;
 
     g_dlStage = 1;
-    if (!downloadFile(url, toWide(zip), err)) {
+    if (!downloadFileWithFallback(url, toWide(zip), err)) {
         cleanupDir(work);
         return app::async::failure<std::string>("下载失败：" + err);
     }
@@ -3111,7 +3134,7 @@ app::async::Result<std::string> installAppUpdateWorker(const std::string& url, c
     std::string err;
 
     g_dlStage = 1;
-    if (!downloadFile(url, toWide(zip), err)) {
+    if (!downloadFileWithFallback(url, toWide(zip), err)) {
         cleanupDir(work);
         return app::async::failure<std::string>("下载失败：" + err);
     }
