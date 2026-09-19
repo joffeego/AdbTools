@@ -5863,6 +5863,14 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
         app::setFontScale(settings.fontSizeScale);
         app::setUiScale(settings.uiScale);
         restoreWindowState();
+        // Prevent the user from shrinking the window below the size where the
+        // fixed toolbar layout would overlap. Sizes are logical; convert to
+        // physical pixels for the current DPI.
+        {
+            const float ms = windowDpiScale();
+            app::setMinWindowSize(static_cast<int>(940.0f * ms),
+                                  static_cast<int>(480.0f * ms));
+        }
         fetchAdbVersion();
         refreshDevices();
         app::setDropHandler([](const std::vector<std::string>& files) {

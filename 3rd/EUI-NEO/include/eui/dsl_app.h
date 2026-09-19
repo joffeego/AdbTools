@@ -117,6 +117,7 @@ bool isWindowMaximized();
 void startWindowDrag();
 void* mainWindowHwnd();
 void setWindowSize(int width, int height);
+void setMinWindowSize(int width, int height);
 
 // Runtime UI configuration (settings dialog).
 void setUiScale(float scale);

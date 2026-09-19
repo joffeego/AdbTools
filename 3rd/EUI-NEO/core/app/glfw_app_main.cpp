@@ -99,6 +99,13 @@ void setWindowSize(int width, int height) {
     glfwSetWindowSize(g_mainWindow, width, height);
 }
 
+void setMinWindowSize(int width, int height) {
+    if (g_mainWindow == nullptr) {
+        return;
+    }
+    glfwSetWindowSizeLimits(g_mainWindow, width, height, GLFW_DONT_CARE, GLFW_DONT_CARE);
+}
+
 void startWindowDrag() {
 #ifdef _WIN32
     // Drag whichever window is under the cursor so child windows (e.g. the
