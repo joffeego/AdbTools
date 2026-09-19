@@ -24,6 +24,9 @@ adb_browser_edit_tmp.txt
 /build/scrcpy/
 /scrcpy-*/
 
+# ---- Local-only docs (contain secrets / token, never push) ----
+维护与发版指南.md
+
 # ---- IDE / OS ----
 .vscode/
 .idea/
