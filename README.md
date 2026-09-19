@@ -33,9 +33,12 @@
 
 ## 下载与安装
 
-> 本项目为**便携版**，无需安装。到 [Releases](../../releases) 页面下载 `AdbFileBrowser-windows-x64.zip`，解压后双击 `adb_browser.exe` 即可运行。
+到 [Releases](../../releases) 页面下载，有两种选择：
 
-解压后的目录结构：
+- **安装版**：`AdbTools-Setup-*.exe` —— 双击运行安装向导，自动创建开始菜单快捷方式（可选桌面快捷方式），并附带卸载程序。安装到用户目录（`%LOCALAPPDATA%\Programs\AdbTools`），无需管理员权限。
+- **便携版**：`AdbFileBrowser-windows-x64.zip` —— 解压后双击 `adb_browser.exe` 即可运行，无需安装。
+
+便携版解压后的目录结构：
 
 ```
 AdbFileBrowser-windows-x64/

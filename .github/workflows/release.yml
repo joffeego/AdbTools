@@ -39,6 +39,25 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch_scrcpy.ps1 -Version latest -OutDir build/scrcpy
 
+      - name: Set version
+        id: version
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          if ($v -like 'v*') { $v = $v.Substring(1) }
+          if (-not $v) { $v = "0.0.0" }
+          "APP_VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: cmd
+        run: |
+          set "PATH=%PATH%;C:\Program Files (x86)\Inno Setup 6"
+          iscc installer.iss /DMyAppVersion=%APP_VERSION%
+
       - name: Assemble portable package
         shell: pwsh
         run: |
@@ -55,12 +74,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AdbFileBrowser-windows-x64
-          path: dist/AdbFileBrowser-windows-x64.zip
+          path: |
+            dist/AdbFileBrowser-windows-x64.zip
+            dist/AdbTools-Setup-*.exe
           if-no-files-found: error
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/AdbFileBrowser-windows-x64.zip
+          files: |
+            dist/AdbFileBrowser-windows-x64.zip
+            dist/AdbTools-Setup-*.exe
           generate_release_notes: true
