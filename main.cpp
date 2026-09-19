@@ -1092,6 +1092,18 @@ void restoreWindowState() {
     }
 }
 
+// Set the minimum window size so the fixed toolbar layout can't be shrunk into
+// overlap. The toolbar needs ~840 logical width (after the compaction tweaks),
+// and the layout is in logical units, so the physical minimum scales with both
+// the monitor DPI and the UI scale setting.
+void applyMinWindowSize() {
+#ifdef _WIN32
+    const float scale = windowDpiScale() * settings.uiScale;
+    app::setMinWindowSize(static_cast<int>(880.0f * scale),
+                          static_cast<int>(420.0f * scale));
+#endif
+}
+
 void setDarkMode(bool dark) {
     settings.darkMode = dark;
     applyTheme();
@@ -1203,6 +1215,7 @@ void selectFontWeight(int weight) {
 void selectUiScale(float scale) {
     settings.uiScale = scale;
     applySettingsNow();
+    applyMinWindowSize();
 }
 
 void selectFontScale(float scale) {
@@ -4155,7 +4168,7 @@ void composeHoverTip(eui::Ui& ui, const std::string& id, const std::string& sour
 }
 
 void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
-    const float devW = 240.0f;
+    const float devW = 200.0f;
 
     // Device selector (opens a context menu).
     std::string deviceLabel = state.selectedDevice.empty() ? "无设备" : state.selectedDevice;
@@ -4201,12 +4214,12 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
         .build();
 
     // Refresh-devices button.
-    toolButton(ui, "topbar.refreshdev", x + devW + 8.0f, y, h, h, 0xF021, "", false, true,
+    toolButton(ui, "topbar.refreshdev", x + devW + 6.0f, y, h, h, 0xF021, "", false, true,
                [] { refreshDevices(); });
     composeHoverTip(ui, "topbar.refreshdev.tip", "topbar.refreshdev.bg",
-                    "刷新设备", x + devW + 8.0f + h * 0.5f, y + h + 4.0f);
+                    "刷新设备", x + devW + 6.0f + h * 0.5f, y + h + 4.0f);
 
-    const float cmdX = x + devW + 8.0f + h + 8.0f;
+    const float cmdX = x + devW + 6.0f + h + 6.0f;
     toolButton(ui, "topbar.command", cmdX, y, h, h, 0xF120, "", false, true,
                [cmdX, y, h] {
                    state.commandMenuOpen = true;
@@ -4217,28 +4230,28 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
                     "常用命令", cmdX + h * 0.5f, y + h + 4.0f);
 
     // Device tools + view options.
-    const float ssX = cmdX + h + 8.0f;
+    const float ssX = cmdX + h + 6.0f;
     toolButton(ui, "topbar.screenshot", ssX, y, h, h, 0xF030, "", false, !state.selectedDevice.empty(),
                [] { doScreenshot(); });
     composeHoverTip(ui, "topbar.screenshot.tip", "topbar.screenshot.bg", "截图", ssX + h * 0.5f, y + h + 4.0f);
-    const float apkX = ssX + h + 8.0f;
+    const float apkX = ssX + h + 6.0f;
     toolButton(ui, "topbar.install", apkX, y, h, h, 0xF17B, "", false, !state.selectedDevice.empty(),
                [] { doInstallApk(); });
     composeHoverTip(ui, "topbar.install.tip", "topbar.install.bg", "安装 APK", apkX + h * 0.5f, y + h + 4.0f);
-    const float infoX = apkX + h + 8.0f;
+    const float infoX = apkX + h + 6.0f;
     toolButton(ui, "topbar.info", infoX, y, h, h, 0xF05A, "", false, !state.selectedDevice.empty(),
                [] { openDeviceInfo(); });
     composeHoverTip(ui, "topbar.info.tip", "topbar.info.bg", "设备信息", infoX + h * 0.5f, y + h + 4.0f);
-    const float logcatX = infoX + h + 8.0f;
+    const float logcatX = infoX + h + 6.0f;
     toolButton(ui, "topbar.logcat", logcatX, y, h, h, 0xF0F6, "", false, !state.selectedDevice.empty(),
                [] { openLogcat(); });
     composeHoverTip(ui, "topbar.logcat.tip", "topbar.logcat.bg", "logcat", logcatX + h * 0.5f, y + h + 4.0f);
-    const float hiddenX = logcatX + h + 8.0f;
+    const float hiddenX = logcatX + h + 6.0f;
     toolButton(ui, "topbar.hidden", hiddenX, y, h, h, state.showHidden ? 0xF06E : 0xF070, "", false, true,
                [] { state.showHidden = !state.showHidden; refreshListing(); saveSettings(); });
     composeHoverTip(ui, "topbar.hidden.tip", "topbar.hidden.bg",
                     state.showHidden ? "隐藏文件已显示" : "显示隐藏文件", hiddenX + h * 0.5f, y + h + 4.0f);
-    const float mirrorX = hiddenX + h + 8.0f;
+    const float mirrorX = hiddenX + h + 6.0f;
     toolButton(ui, "topbar.mirror", mirrorX, y, h, h, 0xF108, "", false, !state.selectedDevice.empty(),
                [] { openMirror(); });
     composeHoverTip(ui, "topbar.mirror.tip", "topbar.mirror.bg", "投屏", mirrorX + h * 0.5f, y + h + 4.0f);
@@ -4248,10 +4261,10 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
     float rightX = x + w;
     auto place = [&](const std::string& id, unsigned int icon, bool primary, bool enabled,
                      std::function<void()> cb, const std::string& tip) {
-        rightX -= 40.0f;
-        toolButton(ui, id, rightX, y, 40.0f, h, icon, "", primary, enabled, std::move(cb));
-        composeHoverTip(ui, id + ".tip", id + ".bg", tip, rightX + 20.0f, y + h + 4.0f);
-        rightX -= 8.0f;
+        rightX -= 38.0f;
+        toolButton(ui, id, rightX, y, 38.0f, h, icon, "", primary, enabled, std::move(cb));
+        composeHoverTip(ui, id + ".tip", id + ".bg", tip, rightX + 19.0f, y + h + 4.0f);
+        rightX -= 6.0f;
     };
 
     place("topbar.delete", 0xF1F8, false, canAct, [] { confirmDelete(); }, "删除");
@@ -5865,14 +5878,7 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
         app::setFontScale(settings.fontSizeScale);
         app::setUiScale(settings.uiScale);
         restoreWindowState();
-        // Prevent the user from shrinking the window below the size where the
-        // fixed toolbar layout would overlap. Sizes are logical; convert to
-        // physical pixels for the current DPI.
-        {
-            const float ms = windowDpiScale();
-            app::setMinWindowSize(static_cast<int>(940.0f * ms),
-                                  static_cast<int>(440.0f * ms));
-        }
+        applyMinWindowSize();
         fetchAdbVersion();
         refreshDevices();
         app::setDropHandler([](const std::vector<std::string>& files) {
