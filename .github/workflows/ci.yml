@@ -55,7 +55,11 @@ jobs:
           ADBTOOLS_TEST_TRACE: '1'
         run: |
           cd build
-          ctest --output-on-failure 2>&1
+          # -LE device: the device end-to-end tests need a real phone and self-skip
+          # without one. Excluding them by label (rather than relying on the skip)
+          # keeps a future failure from hiding behind "no device connected" - and
+          # they are run explicitly on a developer machine.
+          ctest --output-on-failure -LE device 2>&1
 
       # Runs the binary directly as well: a crash inside one case (e.g. a
       # std::bad_alloc) can abort the process under ctest without printing the

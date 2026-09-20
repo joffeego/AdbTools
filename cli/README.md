@@ -81,6 +81,31 @@ builders and parsers, which is what makes `devices`, `list`, `push`, `pull`,
 `rm`, `mkdir`, `install`, `uninstall`, `packages`, `screenshot` and `version`
 testable and keeps the GUI and CLI from drifting apart.
 
+## Tests
+
+- **Unit tests** (`ctest -LE device`) cover the core logic without a device.
+- **Device end-to-end tests** (`tests/device_tests.ps1`, `ctest -L device`) drive
+  this CLI against a real phone: 42 checks covering the CLI contract (exit codes,
+  `--json`), device/listing parsing, byte-for-byte push/pull round trips
+  (including names with spaces), batch deletion with a genuine partial failure,
+  the package list, and the screenshot path (it asserts the PNG signature).
+  They self-skip with exit code 0 when no device is connected, and clean up the
+  test directory on the device even when they fail.
+
+  CI excludes them with `ctest -LE device` rather than relying on that skip, so a
+  future failure cannot hide behind "no device connected".
+
+## Known limitation: non-ASCII file names
+
+`adb` itself mangles non-ASCII names on a system with a non-UTF-8 ANSI code page
+(936 here): `adb push 中文名.txt` run *directly*, with this project out of the
+picture, either fails with `remote couldn't create file: Is a directory` or
+leaves a truncated name on the device (`中文.`), and Latin-1 names lose their last
+byte (`café.txt` → `café.tx`). The CLI only forwards the argument, so this is an
+`adb`/environment problem, not something the app can fix here — but the device
+test reports what it observes instead of asserting success, so the behaviour is
+recorded rather than hidden.
+
 ## Not implemented yet
 
 - `pull`/`push` of whole directory trees recursively (adb handles it, but there

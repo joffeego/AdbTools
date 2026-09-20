@@ -252,9 +252,11 @@ int cmdPush(const Options& options) {
     }
     if (options.json) {
         std::cout << "{\"pushed\":" << ok << ",\"failed\":" << failed << "}\n";
-    } else if (failed) {
-        // Every item is attempted, and the summary says what actually happened -
-        // the same rule the GUI's batch operations follow.
+    } else {
+        // Always report, including the all-succeeded case: silence is
+        // indistinguishable from a command that did nothing. Every item is
+        // attempted and the summary says what actually happened - the same rule
+        // the GUI's batch operations follow.
         emit("完成：成功 " + std::to_string(ok) + "，失败 " + std::to_string(failed));
     }
     return failed == 0 ? kExitOk : kExitFailure;
@@ -292,7 +294,8 @@ int cmdPull(const Options& options) {
     }
     if (options.json) {
         std::cout << "{\"pulled\":" << ok << ",\"failed\":" << failed << "}\n";
-    } else if (failed) {
+    } else {
+        // Always report; see the note in cmdPush.
         emit("完成：成功 " + std::to_string(ok) + "，失败 " + std::to_string(failed));
     }
     return failed == 0 ? kExitOk : kExitFailure;
@@ -321,6 +324,10 @@ int cmdRemove(const Options& options) {
     if (options.json) {
         std::cout << "{\"removed\":" << ok << ",\"failed\":" << failed << "}\n";
     } else {
+        // Always report, including the all-succeeded case: a silent `rm a b` is
+        // indistinguishable from a command that did nothing, and it gives
+        // scripts nothing to confirm against. The GUI's batch delete behaves the
+        // same way, and the wording matches it.
         emit("已删除 " + std::to_string(ok) + " 项" +
              (failed ? "，失败 " + std::to_string(failed) + " 项" : ""));
     }

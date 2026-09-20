@@ -151,4 +151,39 @@ if(ADBTOOLS_BUILD_TESTS)
     endif()
 
     add_test(NAME core COMMAND adbtools_tests)
+    set_tests_properties(core PROPERTIES LABELS "unit")
+
+    # -------------------------------------------------------------------------
+    # Device end-to-end tests: drive the real executable's CLI against a real
+    # Android device. These cover what the unit tests cannot - that the commands,
+    # the adb invocation and the parsers work together on a phone.
+    #
+    # They self-skip (exit 0) when no device is connected, so `ctest` stays green
+    # on a machine without one. CI excludes them explicitly with
+    # `ctest -LE device` because a runner has no device and the skip would
+    # otherwise hide a genuine failure.
+    # -------------------------------------------------------------------------
+    find_program(ADBTOOLS_PWSH NAMES pwsh powershell)
+    if(WIN32 AND ADBTOOLS_PWSH)
+        # Windows PowerShell 5.1 reads a .ps1 without a UTF-8 BOM as ANSI, which
+        # mangles the Chinese text in this script badly enough to break its
+        # parser. Fail loudly at configure time rather than letting the test fail
+        # with a confusing syntax error; scripts/fix_ps1_bom.py repairs it.
+        set(ADBTOOLS_DEVICE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/tests/device_tests.ps1")
+        file(READ "${ADBTOOLS_DEVICE_TEST}" ADBTOOLS_DEVICE_TEST_HEAD LIMIT 3 HEX)
+        if(NOT ADBTOOLS_DEVICE_TEST_HEAD STREQUAL "efbbbf")
+            message(FATAL_ERROR
+                "tests/device_tests.ps1 lost its UTF-8 BOM. Run "
+                "`python scripts/fix_ps1_bom.py` - without it PowerShell 5.1 reads "
+                "the file as ANSI and the Chinese strings break the parser.")
+        endif()
+
+        add_test(NAME device
+            COMMAND "${ADBTOOLS_PWSH}" -NoProfile -ExecutionPolicy Bypass
+                    -File "${ADBTOOLS_DEVICE_TEST}"
+                    -Bin "${CMAKE_CURRENT_BINARY_DIR}/adb_browser.exe")
+        set_tests_properties(device PROPERTIES
+            LABELS "device"
+            TIMEOUT 600)
+    endif()
 endif()
