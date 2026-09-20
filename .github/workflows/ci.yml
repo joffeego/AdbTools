@@ -81,26 +81,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: core/ must not include the UI framework or Windows headers
+      - name: core/ must not include the UI framework; platform headers only where documented
         run: |
           set -uo pipefail
           status=0
+
           if grep -rn --include='*.cpp' --include='*.h' -E 'eui_neo\.h|"eui/|<eui/|glfw' core/; then
             echo "::error::core/ must not include the UI framework (see core/README.md)"
             status=1
           fi
-          # <windows.h> may only appear guarded by _WIN32.
-          if grep -rn --include='*.cpp' --include='*.h' '#include <windows.h>' core/ \
-               | grep -v 'sha256.cpp' ; then
-            echo "::error::only core/sha256.cpp may include <windows.h> (for CNG)"
+
+          # Three files are allowed a platform header, each for a documented
+          # reason: sha256 (CNG hashing), process (CreateProcess/pipes), adbpath
+          # (GetModuleFileNameW). Everything else must be portable, and each of
+          # the three must guard its include with #ifdef _WIN32 so core/ still
+          # builds on the Linux job.
+          allowed='^(core/sha256\.cpp|core/process\.cpp|core/adbpath\.cpp):'
+          offenders=$(grep -rn --include='*.cpp' --include='*.h' '#include <windows.h>' core/ \
+                        | grep -vE "$allowed" || true)
+          if [ -n "$offenders" ]; then
+            echo "::error::only sha256.cpp, process.cpp and adbpath.cpp may include <windows.h>"
+            echo "$offenders"
             status=1
           fi
-          if ! grep -q '#ifdef _WIN32' core/sha256.cpp; then
-            echo "::error::core/sha256.cpp must guard its Windows include with #ifdef _WIN32"
-            status=1
-          fi
+
+          for f in core/sha256.cpp core/process.cpp core/adbpath.cpp; do
+            if ! grep -q '#ifdef _WIN32' "$f"; then
+              echo "::error::$f must guard its Windows include with #ifdef _WIN32"
+              status=1
+            fi
+          done
+
           if [ "$status" -eq 0 ]; then
-            echo "core/ is free of GUI includes; its only platform dependency is guarded."
+            echo "core/ is free of GUI includes; each platform dependency is documented and guarded."
           fi
           exit $status
 
