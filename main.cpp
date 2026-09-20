@@ -87,7 +87,7 @@ constexpr float kMirrorWindowWidth = 320.0f;
 constexpr float kMirrorWindowHeight = 640.0f;
 
 // Application version and the GitHub repo used for the app's own update check.
-constexpr const char* kAppVersion = "0.9.7";
+constexpr const char* kAppVersion = "0.9.8";
 constexpr const char* kAppUpdateRepo = "joffeego/AdbTools";
 
 constexpr float kScrollbarWidth = 10.0f;
