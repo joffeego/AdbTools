@@ -3,7 +3,7 @@
 ; Build the portable files first (adb_browser.exe + assets/ + scrcpy/), then run:
 ;   iscc installer.iss
 ; or override the version from CI:
-;   iscc installer.iss /DMyAppVersion=0.9.2
+;   iscc installer.iss /DMyAppVersion=X.Y.Z   (the CI passes the tag version here)
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.10.0"
