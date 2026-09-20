@@ -16,10 +16,12 @@
 
 #include "eui_neo.h"
 
+#include "core/adb.h"
 #include "core/fileio.h"
 #include "core/package.h"
 #include "core/paths.h"
 #include "core/sha256.h"
+#include "core/store.h"
 #include "core/strings.h"
 #include "core/version.h"
 
@@ -309,28 +311,14 @@ ProcessResult runProcess(const std::string& program,
 }
 
 // =============================================================================
-// Data model
+// Data model & adb output parsing - see core/adb.h
 // =============================================================================
-struct Device {
-    std::string serial;
-    std::string state;
-};
-
-struct FsEntry {
-    std::string name;
-    bool isDir = false;
-    bool isLink = false;
-    bool isOther = false;
-    long long size = 0;
-    std::string perms;
-    std::string date;
-    std::string linkTarget;
-};
-
-struct ListingResult {
-    std::vector<FsEntry> entries;
-    bool writable = false;
-};
+// The structs and parsers live in core/adb.cpp so they can be unit tested
+// against real adb output; the using-declarations keep the call sites here
+// unchanged.
+using adb::core::Device;
+using adb::core::FsEntry;
+using adb::core::ListingResult;
 
 // =============================================================================
 // ADB discovery
@@ -389,6 +377,8 @@ std::string findAdb() {
     return "";
 }
 
+// Kept here rather than in core/: it reads the process environment
+// (USERPROFILE / HOME) instead of doing pure computation.
 std::string defaultDownloadDir() {
     const char* profile = std::getenv("USERPROFILE");
     if (profile != nullptr && *profile != '\0') return std::string(profile) + "\\Downloads";
@@ -397,86 +387,6 @@ std::string defaultDownloadDir() {
     return ".";
 }
 
-// =============================================================================
-// Parsing adb output
-// =============================================================================
-std::vector<Device> parseDevices(const std::string& output) {
-    std::vector<Device> devices;
-    std::istringstream in(output);
-    std::string line;
-    bool first = true;
-    while (std::getline(in, line)) {
-        line = core::trim(line);
-        if (line.empty()) continue;
-        if (line.find("daemon") != std::string::npos) continue;
-        if (first && line.rfind("List of devices", 0) == 0) { first = false; continue; }
-        first = false;
-        std::vector<std::string> tokens = core::splitWs(line);
-        if (tokens.empty() || tokens[0].empty()) continue;
-        Device d;
-        d.serial = tokens[0];
-        d.state = tokens.size() > 1 ? tokens[1] : "";
-        devices.push_back(std::move(d));
-    }
-    return devices;
-}
-
-std::vector<FsEntry> parseLsLa(const std::string& output) {
-    std::vector<FsEntry> entries;
-    std::istringstream in(output);
-    std::string line;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        std::string trimmed = core::trim(line);
-        if (trimmed.empty()) continue;
-        if (trimmed.rfind("total ", 0) == 0) continue;
-
-        std::vector<std::string> tokens = core::splitWs(trimmed);
-        if (tokens.size() < 6) continue;
-
-        FsEntry e;
-        e.perms = tokens[0];
-        if (!e.perms.empty()) {
-            char c = e.perms[0];
-            e.isDir = (c == 'd');
-            e.isLink = (c == 'l');
-            e.isOther = !(c == '-' || c == 'd' || c == 'l');
-        }
-        e.size = core::parseSize(tokens[4]);
-
-        // The name starts after the date columns. `ls -l` shows either
-        // "Mon DD HH:MM" / "Mon DD YYYY" (8 metadata fields) or an ISO date
-        // "YYYY-MM-DD HH:MM" (7 metadata fields).
-        int nameStart = 8;
-        if (tokens.size() >= 7 && core::isMonthName(tokens[5])) {
-            nameStart = 8;
-        } else {
-            nameStart = 7;
-        }
-        if (nameStart == 8) {
-            e.date = tokens[5] + " " + tokens[6] + " " + tokens[7];
-        } else {
-            e.date = tokens[5] + " " + tokens[6];
-        }
-
-        std::string name;
-        for (std::size_t i = static_cast<std::size_t>(nameStart); i < tokens.size(); ++i) {
-            if (!name.empty()) name += " ";
-            name += tokens[i];
-        }
-        if (e.isLink) {
-            std::size_t arrow = name.find(" -> ");
-            if (arrow != std::string::npos) {
-                e.linkTarget = name.substr(arrow + 4);
-                name = name.substr(0, arrow);
-            }
-        }
-        e.name = name;
-        if (e.name == "." || e.name == ".." || e.name.empty()) continue;
-        entries.push_back(std::move(e));
-    }
-    return entries;
-}
 
 // =============================================================================
 // Application state
@@ -836,23 +746,26 @@ std::string settingsFilePath() {
 }
 
 void saveSettings() {
-    std::string text;
-    text += "fontFamily=" + settings.fontFamily + "\n";
-    text += "fontWeight=" + std::to_string(settings.fontWeight) + "\n";
-    text += "uiScale=" + std::to_string(settings.uiScale) + "\n";
-    text += "darkMode=" + std::string(settings.darkMode ? "1" : "0") + "\n";
-    text += "fontScale=" + std::to_string(settings.fontSizeScale) + "\n";
-    text += "accent=" + std::to_string(settings.accentR) + "," + std::to_string(settings.accentG) + "," +
-            std::to_string(settings.accentB) + "\n";
-    text += "sortColumn=" + std::to_string(state.sortColumn) + "\n";
-    text += "sortAscending=" + std::string(state.sortAscending ? "1" : "0") + "\n";
-    text += "showHidden=" + std::string(state.showHidden ? "1" : "0") + "\n";
-    text += "selectedDevice=" + state.selectedDevice + "\n";
-    text += "mirrorW=" + std::to_string(settings.mirrorW) + "\n";
-    text += "mirrorH=" + std::to_string(settings.mirrorH) + "\n";
-    text += "windowW=" + std::to_string(settings.windowW) + "\n";
-    text += "windowH=" + std::to_string(settings.windowH) + "\n";
-    core::writeFileAtomic(settingsFilePath(), text);
+    // The key=value format and its parsing live in core/store.cpp (round-trip
+    // tested); this only decides which keys the app persists.
+    const std::vector<std::pair<std::string, std::string>> values = {
+        {"fontFamily", settings.fontFamily},
+        {"fontWeight", std::to_string(settings.fontWeight)},
+        {"uiScale", std::to_string(settings.uiScale)},
+        {"darkMode", settings.darkMode ? "1" : "0"},
+        {"fontScale", std::to_string(settings.fontSizeScale)},
+        {"accent", std::to_string(settings.accentR) + "," + std::to_string(settings.accentG) + "," +
+                       std::to_string(settings.accentB)},
+        {"sortColumn", std::to_string(state.sortColumn)},
+        {"sortAscending", state.sortAscending ? "1" : "0"},
+        {"showHidden", state.showHidden ? "1" : "0"},
+        {"selectedDevice", state.selectedDevice},
+        {"mirrorW", std::to_string(settings.mirrorW)},
+        {"mirrorH", std::to_string(settings.mirrorH)},
+        {"windowW", std::to_string(settings.windowW)},
+        {"windowH", std::to_string(settings.windowH)},
+    };
+    core::writeFileAtomic(settingsFilePath(), core::serializeKeyValues(values));
 }
 
 #ifdef _WIN32
@@ -1082,12 +995,12 @@ void applySettingsNow() {
 void loadSettings() {
     std::ifstream in(settingsFilePath());
     if (!in) return;
-    std::string line;
-    while (std::getline(in, line)) {
-        const std::size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string key = line.substr(0, eq);
-        const std::string value = line.substr(eq + 1);
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    const std::unordered_map<std::string, std::string> stored = core::parseKeyValues(buffer.str());
+    for (const auto& entry : stored) {
+        const std::string& key = entry.first;
+        const std::string& value = entry.second;
         if (key == "fontFamily") settings.fontFamily = value;
         else if (key == "fontWeight") settings.fontWeight = std::atoi(value.c_str());
         else if (key == "uiScale") settings.uiScale = static_cast<float>(std::atof(value.c_str()));
@@ -1177,16 +1090,11 @@ void selectFontScale(float scale) {
 // =============================================================================
 // Bookmarks (quick paths) & Commands
 // =============================================================================
-struct Bookmark {
-    std::string name;
-    std::string path;
-};
-
-struct CommandEntry {
-    std::string name;
-    bool shell = true;  // true = adb shell, false = host cmd
-    std::string command;
-};
+// The record types and their text formats live in core/store.h so the
+// serialisation can be round-trip tested; only the file paths and the in-memory
+// lists belong here.
+using adb::core::Bookmark;
+using adb::core::CommandEntry;
 
 std::vector<Bookmark> bookmarks;
 std::vector<CommandEntry> commands;
@@ -1195,74 +1103,44 @@ std::string bookmarksFilePath() { return executableDir() + "\\adb_file_browser_b
 std::string commandsFilePath() { return executableDir() + "\\adb_file_browser_commands.txt"; }
 
 void saveBookmarks() {
-    std::string text;
-    for (const Bookmark& b : bookmarks) {
-        text += b.name + "\t" + b.path + "\n";
-    }
-    core::writeFileAtomic(bookmarksFilePath(), text);
+    core::writeFileAtomic(bookmarksFilePath(), core::serializeBookmarks(bookmarks));
 }
 
 void loadBookmarks() {
     bookmarks.clear();
     std::ifstream in(bookmarksFilePath());
     if (!in) return;
-    std::string line;
-    while (std::getline(in, line)) {
-        const std::size_t tab = line.find('\t');
-        if (tab == std::string::npos) continue;
-        Bookmark b;
-        b.name = line.substr(0, tab);
-        b.path = line.substr(tab + 1);
-        if (!b.path.empty()) bookmarks.push_back(std::move(b));
-    }
+    std::ostringstream text;
+    text << in.rdbuf();
+    bookmarks = core::parseBookmarks(text.str());
 }
 
 void saveCommands() {
-    std::string text;
-    for (const CommandEntry& c : commands) {
-        text += c.name + "\t" + (c.shell ? "shell" : "cmd") + "\t" + c.command + "\n";
-    }
-    core::writeFileAtomic(commandsFilePath(), text);
+    core::writeFileAtomic(commandsFilePath(), core::serializeCommands(commands));
 }
 
 void loadCommands() {
     commands.clear();
     std::ifstream in(commandsFilePath());
     if (!in) return;
-    std::string line;
-    while (std::getline(in, line)) {
-        const std::size_t t1 = line.find('\t');
-        if (t1 == std::string::npos) continue;
-        const std::size_t t2 = line.find('\t', t1 + 1);
-        if (t2 == std::string::npos) continue;
-        CommandEntry c;
-        c.name = line.substr(0, t1);
-        c.shell = (line.substr(t1 + 1, t2 - t1 - 1) == "shell");
-        c.command = line.substr(t2 + 1);
-        if (!c.name.empty() && !c.command.empty()) commands.push_back(std::move(c));
-    }
+    std::ostringstream text;
+    text << in.rdbuf();
+    commands = core::parseCommands(text.str());
 }
 
 std::string lastPathsFilePath() { return executableDir() + "\\adb_file_browser_lastpaths.txt"; }
 
 void saveLastPaths() {
-    std::string text;
-    for (const auto& kv : state.lastPaths) {
-        text += kv.first + "\t" + kv.second + "\n";
-    }
-    core::writeFileAtomic(lastPathsFilePath(), text);
+    core::writeFileAtomic(lastPathsFilePath(), core::serializeLastPaths(state.lastPaths));
 }
 
 void loadLastPaths() {
     state.lastPaths.clear();
     std::ifstream in(lastPathsFilePath());
     if (!in) return;
-    std::string line;
-    while (std::getline(in, line)) {
-        const std::size_t tab = line.find('\t');
-        if (tab == std::string::npos) continue;
-        state.lastPaths[line.substr(0, tab)] = line.substr(tab + 1);
-    }
+    std::ostringstream text;
+    text << in.rdbuf();
+    state.lastPaths = core::parseLastPaths(text.str());
 }
 
 void rememberLastPath() {
@@ -1407,17 +1285,17 @@ void restartAdbServer() {
     app::async::runOnce(
         "adb.restart",
         [adb]() -> app::async::Result<std::vector<Device>> {
-            runProcess(adb, {"kill-server"}, 15000);
+            runProcess(adb, core::killServerArgs(), 15000);
             // Give the server a moment to fully stop before the next command
             // auto-restarts it and reconnects the devices.
             std::this_thread::sleep_for(std::chrono::milliseconds(600));
-            ProcessResult r = runProcess(adb, {"devices"}, 15000);
+            ProcessResult r = runProcess(adb, core::devicesArgs(), 15000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure<std::vector<Device>>(
                     msg.empty() ? "重启 adb 失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
-            return app::async::success(parseDevices(r.out));
+            return app::async::success(core::parseDevices(r.out));
         },
         [](const app::async::Result<std::vector<Device>>& result) {
             state.deviceLoading = false;
@@ -1444,11 +1322,11 @@ void schedulePollDevices() {
         "poll.devices",
         [adb]() -> app::async::Result<std::vector<Device>> {
             std::this_thread::sleep_for(std::chrono::seconds(3));
-            ProcessResult r = runProcess(adb, {"devices"}, 15000);
+            ProcessResult r = runProcess(adb, core::devicesArgs(), 15000);
             if (r.exitCode != 0) {
                 return app::async::failure<std::vector<Device>>(core::trim(r.out));
             }
-            return app::async::success(parseDevices(r.out));
+            return app::async::success(core::parseDevices(r.out));
         },
         [](const app::async::Result<std::vector<Device>>& result) {
             if (result.ok) {
@@ -1502,13 +1380,13 @@ void refreshDevices() {
     app::async::runOnce(
         "adb.devices",
         [adb]() -> app::async::Result<std::vector<Device>> {
-            ProcessResult r = runProcess(adb, {"devices"}, 15000);
+            ProcessResult r = runProcess(adb, core::devicesArgs(), 15000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure<std::vector<Device>>(
                     msg.empty() ? "获取设备列表失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
-            return app::async::success(parseDevices(r.out));
+            return app::async::success(core::parseDevices(r.out));
         },
         [](const app::async::Result<std::vector<Device>>& result) {
             state.deviceLoading = false;
@@ -1577,7 +1455,7 @@ void refreshListing(bool force) {
             const std::size_t marker = r.out.find("__WRITE__");
             const std::string lsOut = marker == std::string::npos ? r.out : r.out.substr(0, marker);
             const std::string writeOut = marker == std::string::npos ? std::string{} : r.out.substr(marker + 9);
-            result.entries = parseLsLa(lsOut);
+            result.entries = core::parseLsLa(lsOut);
             result.writable = (core::trim(writeOut) == "1");
             return app::async::success(result);
         },
@@ -1725,7 +1603,7 @@ void pullBatchStep(std::vector<std::string> names, std::size_t index,
         [adb, serial, remote, localDir]() -> app::async::Result<void> {
             std::error_code ec;
             std::filesystem::create_directories(localDir, ec);
-            ProcessResult r = runProcess(adb, {"-s", serial, "pull", remote, localDir}, 600000);
+            ProcessResult r = runProcess(adb, core::pullArgs(serial, remote, localDir), 600000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure(msg.empty() ? "下载失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
@@ -1751,7 +1629,7 @@ void doPush() {
     app::async::runOnce(
         "adb.push",
         [adb, serial, local, remoteDir]() -> app::async::Result<std::string> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "push", local, remoteDir}, 600000);
+            ProcessResult r = runProcess(adb, core::pushArgs(serial, local, remoteDir), 600000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
@@ -1800,7 +1678,7 @@ void pushBatchStep(std::vector<std::string> files, std::size_t index,
     app::async::restart(
         "adb.push.one",
         [adb, serial, file = files[index], remoteDir]() -> app::async::Result<void> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "push", file, remoteDir}, 600000);
+            ProcessResult r = runProcess(adb, core::pushArgs(serial, file, remoteDir), 600000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure(msg.empty() ? "上传失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
@@ -1867,7 +1745,7 @@ void deleteBatchStep(std::vector<std::string> names, std::size_t index,
     app::async::restart(
         "adb.delete.one",
         [adb, serial, remote]() -> app::async::Result<void> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "shell", "rm", "-rf", core::shellQuote(remote)}, 60000);
+            ProcessResult r = runProcess(adb, core::deleteArgs(serial, remote), 60000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure(msg.empty() ? "删除失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
@@ -1906,7 +1784,7 @@ void confirmPrompt() {
         app::async::runOnce(
             "adb.connect",
             [adb, value]() -> app::async::Result<std::string> {
-                ProcessResult r = runProcess(adb, {"connect", value}, 20000);
+                ProcessResult r = runProcess(adb, core::connectArgs(value), 20000);
                 if (r.exitCode != 0) {
                     std::string msg = core::trim(r.out);
                     return app::async::failure<std::string>(msg.empty() ? "连接失败" : msg);
@@ -2039,7 +1917,7 @@ void doScreenshot() {
         [adb, serial, dir]() -> app::async::Result<std::string> {
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
-            ProcessResult r = runProcess(adb, {"-s", serial, "exec-out", "screencap", "-p"}, 30000);
+            ProcessResult r = runProcess(adb, core::screencapArgs(serial), 30000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
@@ -2074,7 +1952,7 @@ void doInstallApk() {
     app::async::runOnce(
         "adb.install",
         [adb, serial, apk]() -> app::async::Result<std::string> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "install", "-r", apk}, 300000);
+            ProcessResult r = runProcess(adb, core::installApkArgs(serial, apk), 300000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
@@ -2190,7 +2068,7 @@ void stopLogcat() {
 #ifdef _WIN32
 void streamLogcatWorker(const std::string& adb, const std::string& serial) {
     // Clear the device log buffer so the stream starts fresh (no old history).
-    runProcess(adb, {"-s", serial, "logcat", "-c"}, 15000);
+    runProcess(adb, core::logcatClearArgs(serial), 15000);
 
     const std::wstring cmd = quoteWinArg(toWide(adb)) + L" -s " + quoteWinArg(toWide(serial)) + L" logcat";
     HANDLE readPipe = nullptr;
@@ -3024,7 +2902,7 @@ app::async::Result<std::string> installAdbWorker(const std::string& url, const s
         return app::async::failure<std::string>("压缩包中未找到 adb.exe");
     }
     g_dlStage = 3;
-    if (!adbPath.empty()) runProcess(adbPath, {"kill-server"}, 15000);
+    if (!adbPath.empty()) runProcess(adbPath, core::killServerArgs(), 15000);
     const std::string target = adbTargetDir(adbPath);
     std::error_code ec;
     std::filesystem::create_directories(target, ec);
@@ -3459,7 +3337,7 @@ void saveTextPreview() {
                 if (!out) return app::async::failure<std::string>("无法写入临时文件");
                 out.write(content.data(), static_cast<std::streamsize>(content.size()));
             }
-            ProcessResult r = runProcess(adb, {"-s", serial, "push", tmp, remote}, 120000);
+            ProcessResult r = runProcess(adb, core::pushArgs(serial, tmp, remote), 120000);
             std::error_code ec;
             std::filesystem::remove(tmp, ec);
             if (r.exitCode != 0) {
@@ -3529,15 +3407,7 @@ void fetchAppList() {
                 std::string msg = core::trim(r.out);
                 return app::async::failure<std::vector<std::string>>(msg.empty() ? "获取应用列表失败" : msg);
             }
-            std::vector<std::string> packages;
-            std::istringstream iss(r.out);
-            std::string line;
-            while (std::getline(iss, line)) {
-                const std::string pkg = core::trim(line);
-                if (pkg.rfind("package:", 0) == 0) {
-                    packages.push_back(pkg.substr(8));
-                }
-            }
+            std::vector<std::string> packages = core::parsePackageList(r.out);
             std::sort(packages.begin(), packages.end());
             return app::async::success(std::move(packages));
         },
@@ -3568,7 +3438,7 @@ void uninstallSelectedApp() {
     app::async::runOnce(
         "adb.uninstall",
         [adb, serial, pkg]() -> app::async::Result<std::string> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "uninstall", pkg}, 120000);
+            ProcessResult r = runProcess(adb, core::uninstallArgs(serial, pkg), 120000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(msg.empty() ? "卸载失败" : msg);
@@ -3591,7 +3461,7 @@ void clearSelectedAppData() {
     app::async::runOnce(
         "adb.app.clear",
         [adb, serial, pkg]() -> app::async::Result<std::string> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "shell", "pm", "clear", pkg}, 120000);
+            ProcessResult r = runProcess(adb, core::clearAppDataArgs(serial, pkg), 120000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(msg.empty() ? "清数据失败" : msg);
@@ -3618,7 +3488,7 @@ void openImagePreview(const std::string& name) {
     app::async::restart(
         "adb.image.preview",
         [adb, serial, remote, tmp]() -> app::async::Result<std::string> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "pull", remote, tmp}, 120000);
+            ProcessResult r = runProcess(adb, core::pullArgs(serial, remote, tmp), 120000);
             if (r.exitCode != 0) {
                 return app::async::failure<std::string>("预览失败");
             }
@@ -4318,7 +4188,7 @@ void updatePathSuggestions() {
             if (r.exitCode != 0) {
                 return app::async::success(std::vector<std::string>{});
             }
-            std::vector<FsEntry> entries = parseLsLa(r.out);
+            std::vector<FsEntry> entries = core::parseLsLa(r.out);
             std::vector<std::string> suggestions;
             for (const FsEntry& e : entries) {
                 if (!e.isDir) continue;

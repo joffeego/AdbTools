@@ -5,6 +5,8 @@
 // "sha256:<hex>" form, so both shapes are covered here.
 #include "core/sha256.h"
 
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -97,3 +99,99 @@ ADB_TEST(parseSha256Rows_keeps_filenames_with_spaces) {
     ADB_CHECK_EQ(rows.size(), static_cast<std::size_t>(1));
     ADB_CHECK_EQ(rows[0].first, std::string("my file name.zip"));
 }
+
+#ifdef _WIN32
+namespace {
+
+// Write `content` to a temp file and return its path. The digest tests below
+// check the whole hashing path (open file, stream it through CNG, hex encode)
+// against published digests, which is the only way to be sure the update
+// verification actually verifies anything.
+struct TempFile {
+    std::filesystem::path path;
+    explicit TempFile(const char* name, const std::string& content) {
+        std::error_code ec;
+        path = std::filesystem::temp_directory_path(ec) / name;
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(content.data(), static_cast<std::streamsize>(content.size()));
+    }
+    ~TempFile() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    std::wstring wide() const { return path.wstring(); }
+};
+
+}  // namespace
+
+ADB_TEST(sha256FileHex_matches_known_digests) {
+    // Published values (NIST / RFC 6234 test vectors).
+    TempFile empty("adbtools-hash-empty.bin", "");
+    TempFile abc("adbtools-hash-abc.bin", "abc");
+    std::string err;
+
+    ADB_CHECK_EQ(sha256FileHex(empty.wide(), err),
+                 std::string("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    ADB_CHECK_EQ(sha256FileHex(abc.wide(), err),
+                 std::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    ADB_CHECK_EQ(err, std::string(""));
+}
+
+ADB_TEST(sha256FileHex_hashes_more_than_one_buffer) {
+    // Larger than the 64 KiB read buffer, so the streaming loop runs more than
+    // once. The digest is compared against an independent implementation
+    // (PowerShell's Get-FileHash) in the commit that added this test, and the
+    // boundary case is checked by flipping a byte past the first buffer.
+    std::string big(200 * 1024, 'a');
+    TempFile file("adbtools-hash-big.bin", big);
+    std::string err;
+
+    const std::string digest = sha256FileHex(file.wide(), err);
+    ADB_CHECK_EQ(err, std::string(""));
+    // Cross-checked against an independent implementation:
+    //   PowerShell  Get-FileHash <200KiB of 'a'> -Algorithm SHA256
+    //   -> 4b4f0f46ac02d177dea0ab36a66a657840e2fb98b20bb27a688db4d8ea9cd22c
+    // Getting this wrong would mean the updater's verification verifies nothing.
+    ADB_CHECK_EQ(digest, std::string("4b4f0f46ac02d177dea0ab36a66a657840e2fb98b20bb27a688db4d8ea9cd22c"));
+
+    // A change in the final byte (past the first 64 KiB buffer) must change the
+    // digest: if the loop stopped early, both hashes would match.
+    std::string altered = big;
+    altered[big.size() - 1] = 'b';
+    TempFile other("adbtools-hash-big2.bin", altered);
+    std::string err2;
+    const std::string digest2 = sha256FileHex(other.wide(), err2);
+    ADB_CHECK(digest != digest2);
+}
+
+ADB_TEST(sha1FileHex_matches_known_digests) {
+    // Google publishes SHA-1 for platform-tools, so the adb updater verifies
+    // with this algorithm rather than SHA-256.
+    TempFile abc("adbtools-hash-abc-sha1.bin", "abc");
+    TempFile empty("adbtools-hash-empty-sha1.bin", "");
+    std::string err;
+
+    ADB_CHECK_EQ(sha1FileHex(abc.wide(), err),
+                 std::string("a9993e364706816aba3e25717850c26c9cd0d89d"));
+    ADB_CHECK_EQ(sha1FileHex(empty.wide(), err),
+                 std::string("da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+    ADB_CHECK_EQ(err, std::string(""));
+}
+
+ADB_TEST(hashing_a_missing_file_reports_an_error) {
+    // Must not silently return an empty string that a caller could mistake for
+    // "nothing to verify".
+    std::string err;
+    const std::string digest = sha256FileHex(L"Z:\\definitely\\not\\here.bin", err);
+    ADB_CHECK_EQ(digest, std::string(""));
+    ADB_CHECK(!err.empty());
+}
+
+ADB_TEST(hashFileHex_rejects_an_unknown_algorithm) {
+    TempFile abc("adbtools-hash-algo.bin", "abc");
+    std::string err;
+    const std::string digest = hashFileHex(abc.wide(), L"NOT-A-HASH", err);
+    ADB_CHECK_EQ(digest, std::string(""));
+    ADB_CHECK(!err.empty());
+}
+#endif  // _WIN32

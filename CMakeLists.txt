@@ -24,10 +24,12 @@ set(EUI_ENABLE_TRAY OFF CACHE BOOL "" FORCE)
 # header documents - that is what keeps them testable.
 # -----------------------------------------------------------------------------
 set(ADBTOOLS_CORE_SOURCES
+    core/adb.cpp
     core/fileio.cpp
     core/package.cpp
     core/paths.cpp
     core/sha256.cpp
+    core/store.cpp
     core/strings.cpp
     core/version.cpp
 )
@@ -94,10 +96,12 @@ if(ADBTOOLS_BUILD_TESTS)
     add_executable(adbtools_tests
         ${ADBTOOLS_CORE_SOURCES}
         tests/test_main.cpp
+        tests/test_adb.cpp
         tests/test_fileio.cpp
         tests/test_package.cpp
         tests/test_paths.cpp
         tests/test_sha256.cpp
+        tests/test_store.cpp
         tests/test_strings.cpp
         tests/test_version.cpp
     )

@@ -44,6 +44,8 @@ file-system helpers, all inside one anonymous namespace. Two consequences:
 | `package.h/.cpp` | GitHub release JSON and Google repository XML parsers |
 | `sha256.h/.cpp` | sha256sum-sidecar parsing, file hashing (CNG) |
 | `fileio.h/.cpp` | `writeFileAtomic` |
+| `adb.h/.cpp` | device/listing model, `adb` output parsers, every adb command line the app builds |
+| `store.h/.cpp` | on-disk text formats: settings, bookmarks, quick commands, recent paths |
 
 ## Tests
 
@@ -51,19 +53,39 @@ file-system helpers, all inside one anonymous namespace. Two consequences:
 `build/adbtools_tests.exe`). There is no third-party framework: `tests/test_main.h`
 is a small harness with `ADB_TEST` / `ADB_CHECK` / `ADB_CHECK_EQ`.
 
-When adding core code, add cases for the boundaries you were unsure about — the
-existing tests are mostly the edge cases that the GUI never exercised.
+Fixtures are copied from real devices wherever possible — the `ls -la` samples,
+the `adb devices -l` line and the `pm list packages` output in `tests/test_adb.cpp`
+come from an actual Huawei ELS-AN00 — because the interesting cases are exactly
+the ones a hand-written sample forgets (that device emits ISO dates, not the
+month-name form most examples use).
 
-## Not done yet
+When adding core code, add cases for the boundaries you were unsure about. The
+hash tests are a good model: they check published digests, and the large-input
+case is cross-checked against PowerShell's `Get-FileHash` so the updater's
+verification cannot silently become a no-op.
 
-The next steps (see the maintenance guide's roadmap) are to move the remaining
-pure logic here:
+## Deliberately still in main.cpp
 
-- `core/adb.h/.cpp` — the push / pull / delete / list command builders and their
-  output parsing (currently still in `main.cpp`, interleaved with async plumbing)
-- `core/store.h/.cpp` — settings / bookmarks / commands / recent-paths
-  serialisation (the writers are already atomic; the keys and formats are not yet
-  isolated)
+Not everything worth testing is here yet, and some things belong in the GUI layer
+permanently:
 
-Once those exist, both a CLI and an end-to-end test driver become thin layers on
+- `findAdb()` / `defaultDownloadDir()` — they read the process environment and
+  the filesystem, so they are not pure.
+- The file *paths* for settings/bookmarks/etc. (they depend on `executableDir()`),
+  even though the formats themselves are in `store.h`.
+- `runProcess()` — process spawning and handle plumbing is platform work, not
+  pure logic.
+
+## Next steps
+
+The remaining pure logic that is still in `main.cpp` and worth moving:
+
+- The batch step drivers (`pullBatchStep` / `pushBatchStep` / `deleteBatchStep`)
+  currently mix "what to do for one item" with the async restart plumbing. Pulling
+  out the per-item decision (which item, what counts as success, how the summary
+  is worded) would make the batching testable — the last time it was changed it
+  needed a temporary self-test hook injected into a build-only copy of `main.cpp`
+  to verify against a device.
+
+Once that exists, both a CLI and an end-to-end test driver become thin layers on
 top instead of new copies of the logic.
