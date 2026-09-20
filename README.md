@@ -101,6 +101,8 @@ cmake --build build --parallel
 AdbTools/
 ├── main.cpp                # 应用主体（全部界面与逻辑）
 ├── regex_wrap.cpp          # std::regex 的异常隔离封装（logcat 过滤用）
+├── adb_browser.rc          # Windows 资源脚本（版本信息 + 内嵌 manifest）
+├── adb_browser.manifest    # 应用清单（asInvoker / longPathAware）
 ├── CMakeLists.txt          # 构建脚本
 ├── LICENSE                 # Apache-2.0
 ├── THIRD_PARTY_NOTICES.md  # 第三方组件与许可
@@ -117,14 +119,34 @@ AdbTools/
 
 「检查更新」对话框（标题栏最左侧下载图标）会检测并更新三样东西：
 
-- **本软件**：从你配置的 GitHub 仓库 `releases/latest` 获取最新版本，点击「更新到 X」会下载、解压并替换 `adb_browser.exe`（更新完成后重启生效）；
-- **adb**：从 Google 官方仓库 `dl.google.com/.../repository2-1.xml` 解析最新 platform-tools 版本；
-- **scrcpy**：从 GitHub Releases API 获取最新版本（更新前会先关闭投屏释放文件占用）。
+- **本软件**：从你配置的 GitHub 仓库 `releases/latest` 获取最新版本，点击「更新到 X」会下载、解压并替换 `adb_browser.exe`（更新完成后重启生效）。下载的升级包会先与 Release 公布的 **SHA-256** 校验值比对，不一致就中止安装；
+- **adb**：从 Google 官方仓库 `dl.google.com/.../repository2-1.xml` 解析最新 platform-tools 版本（同时读取官方公布的校验值和准确的 Windows 包地址）；
+- **scrcpy**：从 GitHub Releases API 获取最新版本，并校验发布方公布的 SHA-256（更新前会先关闭投屏释放文件占用）。
 
 > 📌 **发版时同步版本号**：`kAppUpdateRepo` 已指向本仓库 `joffeego/AdbTools`，自更新地址无需再改；
-> 每次发版只需把 `main.cpp` 顶部的 `kAppVersion` 改成新版本号，提交后打 `vX.Y.Z` 标签推送即可自动发版。
+> 每次发版需要同步改三处版本号：`main.cpp` 的 `kAppVersion`、`adb_browser.rc` 的 `FILEVERSION/PRODUCTVERSION` 及版本字符串、`installer.iss` 的 `MyAppVersion`。提交后打 `vX.Y.Z` 标签推送即可自动发版（CI 会在 Release 里附带每个安装包的 `.sha256` 校验文件）。
 >
 > 若网络无法访问 GitHub，对应行会显示「最新版本：未知」，不影响其它项。
+
+---
+
+## 杀毒软件报毒 / 被防火墙拦截怎么办？
+
+本程序**没有数字签名**，并且会做一些本身合法、但容易被启发式规则误判的行为（调用 `adb.exe` / `scrcpy.exe` 子进程、联网下载更新包、替换自身的 exe 文件）。因此 Windows Defender 或第三方杀软**可能把安装包或主程序报成「木马 / 病毒」**，这是**误报（false positive）**，不是程序真的有毒。
+
+遇到这种情况，可以按下面任一种方式处理：
+
+1. **给文件加白名单**：Windows 安全中心 →「病毒和威胁防护」→「管理设置」→「排除项」→ 添加排除项，选择解压后的程序目录（或 `AdbTools-Setup-*.exe`）。
+2. **提交误报给微软**（最彻底，24–48 小时内会更新特征库）：打开 <https://www.microsoft.com/en-us/wdsi/filesubmission>，选择 “Software developer” → 上传被报毒的文件 → 提交为 **Incorrectly detected / 误报**。
+3. **第三方杀软**（火绒 / 360 / 卡巴斯基等）一般也有「误报反馈」入口，把文件提交过去即可。
+4. **先自己核对文件完整性**：Release 里每个安装包都附带 `.sha256` 校验文件，可用下面的命令核对下载到的文件有没有被篡改或下载不完整：
+
+   ```powershell
+   Get-FileHash .\AdbFileBrowser-windows-x64.zip -Algorithm SHA256
+   Get-Content .\AdbFileBrowser-windows-x64.zip.sha256   # 两者的哈希应完全一致
+   ```
+
+如果你会自己编译，也可以从源码构建（见下方「从源码编译」），这样得到的 exe 与你本地环境一致，能进一步排除「下载被人替换」的疑虑。
 
 ---
 

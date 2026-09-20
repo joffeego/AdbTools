@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="joffeego.AdbTools.adb_browser"
+      version="0.9.7.0"
+      processorArchitecture="*"/>
+  <description>ADB 文件浏览器 (AdbTools)</description>
+
+  <!-- Run as the invoking user: no elevation prompt, no installer detection,
+       and no UAC file/registry virtualization. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- The app manages files at paths the user picked, which can exceed
+       MAX_PATH; opt in to the long-path behaviour on Windows 10 1607+. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

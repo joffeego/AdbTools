@@ -70,6 +70,20 @@ jobs:
           Copy-Item "THIRD_PARTY_NOTICES.md"     $dist/ -Force
           Compress-Archive -Path "$dist/*" -DestinationPath "dist/AdbFileBrowser-windows-x64.zip" -Force
 
+      # Publish a "sha256sum"-style sidecar next to every release asset: the
+      # in-app updater (and the app's own self-update) verifies the download
+      # against "<asset>.sha256" before it replaces anything on disk.
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem "dist/AdbFileBrowser-windows-x64.zip", "dist/AdbTools-Setup-*.exe" | ForEach-Object {
+            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
+            $line = "$hash  $($_.Name)"
+            Set-Content -Path "$($_.FullName).sha256" -Value $line -Encoding ascii -NoNewline
+            Add-Content -Path "$($_.FullName).sha256" -Value "`n" -NoNewline
+            Write-Host "  $line"
+          }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -77,6 +91,7 @@ jobs:
           path: |
             dist/AdbFileBrowser-windows-x64.zip
             dist/AdbTools-Setup-*.exe
+            dist/*.sha256
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -86,4 +101,5 @@ jobs:
           files: |
             dist/AdbFileBrowser-windows-x64.zip
             dist/AdbTools-Setup-*.exe
+            dist/*.sha256
           generate_release_notes: true

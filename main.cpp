@@ -45,6 +45,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <bcrypt.h>
 #include <shellapi.h>
 #include <winhttp.h>
 #endif
@@ -86,7 +87,7 @@ constexpr float kMirrorWindowWidth = 320.0f;
 constexpr float kMirrorWindowHeight = 640.0f;
 
 // Application version and the GitHub repo used for the app's own update check.
-constexpr const char* kAppVersion = "0.9.6";
+constexpr const char* kAppVersion = "0.9.7";
 constexpr const char* kAppUpdateRepo = "joffeego/AdbTools";
 
 constexpr float kScrollbarWidth = 10.0f;
@@ -749,14 +750,18 @@ struct UpdateInfo {
     std::string adbCurrent;
     std::string adbLatest;
     std::string adbUrl;
+    std::string adbSha1;  // Google publishes SHA-1 digests in repository2-1.xml
     bool adbUpdate = false;
     std::string scrcpyCurrent;
     std::string scrcpyLatest;
     std::string scrcpyUrl;
+    std::string scrcpySha256;
     bool scrcpyUpdate = false;
     std::string appCurrent;
     std::string appLatest;
     std::string appUrl;
+    std::string appSha256;  // expected sha256 of the row named in appRow, when published
+    std::string appRow;     // e.g. "adb_browser.exe" or "AdbFileBrowser-windows-x64.zip"
     bool appUpdate = false;
     std::string error;
 };
@@ -2711,9 +2716,137 @@ void openMirror() {
     toast("已启动投屏", "正在连接设备，连接后画面会显示在投屏窗口内。");
 }
 
-// =============================================================================
-// Update checker & installer (adb / scrcpy)
-// =============================================================================
+// -----------------------------------------------------------------------------
+// CNG hashing - used to verify downloaded update packages before they are
+// installed. Without this the updater would happily copy an executable served
+// by a mirror/proxy or a MITM straight over the running binary.
+// -----------------------------------------------------------------------------
+#ifdef _WIN32
+std::string hashFileHex(const std::wstring& path, LPCWSTR algorithm, std::string& err) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::string result;
+    auto cleanup = [&] {
+        if (hash != nullptr) BCryptDestroyHash(hash);
+        if (alg != nullptr) BCryptCloseAlgorithmProvider(alg, 0);
+    };
+
+    if (BCryptOpenAlgorithmProvider(&alg, algorithm, nullptr, 0) < 0) {
+        err = "无法初始化哈希算法";
+        cleanup();
+        return result;
+    }
+    DWORD objectSize = 0;
+    DWORD cb = 0;
+    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
+                          sizeof(objectSize), &cb, 0) < 0) {
+        err = "无法读取哈希属性";
+        cleanup();
+        return result;
+    }
+    DWORD digestSize = 0;
+    if (BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&digestSize),
+                          sizeof(digestSize), &cb, 0) < 0) {
+        err = "无法读取哈希长度";
+        cleanup();
+        return result;
+    }
+    std::vector<unsigned char> object(objectSize);
+    if (BCryptCreateHash(alg, &hash, object.data(), objectSize, nullptr, 0, 0) < 0) {
+        err = "无法创建哈希上下文";
+        cleanup();
+        return result;
+    }
+
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        err = "无法读取下载的文件";
+        cleanup();
+        return result;
+    }
+    std::vector<unsigned char> buf(65536);
+    for (;;) {
+        DWORD read = 0;
+        if (!ReadFile(file, buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr)) {
+            err = "读取下载的文件失败";
+            break;
+        }
+        if (read == 0) break;
+        if (BCryptHashData(hash, buf.data(), read, 0) < 0) {
+            err = "哈希计算失败";
+            break;
+        }
+    }
+    CloseHandle(file);
+    if (!err.empty()) {
+        cleanup();
+        return result;
+    }
+
+    std::vector<unsigned char> digest(digestSize);
+    if (BCryptFinishHash(hash, digest.data(), digestSize, 0) < 0) {
+        err = "哈希计算失败";
+        cleanup();
+        return result;
+    }
+    cleanup();
+
+    static const char* kHex = "0123456789abcdef";
+    result.reserve(digest.size() * 2);
+    for (unsigned char byte : digest) {
+        result += kHex[byte >> 4];
+        result += kHex[byte & 0x0F];
+    }
+    return result;
+}
+
+std::string sha256FileHex(const std::wstring& path, std::string& err) {
+    return hashFileHex(path, BCRYPT_SHA256_ALGORITHM, err);
+}
+
+std::string sha1FileHex(const std::wstring& path, std::string& err) {
+    return hashFileHex(path, BCRYPT_SHA1_ALGORITHM, err);
+}
+
+// Extract "<hex>  <filename>" rows from a sha256sum-style / GitHub digest blob.
+// GitHub's release "digest" field (and "sha256:..." values in general) carry a
+// "sha256:" prefix, so accept both that and the plain sha256sum format.
+std::vector<std::pair<std::string, std::string>> parseSha256Rows(const std::string& text) {
+    std::vector<std::pair<std::string, std::string>> rows;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        std::size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        std::string line = trim(text.substr(pos, end - pos));
+        pos = end + 1;
+
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("sha256:", 0) == 0) line = trim(line.substr(7));
+        if (line.size() < 64) continue;
+
+        std::string hex;
+        hex.reserve(64);
+        std::size_t i = 0;
+        for (; i < line.size() && hex.size() < 64; ++i) {
+            const char c = line[i];
+            if (std::isxdigit(static_cast<unsigned char>(c))) hex += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            else break;
+        }
+        if (hex.size() != 64) continue;
+
+        std::string name = trim(line.substr(i));
+        if (!name.empty() && (name[0] == '*' || name[0] == ' ')) name = trim(name.substr(1));
+        if (name.empty()) continue;
+        rows.emplace_back(name, hex);
+    }
+    return rows;
+}
+#endif  // _WIN32
+
+// -----------------------------------------------------------------------------
+// Update checker & installer (adb / scrcpy / this app)
+// -----------------------------------------------------------------------------
 std::vector<int> parseVersionParts(const std::string& v) {
     std::vector<int> parts;
     std::string cur;
@@ -2813,9 +2946,12 @@ bool extractZip(const std::string& zipPath, const std::string& destDir, std::str
     // Windows 10+ ships bsdtar (tar.exe) which handles zip archives.
     ProcessResult r = runProcess("tar", {"-xf", zipPath, "-C", destDir}, 600000);
     if (r.exitCode == 0) return true;
-    // Fallback to PowerShell's Expand-Archive.
-    const std::string ps = "Expand-Archive -LiteralPath '" + zipPath + "' -DestinationPath '" + destDir + "' -Force";
-    ProcessResult r2 = runProcess("powershell", {"-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps}, 600000);
+    // Fallback to PowerShell's Expand-Archive. Note: -NoProfile -Command does
+    // not need an execution-policy override (that flag only governs .ps1 files)
+    // and "-ExecutionPolicy Bypass" is a classic malware marker that antivirus
+    // engines weight heavily, so it is deliberately not used here.
+    const std::string ps = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Expand-Archive -LiteralPath '" + zipPath + "' -DestinationPath '" + destDir + "' -Force";
+    ProcessResult r2 = runProcess("powershell", {"-NoProfile", "-NonInteractive", "-Command", ps}, 600000);
     if (r2.exitCode == 0) return true;
     err = "解压失败：" + (trim(r2.out).empty() ? r2.err : trim(r2.out));
     return false;
@@ -3047,7 +3183,8 @@ void stopScrcpyIfRunning() {
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
 }
 
-app::async::Result<std::string> installScrcpyWorker(const std::string& url, const std::string& version) {
+app::async::Result<std::string> installScrcpyWorker(const std::string& url, const std::string& version,
+                                                    const std::string& expectedSha256) {
     const std::string work = makeUpdateWorkDir("scrcpy");
     const std::string zip = work + "\\scrcpy.zip";
     const std::string extracted = work + "\\extracted";
@@ -3057,6 +3194,19 @@ app::async::Result<std::string> installScrcpyWorker(const std::string& url, cons
     if (!downloadFileWithFallback(url, toWide(zip), err)) {
         cleanupDir(work);
         return app::async::failure<std::string>("下载失败：" + err);
+    }
+    // Downloads can travel via a third-party GitHub mirror, so verify the
+    // archive against the checksum published in the release before unpacking.
+    if (!expectedSha256.empty()) {
+        const std::string actual = sha256FileHex(toWide(zip), err);
+        if (actual.empty()) {
+            cleanupDir(work);
+            return app::async::failure<std::string>("校验失败：" + err);
+        }
+        if (lower(actual) != lower(expectedSha256)) {
+            cleanupDir(work);
+            return app::async::failure<std::string>("scrcpy 更新包校验失败（SHA-256 不匹配），已取消安装。");
+        }
     }
     g_dlStage = 2;
     if (!extractZip(zip, extracted, err)) {
@@ -3085,7 +3235,8 @@ app::async::Result<std::string> installScrcpyWorker(const std::string& url, cons
 }
 
 app::async::Result<std::string> installAdbWorker(const std::string& url, const std::string& version,
-                                                 const std::string& adbPath) {
+                                                 const std::string& adbPath,
+                                                 const std::string& expectedSha1) {
     const std::string work = makeUpdateWorkDir("adb");
     const std::string zip = work + "\\platform-tools.zip";
     const std::string extracted = work + "\\extracted";
@@ -3098,6 +3249,17 @@ app::async::Result<std::string> installAdbWorker(const std::string& url, const s
         if (!downloadFile(fallback, toWide(zip), err)) {
             cleanupDir(work);
             return app::async::failure<std::string>("下载失败：" + err);
+        }
+    }
+    // Google publishes a SHA-1 (not SHA-256) in repository2-1.xml. It is weak
+    // against deliberate collisions but still catches truncated or substituted
+    // downloads; a mismatch is reported instead of being ignored.
+    std::string adbVerifyWarning;
+    if (!expectedSha1.empty()) {
+        std::string hashErr;
+        const std::string actual = sha1FileHex(toWide(zip), hashErr);
+        if (!actual.empty() && lower(actual) != lower(expectedSha1)) {
+            adbVerifyWarning = "（注意：下载包校验值与官方公布的不一致，可能不是官方文件）";
         }
     }
     g_dlStage = 2;
@@ -3126,10 +3288,11 @@ app::async::Result<std::string> installAdbWorker(const std::string& url, const s
         }
     }
     cleanupDir(work);
-    return app::async::success<std::string>("adb 已更新到 " + version);
+    return app::async::success<std::string>("adb 已更新到 " + version + adbVerifyWarning);
 }
 
-app::async::Result<std::string> installAppUpdateWorker(const std::string& url, const std::string& version) {
+app::async::Result<std::string> installAppUpdateWorker(const std::string& url, const std::string& version,
+                                                       const std::string& expectedSha256) {
     const std::string work = makeUpdateWorkDir("app");
     const std::string zip = work + "\\app.zip";
     const std::string extracted = work + "\\extracted";
@@ -3139,6 +3302,19 @@ app::async::Result<std::string> installAppUpdateWorker(const std::string& url, c
     if (!downloadFileWithFallback(url, toWide(zip), err)) {
         cleanupDir(work);
         return app::async::failure<std::string>("下载失败：" + err);
+    }
+    // Verify the archive before anything is unpacked or executed. The digest
+    // comes from the GitHub release metadata (or its .sha256 sidecar).
+    if (!expectedSha256.empty()) {
+        const std::string actual = sha256FileHex(toWide(zip), err);
+        if (actual.empty()) {
+            cleanupDir(work);
+            return app::async::failure<std::string>("校验失败：" + err);
+        }
+        if (lower(actual) != lower(expectedSha256)) {
+            cleanupDir(work);
+            return app::async::failure<std::string>("更新包校验失败（SHA-256 不匹配），已取消安装。");
+        }
     }
     g_dlStage = 2;
     if (!extractZip(zip, extracted, err)) {
@@ -3162,6 +3338,10 @@ app::async::Result<std::string> installAppUpdateWorker(const std::string& url, c
         cleanupDir(work);
         return app::async::failure<std::string>("更新包中未找到 adb_browser.exe");
     }
+
+    // Note: the archive itself was already verified against the published
+    // sha256 above, and the executable we copy out of it comes straight from
+    // that verified archive - so no second digest is needed here.
 
     // Windows allows renaming a running executable (but not overwriting it), so
     // move the current one aside and copy the new one into place.
@@ -3204,6 +3384,94 @@ std::string jsonStringValue(const std::string& json, const std::string& key) {
     return json.substr(start, end - start);
 }
 
+// End index of the JSON string that opens at "openQuote". Skips escaped
+// characters so a quoted "}" or "{" can never be mistaken for structure.
+std::size_t jsonStringEnd(const std::string& json, std::size_t openQuote) {
+    for (std::size_t i = openQuote + 1; i < json.size(); ++i) {
+        const char c = json[i];
+        if (c == '\\') { ++i; continue; }
+        if (c == '"') return i;
+    }
+    return std::string::npos;
+}
+
+// End index (the closing brace) of the JSON object that opens at "brace".
+// String-aware: braces inside string literals are ignored. That matters a lot
+// here, because GitHub's API JSON is full of URL templates such as
+// "https://api.github.com/users/x/following{/other_user}", and a naive
+// brace counter walks straight out of the object it was asked about.
+std::size_t jsonObjectEnd(const std::string& json, std::size_t brace) {
+    int depth = 0;
+    for (std::size_t i = brace; i < json.size(); ++i) {
+        const char c = json[i];
+        if (c == '"') {
+            const std::size_t end = jsonStringEnd(json, i);
+            if (end == std::string::npos) return std::string::npos;
+            i = end;
+            continue;
+        }
+        if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            if (--depth == 0) return i;
+        }
+    }
+    return std::string::npos;
+}
+
+// Locate the release asset the in-app self-update should install: the first
+// asset whose name ends in ".zip". GitHub also exposes zipball/tarball URLs,
+// but those are separate JSON fields and never show up as
+// "browser_download_url" entries, so they cannot be picked up here.
+//
+// The asset's own "digest" field ("sha256:<hex>", published by GitHub for
+// uploaded assets) is returned as well so the updater can verify what it
+// downloaded before replacing its own executable. An empty digest means "not
+// published": the caller then falls back to the "<asset>.sha256" sidecar and
+// only reports the update as unverified when that is missing too.
+//
+// The "assets":[ array is walked object by object instead of searching for a
+// URL and then looking backwards for its object, because GitHub's own JSON is
+// full of URL templates containing braces (".../events{/privacy}") that make
+// naive backward brace matching land inside a string literal.
+bool findAppReleaseAsset(const std::string& json, std::string& url, std::string& row, std::string& sha) {
+    url.clear();
+    row.clear();
+    sha.clear();
+
+    const std::string assetsNeedle = "\"assets\":[";
+    const std::size_t assets = json.find(assetsNeedle);
+    if (assets == std::string::npos) return false;
+
+    std::size_t i = assets + assetsNeedle.size();
+    while (i < json.size()) {
+        if (json[i] != '{') {
+            if (json[i] == ']') break;  // end of the asset array
+            ++i;
+            continue;
+        }
+        const std::size_t objEnd = jsonObjectEnd(json, i);
+        if (objEnd == std::string::npos) break;
+        const std::string entry = json.substr(i, objEnd - i + 1);
+        i = objEnd + 1;
+
+        const std::string name = jsonStringValue(entry, "name");
+        const std::string assetUrl = jsonStringValue(entry, "browser_download_url");
+        const bool zip = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".zip") == 0) ||
+                         (assetUrl.size() >= 4 && assetUrl.compare(assetUrl.size() - 4, 4, ".zip") == 0);
+        if (!zip) continue;
+
+        const std::size_t lastSlash = assetUrl.find_last_of('/');
+        url = assetUrl;
+        row = !name.empty() ? name : (lastSlash == std::string::npos ? assetUrl : assetUrl.substr(lastSlash + 1));
+
+        const std::string digest = jsonStringValue(entry, "digest");
+        if (digest.rfind("sha256:", 0) == 0) sha = lower(trim(digest.substr(7)));
+        return true;
+    }
+    return false;
+}
+
 std::string findWin64AssetUrl(const std::string& json) {
     const std::size_t namePos = json.find("\"name\":\"scrcpy-win64-");
     if (namePos == std::string::npos) return "";
@@ -3216,24 +3484,41 @@ std::string findWin64AssetUrl(const std::string& json) {
     return json.substr(start, end - start);
 }
 
-// Find the first release asset URL ending with ".zip" (the app's self-update
-// package). GitHub releases also expose zipball/tarball URLs, but those are
-// separate fields, not "browser_download_url" entries, so this only matches
-// uploaded assets.
-std::string findZipAssetUrl(const std::string& json) {
-    const std::string needle = "\"browser_download_url\":\"";
-    std::size_t pos = 0;
-    while ((pos = json.find(needle, pos)) != std::string::npos) {
-        const std::size_t start = pos + needle.size();
-        const std::size_t end = json.find('"', start);
-        if (end == std::string::npos) return "";
-        const std::string url = json.substr(start, end - start);
-        if (url.size() >= 4 && url.compare(url.size() - 4, 4, ".zip") == 0) {
-            return url;
-        }
-        pos = end;
-    }
-    return "";
+// Resolve the published sha256 for an asset URL, using the GitHub release
+// metadata first ("digest" on the asset) and the "<url>.sha256" sidecar as a
+// fallback. Returns an empty string when the release publishes no digest; the
+// callers treat that as "cannot verify" rather than "verified".
+std::string resolveAssetSha256(const std::string& releaseJson, const std::string& url) {
+    if (url.empty()) return "";
+    // The release payload already carries the asset digest when we have the
+    // whole release JSON; find it through the same asset walk.
+    std::string foundUrl, foundRow, foundSha;
+    (void)findAppReleaseAsset(releaseJson, foundUrl, foundRow, foundSha);
+    if (foundUrl == url && foundSha.size() == 64) return foundSha;
+
+    HttpResult hr = httpGetString(url + ".sha256", 64 * 1024);
+    if (!hr.ok) return "";
+    const std::string body = trim(hr.body);
+    if (body.empty() || body[0] == '<') return "";  // an HTML error page, not a digest
+    const std::vector<std::pair<std::string, std::string>> rows = parseSha256Rows(body);
+    return rows.empty() ? std::string() : rows.front().second;
+}
+
+// -----------------------------------------------------------------------------
+// Google's SDK repository XML (repository2-1.xml): the <remotePackage
+// path="platform-tools"> entry carries the current revision plus, for every
+// host OS, the exact archive URL and its checksum. Reading it directly means we
+// download a pinned file we can verify instead of guessing a URL from a version
+// number (the Windows archive is named "-win.zip", not "-windows.zip").
+// -----------------------------------------------------------------------------
+std::string xmlValue(const std::string& block, const std::string& name) {
+    const std::string open = "<" + name + ">";
+    const std::string close = "</" + name + ">";
+    const std::size_t a = block.find(open);
+    if (a == std::string::npos) return "";
+    const std::size_t b = block.find(close, a);
+    if (b == std::string::npos) return "";
+    return trim(block.substr(a + open.size(), b - a - open.size()));
 }
 
 std::string parsePlatformToolsVersion(const std::string& xml) {
@@ -3244,23 +3529,41 @@ std::string parsePlatformToolsVersion(const std::string& xml) {
     const std::size_t revEnd = xml.find("</revision>", rev);
     if (revEnd == std::string::npos) return "";
     const std::string revBlock = xml.substr(rev, revEnd - rev);
-    auto tag = [&revBlock](const std::string& name) {
-        const std::string open = "<" + name + ">";
-        const std::string close = "</" + name + ">";
-        const std::size_t a = revBlock.find(open);
-        if (a == std::string::npos) return std::string();
-        const std::size_t b = revBlock.find(close, a);
-        if (b == std::string::npos) return std::string();
-        return revBlock.substr(a + open.size(), b - a - open.size());
-    };
-    const std::string major = tag("major");
+    const std::string major = xmlValue(revBlock, "major");
     if (major.empty()) return "";
     std::string v = major;
-    const std::string minor = tag("minor");
-    const std::string micro = tag("micro");
+    const std::string minor = xmlValue(revBlock, "minor");
+    const std::string micro = xmlValue(revBlock, "micro");
     if (!minor.empty()) v += "." + minor;
     if (!micro.empty()) v += "." + micro;
     return v;
+}
+
+// Windows archive of the platform-tools remote package: returns the absolute
+// download URL and its published checksum (SHA-1).
+void parsePlatformToolsWindowsArchive(const std::string& xml, std::string& url, std::string& checksum) {
+    url.clear();
+    checksum.clear();
+    const std::size_t pkg = xml.find("<remotePackage path=\"platform-tools\"");
+    if (pkg == std::string::npos) return;
+    const std::size_t pkgEnd = xml.find("</remotePackage>", pkg);
+    const std::string pkgBlock = xml.substr(pkg, pkgEnd == std::string::npos ? std::string::npos
+                                                                             : pkgEnd - pkg);
+    const std::size_t archives = pkgBlock.find("<archives>");
+    if (archives == std::string::npos) return;
+
+    std::size_t pos = archives;
+    while ((pos = pkgBlock.find("<archive>", pos)) != std::string::npos) {
+        const std::size_t end = pkgBlock.find("</archive>", pos);
+        if (end == std::string::npos) return;
+        const std::string block = pkgBlock.substr(pos, end - pos);
+        pos = end + 1;
+        if (xmlValue(block, "host-os") != "windows") continue;
+        const std::string base = "https://dl.google.com/android/repository/";
+        url = base + xmlValue(block, "url");
+        checksum = lower(xmlValue(block, "checksum"));
+        return;
+    }
 }
 
 void checkForUpdates();
@@ -3299,6 +3602,7 @@ void checkForUpdates() {
                     info.scrcpyUrl = "https://github.com/Genymobile/scrcpy/releases/download/v" + tag +
                                      "/scrcpy-win64-v" + tag + ".zip";
                 }
+                info.scrcpySha256 = resolveAssetSha256(hr.body, info.scrcpyUrl);
             } else if (info.error.empty()) {
                 info.error = "获取 scrcpy 最新版本失败：" + hr.error;
             }
@@ -3307,7 +3611,9 @@ void checkForUpdates() {
             HttpResult hr2 = httpGetString("https://dl.google.com/android/repository/repository2-1.xml", 8 * 1024 * 1024);
             if (hr2.ok) {
                 info.adbLatest = parsePlatformToolsVersion(hr2.body);
-                if (!info.adbLatest.empty()) {
+                // Prefer the exact archive URL + checksum published for Windows.
+                parsePlatformToolsWindowsArchive(hr2.body, info.adbUrl, info.adbSha1);
+                if (info.adbUrl.empty() && !info.adbLatest.empty()) {
                     info.adbUrl = "https://dl.google.com/android/repository/platform-tools_r" +
                                   info.adbLatest + "-windows.zip";
                 }
@@ -3321,7 +3627,12 @@ void checkForUpdates() {
                 std::string tag = jsonStringValue(hr3.body, "tag_name");
                 if (!tag.empty() && tag[0] == 'v') tag = tag.substr(1);
                 info.appLatest = tag;
-                info.appUrl = findZipAssetUrl(hr3.body);
+                findAppReleaseAsset(hr3.body, info.appUrl, info.appRow, info.appSha256);
+                // Older releases carry no asset "digest"; fall back to the
+                // ".sha256" sidecar the release workflow publishes.
+                if (info.appSha256.empty() && !info.appUrl.empty()) {
+                    info.appSha256 = resolveAssetSha256("", info.appUrl);
+                }
             } else if (info.error.empty()) {
                 info.error = "获取本软件最新版本失败：" + hr3.error;
             }
@@ -3368,10 +3679,11 @@ void startUpdateScrcpy() {
     g_dlReceived = 0;
 #ifdef _WIN32
     stopScrcpyIfRunning();
+    const std::string sha256 = g_update.scrcpySha256;
     app::async::restart(
         "update.install.scrcpy",
-        [url, version]() -> app::async::Result<std::string> {
-            return installScrcpyWorker(url, version);
+        [url, version, sha256]() -> app::async::Result<std::string> {
+            return installScrcpyWorker(url, version, sha256);
         },
         [version](const app::async::Result<std::string>& result) {
             state.updateWorking = false;
@@ -3401,6 +3713,7 @@ void startUpdateAdb() {
     const std::string url = g_update.adbUrl;
     const std::string version = g_update.adbLatest;
     const std::string adbPath = state.adbPath;
+    const std::string sha1 = g_update.adbSha1;
     state.updateWorking = true;
     state.updateStatus = "正在更新 adb…";
     g_dlStage = 0;
@@ -3409,8 +3722,8 @@ void startUpdateAdb() {
 #ifdef _WIN32
     app::async::restart(
         "update.install.adb",
-        [url, version, adbPath]() -> app::async::Result<std::string> {
-            return installAdbWorker(url, version, adbPath);
+        [url, version, adbPath, sha1]() -> app::async::Result<std::string> {
+            return installAdbWorker(url, version, adbPath, sha1);
         },
         [version](const app::async::Result<std::string>& result) {
             state.updateWorking = false;
@@ -3442,6 +3755,7 @@ void startUpdateApp() {
     }
     const std::string url = g_update.appUrl;
     const std::string version = g_update.appLatest;
+    const std::string sha256 = g_update.appSha256;
     state.updateWorking = true;
     state.updateStatus = "正在更新本软件…";
     g_dlStage = 0;
@@ -3450,8 +3764,8 @@ void startUpdateApp() {
 #ifdef _WIN32
     app::async::restart(
         "update.install.app",
-        [url, version]() -> app::async::Result<std::string> {
-            return installAppUpdateWorker(url, version);
+        [url, version, sha256]() -> app::async::Result<std::string> {
+            return installAppUpdateWorker(url, version, sha256);
         },
         [version](const app::async::Result<std::string>& result) {
             state.updateWorking = false;
