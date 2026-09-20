@@ -47,22 +47,22 @@ const char* kLsMonthDate =
 ADB_TEST(parseDevices_reads_serial_state_and_model) {
     const std::vector<Device> devices = parseDevices(kDevicesL);
     ADB_CHECK_EQ(devices.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(devices[0].serial, std::string("UQG5T20616008457"));
-    ADB_CHECK_EQ(devices[0].state, std::string("device"));
-    ADB_CHECK_EQ(devices[0].model, std::string("ELS_AN00"));
-    ADB_CHECK_EQ(devices[0].product, std::string("ELS-AN00"));
+    ADB_CHECK_EQ(ADB_AT(devices, 0).serial, std::string("UQG5T20616008457"));
+    ADB_CHECK_EQ(ADB_AT(devices, 0).state, std::string("device"));
+    ADB_CHECK_EQ(ADB_AT(devices, 0).model, std::string("ELS_AN00"));
+    ADB_CHECK_EQ(ADB_AT(devices, 0).product, std::string("ELS-AN00"));
 }
 
 ADB_TEST(parseDevices_skips_header_and_keeps_problem_states) {
     const std::vector<Device> devices = parseDevices(kDevicesMixed);
     ADB_CHECK_EQ(devices.size(), static_cast<std::size_t>(3));
-    ADB_CHECK_EQ(devices[0].state, std::string("device"));
+    ADB_CHECK_EQ(ADB_AT(devices, 0).state, std::string("device"));
     // A device the user has not authorised must still be listed, otherwise the
     // UI cannot tell them why nothing is selectable.
-    ADB_CHECK_EQ(devices[1].state, std::string("unauthorized"));
-    ADB_CHECK_EQ(devices[1].serial, std::string("UQG5T20616008457"));
-    ADB_CHECK_EQ(devices[1].model, std::string(""));  // -l omitted the property
-    ADB_CHECK_EQ(devices[2].state, std::string("offline"));
+    ADB_CHECK_EQ(ADB_AT(devices, 1).state, std::string("unauthorized"));
+    ADB_CHECK_EQ(ADB_AT(devices, 1).serial, std::string("UQG5T20616008457"));
+    ADB_CHECK_EQ(ADB_AT(devices, 1).model, std::string(""));  // -l omitted the property
+    ADB_CHECK_EQ(ADB_AT(devices, 2).state, std::string("offline"));
 }
 
 ADB_TEST(parseDevices_ignores_daemon_chatter) {
@@ -73,7 +73,7 @@ ADB_TEST(parseDevices_ignores_daemon_chatter) {
         "ABC123\tdevice\n";
     const std::vector<Device> devices = parseDevices(out);
     ADB_CHECK_EQ(devices.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(devices[0].serial, std::string("ABC123"));
+    ADB_CHECK_EQ(ADB_AT(devices, 0).serial, std::string("ABC123"));
 }
 
 ADB_TEST(parseDevices_empty_and_blank_output) {
@@ -88,40 +88,45 @@ ADB_TEST(parseDevices_keeps_line_without_state) {
     // dropped, so the problem is visible instead of the device vanishing.
     const std::vector<Device> devices = parseDevices("List of devices attached\nABC123\n");
     ADB_CHECK_EQ(devices.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(devices[0].serial, std::string("ABC123"));
-    ADB_CHECK_EQ(devices[0].state, std::string(""));
+    ADB_CHECK_EQ(ADB_AT(devices, 0).serial, std::string("ABC123"));
+    ADB_CHECK_EQ(ADB_AT(devices, 0).state, std::string(""));
 }
 
 ADB_TEST(parseLsLa_reads_iso_dates_and_skips_total) {
     const std::vector<FsEntry> entries = parseLsLa(kLsIsoDate);
     ADB_CHECK_EQ(entries.size(), static_cast<std::size_t>(4));  // "total" line skipped
-    ADB_CHECK_EQ(entries[0].name, std::string(".7934039b"));
-    ADB_CHECK(entries[0].isDir);
-    ADB_CHECK(!entries[0].isLink);
-    ADB_CHECK_EQ(entries[0].date, std::string("2025-12-29 03:11"));
-    ADB_CHECK_EQ(entries[1].size, 32LL);
-    ADB_CHECK(!entries[1].isDir);
-    ADB_CHECK_EQ(entries[2].name,
+    ADB_CHECK_EQ(ADB_AT(entries, 0).name, std::string(".7934039b"));
+    ADB_CHECK(ADB_AT(entries, 0).isDir);
+    ADB_CHECK(!ADB_AT(entries, 0).isLink);
+    ADB_CHECK_EQ(ADB_AT(entries, 0).date, std::string("2025-12-29 03:11"));
+    ADB_CHECK_EQ(ADB_AT(entries, 1).size, 32LL);
+    ADB_CHECK(!ADB_AT(entries, 1).isDir);
+    ADB_CHECK_EQ(ADB_AT(entries, 2).name,
                  std::string("2. 矩阵高次幂的计算（例题解析）_1664539430387.pdf"));
-    ADB_CHECK_EQ(entries[2].size, 1434590LL);
-    ADB_CHECK_EQ(entries[3].name, std::string("Browser"));
-    ADB_CHECK(entries[3].isDir);
+    ADB_CHECK_EQ(ADB_AT(entries, 2).size, 1434590LL);
+    ADB_CHECK_EQ(ADB_AT(entries, 3).name, std::string("Browser"));
+    ADB_CHECK(ADB_AT(entries, 3).isDir);
 }
 
 ADB_TEST(parseLsLa_reads_month_dates_and_year_only) {
     const std::vector<FsEntry> entries = parseLsLa(kLsMonthDate);
     ADB_CHECK_EQ(entries.size(), static_cast<std::size_t>(3));
-    ADB_CHECK_EQ(entries[0].name, std::string("dcim"));
-    ADB_CHECK_EQ(entries[0].date, std::string("Jan 12 09:30"));
+    ADB_CHECK_EQ(ADB_AT(entries, 0).name, std::string("dcim"));
+    ADB_CHECK_EQ(ADB_AT(entries, 0).date, std::string("Jan 12 09:30"));
     // "Dec  3  2024" - the double space collapses into the date as well.
-    ADB_CHECK_EQ(entries[1].name, std::string("notes.txt"));
-    ADB_CHECK_EQ(entries[1].date, std::string("Dec 3 2024"));
-    ADB_CHECK_EQ(entries[1].size, 512LL);
+    ADB_CHECK_EQ(ADB_AT(entries, 1).name, std::string("notes.txt"));
+    ADB_CHECK_EQ(ADB_AT(entries, 1).date, std::string("Dec 3 2024"));
+    ADB_CHECK_EQ(ADB_AT(entries, 1).size, 512LL);
 }
 
 ADB_TEST(parseLsLa_splits_symlink_target) {
     const std::vector<FsEntry> entries = parseLsLa(kLsMonthDate);
-    const FsEntry& link = entries[2];
+    // The size is asserted before anything is read: binding a reference to
+    // entries[2] when the parser produced fewer entries would read past the end,
+    // which is how this file previously corrupted the heap on CI instead of
+    // failing.
+    ADB_CHECK_EQ(entries.size(), static_cast<std::size_t>(3));
+    const FsEntry& link = ADB_AT(entries, 2);
     ADB_CHECK(link.isLink);
     ADB_CHECK(!link.isDir);
     ADB_CHECK_EQ(link.name, std::string("sdcard"));
@@ -134,7 +139,7 @@ ADB_TEST(parseLsLa_reassembles_names_with_spaces) {
     const std::string out = "-rw-r--r-- 1 root root 100 Jan 12 09:30 my report 2024 final.txt\n";
     const std::vector<FsEntry> entries = parseLsLa(out);
     ADB_CHECK_EQ(entries.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(entries[0].name, std::string("my report 2024 final.txt"));
+    ADB_CHECK_EQ(ADB_AT(entries, 0).name, std::string("my report 2024 final.txt"));
 }
 
 ADB_TEST(parseLsLa_marks_special_files_as_other) {
@@ -162,7 +167,7 @@ ADB_TEST(parseLsLa_skips_dot_entries_and_junk) {
         "-rw-r--r-- 1 root root 10 2025-01-01 00:00 keep.txt\n";
     const std::vector<FsEntry> entries = parseLsLa(out);
     ADB_CHECK_EQ(entries.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(entries[0].name, std::string("keep.txt"));
+    ADB_CHECK_EQ(ADB_AT(entries, 0).name, std::string("keep.txt"));
 }
 
 ADB_TEST(parseLsLa_handles_crlf_from_windows_adb) {
@@ -171,7 +176,7 @@ ADB_TEST(parseLsLa_handles_crlf_from_windows_adb) {
     const std::string out = "-rw-r--r-- 1 root root 10 2025-01-01 00:00 keep.txt\r\n";
     const std::vector<FsEntry> entries = parseLsLa(out);
     ADB_CHECK_EQ(entries.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(entries[0].name, std::string("keep.txt"));
+    ADB_CHECK_EQ(ADB_AT(entries, 0).name, std::string("keep.txt"));
 }
 
 ADB_TEST(parseLsLa_error_text_produces_no_entries) {
@@ -205,7 +210,7 @@ ADB_TEST(parseListingOutput_splits_listing_and_writable) {
         kWriteMarker + "\n1\n";
     const ListingResult result = parseListingOutput(out);
     ADB_CHECK_EQ(result.entries.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(result.entries[0].name, std::string("sub"));
+    ADB_CHECK_EQ(ADB_AT(result.entries, 0).name, std::string("sub"));
     ADB_CHECK(result.writable);
 }
 
@@ -229,8 +234,8 @@ ADB_TEST(parseListingOutput_without_marker_is_not_writable) {
 
 ADB_TEST(command_builders_quote_device_paths) {
     ADB_CHECK_EQ(deleteArgs("S1", "/sdcard/My Dir").size(), static_cast<std::size_t>(6));
-    ADB_CHECK_EQ(deleteArgs("S1", "/sdcard/My Dir")[5], std::string("'/sdcard/My Dir'"));
-    ADB_CHECK_EQ(makeDirArgs("S1", "/sdcard/a b")[5], std::string("'/sdcard/a b'"));
+    ADB_CHECK_EQ(ADB_AT(deleteArgs("S1", "/sdcard/My Dir"), 5), std::string("'/sdcard/My Dir'"));
+    ADB_CHECK_EQ(ADB_AT(makeDirArgs("S1", "/sdcard/a b"), 5), std::string("'/sdcard/a b'"));
 }
 
 ADB_TEST(command_builders_shape) {
@@ -242,83 +247,83 @@ ADB_TEST(command_builders_shape) {
     const std::vector<std::string> pull = pullArgs("S1", "/sdcard/a.txt", "C:\\out");
     ADB_CHECK_EQ(pull.size(), static_cast<std::size_t>(5));
     if (pull.size() == 5) {
-        ADB_CHECK_EQ(pull[0], std::string("-s"));
-        ADB_CHECK_EQ(pull[1], std::string("S1"));
-        ADB_CHECK_EQ(pull[2], std::string("pull"));
-        ADB_CHECK_EQ(pull[3], std::string("/sdcard/a.txt"));
+        ADB_CHECK_EQ(ADB_AT(pull, 0), std::string("-s"));
+        ADB_CHECK_EQ(ADB_AT(pull, 1), std::string("S1"));
+        ADB_CHECK_EQ(ADB_AT(pull, 2), std::string("pull"));
+        ADB_CHECK_EQ(ADB_AT(pull, 3), std::string("/sdcard/a.txt"));
         // Local paths are NOT shell-quoted: they go through CreateProcess as
         // separate argv entries via runProcess, which quotes them itself.
-        ADB_CHECK_EQ(pull[4], std::string("C:\\out"));
+        ADB_CHECK_EQ(ADB_AT(pull, 4), std::string("C:\\out"));
     }
 
     const std::vector<std::string> push = pushArgs("S1", "C:\\my file.apk", "/sdcard/My Dir");
     ADB_CHECK_EQ(push.size(), static_cast<std::size_t>(5));
     if (push.size() == 5) {
-        ADB_CHECK_EQ(push[2], std::string("push"));
-        ADB_CHECK_EQ(push[3], std::string("C:\\my file.apk"));
+        ADB_CHECK_EQ(ADB_AT(push, 2), std::string("push"));
+        ADB_CHECK_EQ(ADB_AT(push, 3), std::string("C:\\my file.apk"));
         // The remote side is a directory argument, not a shell snippet: adb
         // quotes it itself, so it must not arrive pre-quoted.
-        ADB_CHECK_EQ(push[4], std::string("/sdcard/My Dir"));
+        ADB_CHECK_EQ(ADB_AT(push, 4), std::string("/sdcard/My Dir"));
     }
 
     const std::vector<std::string> install = installApkArgs("S1", "C:\\a.apk");
     ADB_CHECK_EQ(install.size(), static_cast<std::size_t>(5));
     if (install.size() == 5) {
-        ADB_CHECK_EQ(install[2], std::string("install"));
-        ADB_CHECK_EQ(install[3], std::string("-r"));
-        ADB_CHECK_EQ(install[4], std::string("C:\\a.apk"));
+        ADB_CHECK_EQ(ADB_AT(install, 2), std::string("install"));
+        ADB_CHECK_EQ(ADB_AT(install, 3), std::string("-r"));
+        ADB_CHECK_EQ(ADB_AT(install, 4), std::string("C:\\a.apk"));
     }
 
     const std::vector<std::string> uninstall = uninstallArgs("S1", "com.x");
     ADB_CHECK_EQ(uninstall.size(), static_cast<std::size_t>(4));
     if (uninstall.size() == 4) {
-        ADB_CHECK_EQ(uninstall[2], std::string("uninstall"));
-        ADB_CHECK_EQ(uninstall[3], std::string("com.x"));
+        ADB_CHECK_EQ(ADB_AT(uninstall, 2), std::string("uninstall"));
+        ADB_CHECK_EQ(ADB_AT(uninstall, 3), std::string("com.x"));
     }
 
     const std::vector<std::string> clear = clearAppDataArgs("S1", "com.x");
     ADB_CHECK_EQ(clear.size(), static_cast<std::size_t>(6));
     if (clear.size() == 6) {
-        ADB_CHECK_EQ(clear[2], std::string("shell"));
-        ADB_CHECK_EQ(clear[3], std::string("pm"));
-        ADB_CHECK_EQ(clear[4], std::string("clear"));
-        ADB_CHECK_EQ(clear[5], std::string("com.x"));
+        ADB_CHECK_EQ(ADB_AT(clear, 2), std::string("shell"));
+        ADB_CHECK_EQ(ADB_AT(clear, 3), std::string("pm"));
+        ADB_CHECK_EQ(ADB_AT(clear, 4), std::string("clear"));
+        ADB_CHECK_EQ(ADB_AT(clear, 5), std::string("com.x"));
     }
 
     const std::vector<std::string> screencap = screencapArgs("S1");
     ADB_CHECK_EQ(screencap.size(), static_cast<std::size_t>(5));
     if (screencap.size() == 5) {
-        ADB_CHECK_EQ(screencap[2], std::string("exec-out"));
-        ADB_CHECK_EQ(screencap[3], std::string("screencap"));
-        ADB_CHECK_EQ(screencap[4], std::string("-p"));
+        ADB_CHECK_EQ(ADB_AT(screencap, 2), std::string("exec-out"));
+        ADB_CHECK_EQ(ADB_AT(screencap, 3), std::string("screencap"));
+        ADB_CHECK_EQ(ADB_AT(screencap, 4), std::string("-p"));
     }
 
     const std::vector<std::string> logcatClear = logcatClearArgs("S1");
     ADB_CHECK_EQ(logcatClear.size(), static_cast<std::size_t>(4));
     if (logcatClear.size() == 4) {
-        ADB_CHECK_EQ(logcatClear[2], std::string("logcat"));
-        ADB_CHECK_EQ(logcatClear[3], std::string("-c"));
+        ADB_CHECK_EQ(ADB_AT(logcatClear, 2), std::string("logcat"));
+        ADB_CHECK_EQ(ADB_AT(logcatClear, 3), std::string("-c"));
     }
 
     const std::vector<std::string> connect = connectArgs("192.168.1.5:5555");
     ADB_CHECK_EQ(connect.size(), static_cast<std::size_t>(2));
     if (connect.size() == 2) {
-        ADB_CHECK_EQ(connect[0], std::string("connect"));
-        ADB_CHECK_EQ(connect[1], std::string("192.168.1.5:5555"));
+        ADB_CHECK_EQ(ADB_AT(connect, 0), std::string("connect"));
+        ADB_CHECK_EQ(ADB_AT(connect, 1), std::string("192.168.1.5:5555"));
     }
 
     const std::vector<std::string> kill = killServerArgs();
     ADB_CHECK_EQ(kill.size(), static_cast<std::size_t>(1));
     if (kill.size() == 1) {
-        ADB_CHECK_EQ(kill[0], std::string("kill-server"));
+        ADB_CHECK_EQ(ADB_AT(kill, 0), std::string("kill-server"));
     }
 }
 
 ADB_TEST(devicesArgs_requests_long_format) {
     const std::vector<std::string> args = devicesArgs();
     ADB_CHECK_EQ(args.size(), static_cast<std::size_t>(2));
-    ADB_CHECK_EQ(args[0], std::string("devices"));
-    ADB_CHECK_EQ(args[1], std::string("-l"));
+    ADB_CHECK_EQ(ADB_AT(args, 0), std::string("devices"));
+    ADB_CHECK_EQ(ADB_AT(args, 1), std::string("-l"));
 }
 
 ADB_TEST(parsePackageList_reads_package_lines_only) {
@@ -330,10 +335,10 @@ ADB_TEST(parsePackageList_reads_package_lines_only) {
         "package:com.android.cts.priv.ctsshim versionCode=29\n";
     const std::vector<std::string> packages = parsePackageList(out);
     ADB_CHECK_EQ(packages.size(), static_cast<std::size_t>(3));
-    ADB_CHECK_EQ(packages[0], std::string("com.huawei.security.hsdr"));
-    ADB_CHECK_EQ(packages[1], std::string("com.fenqile.fenqile"));
+    ADB_CHECK_EQ(ADB_AT(packages, 0), std::string("com.huawei.security.hsdr"));
+    ADB_CHECK_EQ(ADB_AT(packages, 1), std::string("com.fenqile.fenqile"));
     // A trailing property is not part of the package name.
-    ADB_CHECK_EQ(packages[2], std::string("com.android.cts.priv.ctsshim"));
+    ADB_CHECK_EQ(ADB_AT(packages, 2), std::string("com.android.cts.priv.ctsshim"));
 }
 
 ADB_TEST(parsePackageList_empty) {

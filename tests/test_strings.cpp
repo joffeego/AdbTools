@@ -22,7 +22,7 @@ ADB_TEST(trim_keeps_inner_whitespace_and_handles_empty) {
 
 ADB_TEST(splitWs_splits_on_any_whitespace_run) {
     ADB_CHECK_EQ(splitWs("  a\tb\n c ").size(), static_cast<std::size_t>(3));
-    ADB_CHECK_EQ(splitWs("a  b")[1], std::string("b"));
+    ADB_CHECK_EQ(ADB_AT(splitWs("a  b"), 1), std::string("b"));
     ADB_CHECK_EQ(splitWs("").size(), static_cast<std::size_t>(0));
     ADB_CHECK_EQ(splitWs("   ").size(), static_cast<std::size_t>(0));
 }

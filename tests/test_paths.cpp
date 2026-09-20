@@ -59,11 +59,11 @@ ADB_TEST(parentPath_ignores_trailing_slashes) {
 
 ADB_TEST(splitPath_produces_components) {
     ADB_CHECK_EQ(splitPath("/sdcard/a.txt").size(), static_cast<std::size_t>(2));
-    ADB_CHECK_EQ(splitPath("/sdcard/a.txt")[0], std::string("sdcard"));
-    ADB_CHECK_EQ(splitPath("/sdcard/a.txt")[1], std::string("a.txt"));
+    ADB_CHECK_EQ(ADB_AT(splitPath("/sdcard/a.txt"), 0), std::string("sdcard"));
+    ADB_CHECK_EQ(ADB_AT(splitPath("/sdcard/a.txt"), 1), std::string("a.txt"));
     ADB_CHECK_EQ(splitPath("/").size(), static_cast<std::size_t>(0));
     ADB_CHECK_EQ(splitPath("").size(), static_cast<std::size_t>(0));
     // Double slashes and a trailing slash must not create empty components.
     ADB_CHECK_EQ(splitPath("/a//b/").size(), static_cast<std::size_t>(2));
-    ADB_CHECK_EQ(splitPath("a/b")[0], std::string("a"));
+    ADB_CHECK_EQ(ADB_AT(splitPath("a/b"), 0), std::string("a"));
 }

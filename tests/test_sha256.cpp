@@ -24,8 +24,8 @@ ADB_TEST(parseSha256Rows_reads_sha256sum_format) {
     const std::string text = std::string(kHex64) + "  AdbFileBrowser-windows-x64.zip\n";
     const auto rows = parseSha256Rows(text);
     ADB_CHECK_EQ(rows.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(rows[0].first, std::string("AdbFileBrowser-windows-x64.zip"));
-    ADB_CHECK_EQ(rows[0].second, std::string(kHex64));
+    ADB_CHECK_EQ(ADB_AT(rows, 0).first, std::string("AdbFileBrowser-windows-x64.zip"));
+    ADB_CHECK_EQ(ADB_AT(rows, 0).second, std::string(kHex64));
 }
 
 ADB_TEST(parseSha256Rows_reads_binary_marker_and_crlf) {
@@ -34,8 +34,8 @@ ADB_TEST(parseSha256Rows_reads_binary_marker_and_crlf) {
     const std::string text = std::string(kHex64) + " *app.zip\r\n";
     const auto rows = parseSha256Rows(text);
     ADB_CHECK_EQ(rows.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(rows[0].first, std::string("app.zip"));
-    ADB_CHECK_EQ(rows[0].second, std::string(kHex64));
+    ADB_CHECK_EQ(ADB_AT(rows, 0).first, std::string("app.zip"));
+    ADB_CHECK_EQ(ADB_AT(rows, 0).second, std::string(kHex64));
 }
 
 ADB_TEST(parseSha256Rows_bare_digest_without_filename_is_dropped) {
@@ -58,15 +58,15 @@ ADB_TEST(parseSha256Rows_normalises_uppercase_hex) {
     const auto rows = parseSha256Rows(upper + "  app.zip\n");
     ADB_CHECK_EQ(rows.size(), static_cast<std::size_t>(1));
     // Digests are compared case-insensitively but stored lowercase.
-    ADB_CHECK_EQ(rows[0].second, std::string(kHex64));
+    ADB_CHECK_EQ(ADB_AT(rows, 0).second, std::string(kHex64));
 }
 
 ADB_TEST(parseSha256Rows_reads_multiple_lines) {
     const std::string text = std::string(kHex64) + "  a.zip\n" + kHex64b + "  b.exe\n";
     const auto rows = parseSha256Rows(text);
     ADB_CHECK_EQ(rows.size(), static_cast<std::size_t>(2));
-    ADB_CHECK_EQ(rows[0].first, std::string("a.zip"));
-    ADB_CHECK_EQ(rows[1].first, std::string("b.exe"));
+    ADB_CHECK_EQ(ADB_AT(rows, 0).first, std::string("a.zip"));
+    ADB_CHECK_EQ(ADB_AT(rows, 1).first, std::string("b.exe"));
 }
 
 ADB_TEST(parseSha256Rows_skips_malformed_lines) {
@@ -97,7 +97,7 @@ ADB_TEST(parseSha256Rows_keeps_filenames_with_spaces) {
     const std::string text = std::string(kHex64) + "  my file name.zip\n";
     const auto rows = parseSha256Rows(text);
     ADB_CHECK_EQ(rows.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(rows[0].first, std::string("my file name.zip"));
+    ADB_CHECK_EQ(ADB_AT(rows, 0).first, std::string("my file name.zip"));
 }
 
 #ifdef _WIN32

@@ -41,9 +41,44 @@ struct Registrar {
 // Report a failure with the failing expression and its location.
 inline void reportFailure(const char* expr, const char* file, int line, const std::string& extra) {
     ++failureCount();
+    std::cerr << "  FAIL [" << currentCase() << "] " << file << ":" << line << "\n"
+              << "       " << expr << "\n";
+    if (!extra.empty()) std::cerr << "       -> " << extra << "\n";
     std::cout << "  FAIL [" << currentCase() << "] " << file << ":" << line << "\n"
               << "       " << expr << "\n";
     if (!extra.empty()) std::cout << "       -> " << extra << "\n";
+}
+
+// Index an element of a container that may be a temporary, without ever reading
+// out of bounds.
+//
+// Indexing a function's return value directly - `f(...)[3]` - is what let an
+// earlier version of these tests corrupt the heap instead of reporting a
+// failure: a wrong expected size meant reading past the end of a vector that had
+// already been destroyed, which surfaced as std::length_error in one runner and
+// std::bad_alloc in another, at unrelated places in the suite.
+//
+// Using these accessors, a wrong size produces a normal "out of range" failure.
+template <typename Container>
+auto atOrEmpty(const Container& c, std::size_t index, const char* file, int line)
+    -> const typename Container::value_type& {
+    static const typename Container::value_type empty{};
+    if (index >= c.size()) {
+        reportFailure("index in range", file, line,
+                      "index " + std::to_string(index) + " >= size " + std::to_string(c.size()));
+        return empty;
+    }
+    return c[index];
+}
+
+// Same idea for std::string, which has operator[] but no value_type fallback.
+inline char charAtOrZero(const std::string& s, std::size_t index, const char* file, int line) {
+    if (index >= s.size()) {
+        reportFailure("index in range", file, line,
+                      "index " + std::to_string(index) + " >= size " + std::to_string(s.size()));
+        return '\0';
+    }
+    return s[index];
 }
 
 template <typename T>
@@ -105,6 +140,17 @@ inline int runAll() {
     do {                                                                      \
         if (!(expr)) ::adb::test::reportFailure(#expr, __FILE__, __LINE__, ""); \
     } while (0)
+
+// Element access that never reads out of bounds. Prefer
+//   ADB_CHECK_EQ(ADB_AT(rows, 0).first, std::string("x"))
+// over
+//   ADB_CHECK_EQ(rows[0].first, std::string("x"))
+// so a wrong size is reported as a failure instead of corrupting the heap.
+#define ADB_AT(container, index) \
+    ::adb::test::atOrEmpty((container), static_cast<std::size_t>(index), __FILE__, __LINE__)
+
+#define ADB_CHAR_AT(str, index) \
+    ::adb::test::charAtOrZero((str), static_cast<std::size_t>(index), __FILE__, __LINE__)
 
 #define ADB_CHECK_EQ(actual, expected)                                        \
     do {                                                                      \

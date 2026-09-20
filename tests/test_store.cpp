@@ -25,8 +25,8 @@ ADB_TEST(bookmarks_round_trip) {
     const std::vector<Bookmark> out = parseBookmarks(serializeBookmarks(in));
     ADB_CHECK_EQ(out.size(), in.size());
     for (std::size_t i = 0; i < in.size(); ++i) {
-        ADB_CHECK_EQ(out[i].name, in[i].name);
-        ADB_CHECK_EQ(out[i].path, in[i].path);
+        ADB_CHECK_EQ(ADB_AT(out, i).name, ADB_AT(in, i).name);
+        ADB_CHECK_EQ(ADB_AT(out, i).path, ADB_AT(in, i).path);
     }
 }
 
@@ -39,8 +39,8 @@ ADB_TEST(bookmarks_skip_malformed_lines_but_keep_the_rest) {
         "also good\t/sdcard/also\n";
     const std::vector<Bookmark> out = parseBookmarks(text);
     ADB_CHECK_EQ(out.size(), static_cast<std::size_t>(2));
-    ADB_CHECK_EQ(out[0].name, std::string("good"));
-    ADB_CHECK_EQ(out[1].name, std::string("also good"));
+    ADB_CHECK_EQ(ADB_AT(out, 0).name, std::string("good"));
+    ADB_CHECK_EQ(ADB_AT(out, 1).name, std::string("also good"));
 }
 
 ADB_TEST(bookmarks_drop_empty_path) {
@@ -52,14 +52,14 @@ ADB_TEST(bookmarks_drop_empty_path) {
 ADB_TEST(bookmarks_tolerate_crlf) {
     const std::vector<Bookmark> out = parseBookmarks("Download\t/sdcard/Download\r\n");
     ADB_CHECK_EQ(out.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(out[0].path, std::string("/sdcard/Download"));
+    ADB_CHECK_EQ(ADB_AT(out, 0).path, std::string("/sdcard/Download"));
 }
 
 ADB_TEST(bookmarks_keep_tabs_inside_the_path) {
     // Paths on the device can contain a tab; only the first tab splits.
     const std::vector<Bookmark> out = parseBookmarks("n\t/sdcard/a\tb\n");
     ADB_CHECK_EQ(out.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(out[0].path, std::string("/sdcard/a\tb"));
+    ADB_CHECK_EQ(ADB_AT(out, 0).path, std::string("/sdcard/a\tb"));
 }
 
 ADB_TEST(commands_round_trip) {
@@ -71,9 +71,9 @@ ADB_TEST(commands_round_trip) {
     const std::vector<CommandEntry> out = parseCommands(serializeCommands(in));
     ADB_CHECK_EQ(out.size(), in.size());
     for (std::size_t i = 0; i < in.size(); ++i) {
-        ADB_CHECK_EQ(out[i].name, in[i].name);
-        ADB_CHECK_EQ(out[i].shell, in[i].shell);
-        ADB_CHECK_EQ(out[i].command, in[i].command);
+        ADB_CHECK_EQ(ADB_AT(out, i).name, ADB_AT(in, i).name);
+        ADB_CHECK_EQ(ADB_AT(out, i).shell, ADB_AT(in, i).shell);
+        ADB_CHECK_EQ(ADB_AT(out, i).command, ADB_AT(in, i).command);
     }
 }
 
@@ -81,14 +81,14 @@ ADB_TEST(commands_shell_flag_defaults_to_host_when_not_shell) {
     // Only the literal "shell" means adb shell; anything else is a host command.
     const std::vector<CommandEntry> out = parseCommands("n\tcmd\techo hi\n");
     ADB_CHECK_EQ(out.size(), static_cast<std::size_t>(1));
-    ADB_CHECK(!out[0].shell);
-    ADB_CHECK_EQ(out[0].command, std::string("echo hi"));
+    ADB_CHECK(!ADB_AT(out, 0).shell);
+    ADB_CHECK_EQ(ADB_AT(out, 0).command, std::string("echo hi"));
 }
 
 ADB_TEST(commands_allow_pipes_and_tabs_in_the_command) {
     const std::vector<CommandEntry> out = parseCommands("n\tshell\tls | grep a\tb\n");
     ADB_CHECK_EQ(out.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(out[0].command, std::string("ls | grep a\tb"));
+    ADB_CHECK_EQ(ADB_AT(out, 0).command, std::string("ls | grep a\tb"));
 }
 
 ADB_TEST(commands_skip_malformed_lines) {
@@ -99,7 +99,7 @@ ADB_TEST(commands_skip_malformed_lines) {
         "name\tshell\t\n";             // empty command -> dropped
     const std::vector<CommandEntry> out = parseCommands(text);
     ADB_CHECK_EQ(out.size(), static_cast<std::size_t>(1));
-    ADB_CHECK_EQ(out[0].name, std::string("n"));
+    ADB_CHECK_EQ(ADB_AT(out, 0).name, std::string("n"));
 }
 
 ADB_TEST(last_paths_round_trip) {
