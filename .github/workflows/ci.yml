@@ -49,14 +49,17 @@ jobs:
         shell: msys2 {0}
         run: |
           cd build
-          ctest --output-on-failure
+          # 2>&1 so the harness's per-case progress (which it writes to stderr,
+          # unbuffered, precisely so it survives a crash) lands in the CI log.
+          ctest --output-on-failure 2>&1
 
-      # The tests also run directly so a failure shows the per-case output even
-      # when ctest reports it tersely.
-      - name: Show test detail on failure
-        if: failure()
+      # Runs the binary directly as well: a crash inside one case (e.g. a
+      # std::bad_alloc) can abort the process under ctest without printing the
+      # per-case detail, and this is the step that then shows which case it was.
+      - name: Run tests directly
+        if: always()
         shell: msys2 {0}
-        run: ./build/adbtools_tests.exe
+        run: ./build/adbtools_tests.exe 2>&1 || echo "direct run failed (see above)"
 
   # Keeps the "pure logic" half honest: core/ must stay free of GUI and app
   # state, which is what makes it testable at all. Runs on Linux on purpose:

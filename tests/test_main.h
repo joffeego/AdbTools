@@ -70,15 +70,20 @@ std::string describe(const std::vector<T>& value) {
 inline std::string describe(bool value) { return value ? "true" : "false"; }
 
 inline int runAll() {
+    // Progress goes to stderr, unbuffered. std::cout is buffered and its
+    // "last line before the crash" is exactly what gets lost when a case aborts
+    // the process (which is how a std::bad_alloc on CI gave no indication of
+    // which case it was). stderr is line-buffered/unbuffered enough to survive.
+    std::cerr << "Running " << registry().size() << " test cases" << std::endl;
     std::cout << "Running " << registry().size() << " test cases" << std::endl;
     for (const Case& c : registry()) {
         currentCase() = c.name;
-        // Flush before running: if a case crashes the process, the last printed
-        // name is the only clue to which one it was.
-        std::cout << "  ...  " << c.name << std::endl;
+        std::cerr << "  ...  " << c.name << std::endl;
         const int before = failureCount();
         c.fn();
-        std::cout << (failureCount() == before ? "  ok   " : "  FAIL ") << c.name << std::endl;
+        const bool ok = (failureCount() == before);
+        std::cerr << (ok ? "  ok   " : "  FAIL ") << c.name << std::endl;
+        std::cout << (ok ? "  ok   " : "  FAIL ") << c.name << std::endl;
     }
     std::cout << std::endl;
     if (failureCount() == 0) {
