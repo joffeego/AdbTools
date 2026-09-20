@@ -47,10 +47,14 @@ jobs:
 
       - name: Run core unit tests
         shell: msys2 {0}
+        env:
+          # Per-assertion breadcrumb (file:line). The harness writes it to
+          # stderr, flushed, so if a case aborts the process the last line names
+          # the exact assertion that was running - which is otherwise impossible
+          # to determine from a std::bad_alloc abort.
+          ADBTOOLS_TEST_TRACE: '1'
         run: |
           cd build
-          # 2>&1 so the harness's per-case progress (which it writes to stderr,
-          # unbuffered, precisely so it survives a crash) lands in the CI log.
           ctest --output-on-failure 2>&1
 
       # Runs the binary directly as well: a crash inside one case (e.g. a

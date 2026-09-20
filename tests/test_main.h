@@ -49,6 +49,25 @@ inline void reportFailure(const char* expr, const char* file, int line, const st
     if (!extra.empty()) std::cout << "       -> " << extra << "\n";
 }
 
+// Per-assertion breadcrumb, enabled with ADBTOOLS_TEST_TRACE=1.
+//
+// It exists because a heap-corruption crash in the suite could not be
+// reproduced locally at all (the same binary passed every run) while CI aborted
+// part-way through with std::bad_alloc. When a process dies from corruption, the
+// only reliable record of where it got to is a line written and flushed before
+// the memory is touched - so this is opt-in noise for exactly that situation.
+inline bool traceEnabled() {
+    static const bool enabled = (std::getenv("ADBTOOLS_TEST_TRACE") != nullptr);
+    return enabled;
+}
+
+inline void traceAssertion(const char* file, int line, const char* expr) {
+    if (!traceEnabled()) return;
+    std::cerr << "  trace " << file << ":" << line << "  " << expr << std::endl;
+}
+
+#define ADB_TRACE(expr) ::adb::test::traceAssertion(__FILE__, __LINE__, #expr)
+
 // Index an element of a container that may be a temporary, without ever reading
 // out of bounds.
 //
@@ -138,6 +157,7 @@ inline int runAll() {
 
 #define ADB_CHECK(expr)                                                       \
     do {                                                                      \
+        ::adb::test::traceAssertion(__FILE__, __LINE__, #expr);               \
         if (!(expr)) ::adb::test::reportFailure(#expr, __FILE__, __LINE__, ""); \
     } while (0)
 
@@ -154,6 +174,7 @@ inline int runAll() {
 
 #define ADB_CHECK_EQ(actual, expected)                                        \
     do {                                                                      \
+        ::adb::test::traceAssertion(__FILE__, __LINE__, #actual);             \
         const auto& adb_actual_ = (actual);                                   \
         const auto& adb_expected_ = (expected);                               \
         if (!(adb_actual_ == adb_expected_)) {                                \
