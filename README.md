@@ -57,6 +57,19 @@ AdbFileBrowser-windows-x64/
 
 ---
 
+## 关于数字签名（本软件未签名）
+
+**当前发布的版本没有数字签名**，因此：
+
+- Windows 可能显示「未知发布者」，SmartScreen 可能提示"已阻止"；
+- 个别杀毒软件可能误报（原因和解决办法见下方「杀毒软件报毒怎么办」）。
+
+这是**已知且预期**的情况，不是程序有问题。代码签名证书需要付费或有资格门槛（开源项目证书只能签发给法律实体），本项目目前不打算引入签名；如果你介意这一点，可以从源码自行编译（见下方「从源码编译」），或按下方说明把程序加入杀软白名单。
+
+**隐私政策**：本程序**不会**在未经用户明确要求的情况下向任何联网系统传输信息。所有网络访问都只在你主动操作时发生：检查/执行 adb、scrcpy、本软件的更新（访问 Google 官方仓库与 GitHub Releases），以及你自己触发的下载。第三方组件的隐私政策请参见各自项目主页（[scrcpy](https://github.com/Genymobile/scrcpy)、[Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools)）。
+
+---
+
 ## 从源码编译
 
 ### 依赖

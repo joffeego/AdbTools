@@ -31,6 +31,18 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
+; The installer can be Authenticode-signed after compilation (SignPath in CI,
+; see .github/workflows/release.yml). Signing is currently NOT enabled, so
+; released installers are unsigned.
+;
+; The uninstaller is deliberately NOT signed: Inno Setup can only embed a
+; signature into unins000.exe by running a local SignTool, or by embedding a
+; pre-signed uninst***.exe from SignedUninstallerDir - a cloud signing service
+; cannot do either during the build. Leaving SignedUninstaller at its default
+; (yes whenever a SignTool is set) would make iscc abort and ask for a manual
+; signature, so it is disabled explicitly. Consequence: unins000.exe stays
+; unsigned and shows "unknown publisher" when a user runs the uninstaller.
+SignedUninstaller=no
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"

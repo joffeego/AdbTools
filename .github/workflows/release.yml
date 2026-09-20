@@ -9,6 +9,34 @@ on:
 permissions:
   contents: write
 
+# ---------------------------------------------------------------------------
+# Code signing is OPTIONAL and off by default.
+#
+# The "Set up signing" step below enables it only when both repository secrets
+# exist, so this workflow builds and publishes completely unsigned releases
+# unless you deliberately configure signing:
+#
+#   Settings -> Secrets and variables -> Actions
+#     SIGNPATH_API_TOKEN        API token of a SignPath user with submitter rights
+#     SIGNPATH_ORGANIZATION_ID  SignPath organization id (GUID)
+#
+# Optional variables - only needed if you named things differently in SignPath:
+#   SIGNPATH_PROJECT_SLUG         (default: adbtools)
+#   SIGNPATH_SIGNING_POLICY_SLUG  (default: release-signing)
+#   SIGNPATH_ARTIFACT_CONFIG_SLUG (default: adbtools-release)
+#     (.signpath/artifact-configuration.xml is the source of truth for that
+#      configuration; paste it into SignPath whenever it changes)
+#
+# Why SignPath and what it buys: signing is what removes the Windows "unknown
+# publisher" / SmartScreen warning and starts building Defender reputation.
+# See the maintenance guide, section "杀毒软件误报".
+#
+# Signing uses SignPath's GitHub trusted build system connector; the Open
+# Source Code Signing edition requires origin verification, which means the
+# SignPath GitHub App must be installed on this repo and every job leading up
+# to a signing request must run on GitHub-hosted runners (satisfied below).
+# ---------------------------------------------------------------------------
+
 jobs:
   build-windows:
     name: Windows x64
@@ -16,6 +44,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up signing
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+        run: |
+          if ($env:SIGNPATH_API_TOKEN -and $env:SIGNPATH_ORGANIZATION_ID) {
+            "SIGNPATH_ENABLED=true" >> $env:GITHUB_ENV
+            Write-Host "SignPath credentials found - release artifacts will be Authenticode-signed."
+          } else {
+            "SIGNPATH_ENABLED=false" >> $env:GITHUB_ENV
+            Write-Host "::notice title=Unsigned release::SignPath secrets are not configured, so this release will ship unsigned. See .github/workflows/release.yml for setup."
+          }
 
       - name: Setup MSYS2 (MinGW-w64)
         uses: msys2/setup-msys2@v2
@@ -40,13 +82,53 @@ jobs:
         run: ./scripts/fetch_scrcpy.ps1 -Version latest -OutDir build/scrcpy
 
       - name: Set version
-        id: version
         shell: pwsh
         run: |
           $v = "${{ github.ref_name }}"
           if ($v -like 'v*') { $v = $v.Substring(1) }
           if (-not $v) { $v = "0.0.0" }
           "APP_VERSION=$v" >> $env:GITHUB_ENV
+
+      # ---------------------------------------------------------------------
+      # Optional signing pass 1: the main executable, signed BEFORE it is
+      # packaged. The portable ZIP then distributes this signed binary and iscc
+      # embeds it into the (separately signed) installer, so one signing request
+      # covers both packages.
+      # ---------------------------------------------------------------------
+      - name: Upload unsigned adb_browser.exe
+        id: upload-unsigned-exe
+        if: env.SIGNPATH_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: adb_browser-unsigned
+          path: build/adb_browser.exe
+          if-no-files-found: error
+
+      - name: Submit adb_browser.exe for signing
+        if: env.SIGNPATH_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: '${{ vars.SIGNPATH_PROJECT_SLUG || ''adbtools'' }}'
+          signing-policy-slug: '${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || ''release-signing'' }}'
+          artifact-configuration-slug: '${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG || ''adbtools-release'' }}'
+          github-artifact-id: '${{ steps.upload-unsigned-exe.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'build'
+          parameters: |
+            version: ${{ toJSON(env.APP_VERSION) }}
+            file-name: "adb_browser.exe"
+
+      - name: Verify the executable signature
+        if: env.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "build/adb_browser.exe"
+          "Status : $($sig.Status)"
+          "Signer : $($sig.SignerCertificate.Subject)"
+          "Issuer : $($sig.SignerCertificate.Issuer)"
+          if ($sig.Status -ne 'Valid') { throw "adb_browser.exe is not validly signed ($($sig.Status))" }
 
       - name: Install Inno Setup
         shell: pwsh
@@ -57,6 +139,47 @@ jobs:
         run: |
           set "PATH=%PATH%;C:\Program Files (x86)\Inno Setup 6"
           iscc installer.iss /DMyAppVersion=%APP_VERSION%
+
+      # ---------------------------------------------------------------------
+      # Optional signing pass 2: the installer package itself.
+      # ---------------------------------------------------------------------
+      - name: Upload unsigned installer
+        id: upload-unsigned-setup
+        if: env.SIGNPATH_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdbTools-Setup-unsigned
+          path: dist/AdbTools-Setup-*.exe
+          if-no-files-found: error
+
+      - name: Submit installer for signing
+        if: env.SIGNPATH_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        env:
+          SETUP_FILE_NAME: AdbTools-Setup-${{ env.APP_VERSION }}.exe
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: '${{ vars.SIGNPATH_PROJECT_SLUG || ''adbtools'' }}'
+          signing-policy-slug: '${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || ''release-signing'' }}'
+          artifact-configuration-slug: '${{ vars.SIGNPATH_ARTIFACT_CONFIG_SLUG || ''adbtools-release'' }}'
+          github-artifact-id: '${{ steps.upload-unsigned-setup.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'dist'
+          parameters: |
+            version: ${{ toJSON(env.APP_VERSION) }}
+            file-name: ${{ toJSON(env.SETUP_FILE_NAME) }}
+
+      - name: Verify the installer signature
+        if: env.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem "dist/AdbTools-Setup-*.exe" | Select-Object -First 1
+          $sig = Get-AuthenticodeSignature $setup.FullName
+          "File   : $($setup.Name)"
+          "Status : $($sig.Status)"
+          "Signer : $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "$($setup.Name) is not validly signed ($($sig.Status))" }
 
       - name: Assemble portable package
         shell: pwsh
@@ -70,9 +193,10 @@ jobs:
           Copy-Item "THIRD_PARTY_NOTICES.md"     $dist/ -Force
           Compress-Archive -Path "$dist/*" -DestinationPath "dist/AdbFileBrowser-windows-x64.zip" -Force
 
-      # Publish a "sha256sum"-style sidecar next to every release asset: the
-      # in-app updater (and the app's own self-update) verifies the download
-      # against "<asset>.sha256" before it replaces anything on disk.
+      # Checksums are generated last: attaching a signature changes the bytes of
+      # every executable, so anything computed before signing would be stale.
+      # The in-app updater verifies downloads against these (GitHub's asset
+      # "digest", or the "<asset>.sha256" sidecar published below).
       - name: Generate checksums
         shell: pwsh
         run: |
