@@ -116,7 +116,7 @@ AdbTools/
 ├── main.cpp                # 界面与交互（GUI 层）
 ├── cli/                    # 命令行模式（见 cli/README.md）
 ├── core/                   # 纯逻辑（无 UI 依赖，有单元测试）——见 core/README.md
-├── tests/                  # core 的单元测试（ctest，无第三方框架）
+├── tests/                  # core 的单元测试 + 真机端到端测试（ctest，无第三方框架）
 ├── regex_wrap.cpp          # std::regex 的异常隔离封装（logcat 过滤用）
 ├── adb_browser.rc          # Windows 资源脚本（版本信息 + 内嵌 manifest）
 ├── adb_browser.manifest    # 应用清单（asInvoker / longPathAware）
@@ -124,7 +124,8 @@ AdbTools/
 ├── LICENSE                 # Apache-2.0
 ├── THIRD_PARTY_NOTICES.md  # 第三方组件与许可
 ├── scripts/
-│   └── fetch_scrcpy.ps1    # 下载并解压 scrcpy（内含 adb）
+│   ├── fetch_scrcpy.ps1    # 下载并解压 scrcpy（内含 adb）
+│   └── fix_ps1_bom.py      # 修复 .ps1 的 UTF-8 BOM（PS 5.1 没 BOM 会按 ANSI 读）
 ├── screenshots/            # README 截图
 ├── .github/workflows/      # CI（构建 + 单元测试）与发版
 └── 3rd/EUI-NEO/            # 框架源码（bundled，含少量定制修改）
@@ -145,7 +146,9 @@ adb_browser.exe push ./a.apk /sdcard/ # 上传
 adb_browser.exe pull /sdcard/a.txt .  # 下载
 adb_browser.exe rm /sdcard/a.txt      # 删除
 adb_browser.exe shell getprop ro.product.model
+adb_browser.exe logcat -n 50              # 取最近 50 行日志
 adb_browser.exe screenshot shot.png   # 截屏（实测输出为标准 PNG）
+adb_browser.exe install app.apk       # 安装 APK（带 -r 覆盖）
 adb_browser.exe packages --json       # JSON 输出，便于脚本处理
 ```
 
@@ -171,9 +174,14 @@ adb_browser.exe packages --json       # JSON 输出，便于脚本处理
 
 ```bash
 cmake --build build --parallel
-cd build && ctest --output-on-failure
+cd build && ctest --output-on-failure        # 单元测试 + 真机端到端测试
+ctest -LE device                             # 只跑单元测试（不需要设备）
+ctest -L device                              # 只跑真机测试（没插设备会自动跳过）
 # 或直接看每个用例： ./adbtools_tests.exe
 ```
+
+真机测试（`tests/device_tests.ps1`，42 条断言）用 CLI 驱动一台真实手机，覆盖设备列表、列目录、
+push/pull/rm/mkdir、安装卸载、截屏、logcat 等；所有临时文件都在 `/sdcard/.__adbtools_e2e` 下并在结束时清理。
 
 新增代码时：纯逻辑放 `core/`（并补测试），界面相关放 `main.cpp`。判断标准很简单 —— **如果一个函数需要"应用上下文"才能工作，它还不适合进 core，先拆分**。
 
@@ -188,7 +196,11 @@ cd build && ctest --output-on-failure
 - **scrcpy**：从 GitHub Releases API 获取最新版本，并校验发布方公布的 SHA-256（更新前会先关闭投屏释放文件占用）。
 
 > 📌 **发版时同步版本号**：`kAppUpdateRepo` 已指向本仓库 `joffeego/AdbTools`，自更新地址无需再改；
-> 每次发版需要同步改三处版本号：`main.cpp` 的 `kAppVersion`、`adb_browser.rc` 的 `FILEVERSION/PRODUCTVERSION` 及版本字符串、`installer.iss` 的 `MyAppVersion`。提交后打 `vX.Y.Z` 标签推送即可自动发版（CI 会在 Release 里附带每个安装包的 `.sha256` 校验文件）。
+> 每次发版需要同步改 **5 个文件里的 6 处**版本号 —— 代码内唯一的来源是 `core/appinfo.h` 的 `kAppVersion`
+> （图形界面和命令行都引用它），另外四处是 `adb_browser.rc` 的 `FILEVERSION/PRODUCTVERSION` 与版本字符串、
+> `adb_browser.manifest` 的 `assemblyIdentity`、以及 `installer.iss` 的 `MyAppVersion`
+> （这些格式没法 include 头文件，只能各留一份拷贝）。提交后打 `vX.Y.Z` 标签推送即可自动发版
+> （CI 会在 Release 里附带每个安装包的 `.sha256` 校验文件）。
 >
 > 若网络无法访问 GitHub，对应行会显示「最新版本：未知」，不影响其它项。
 
