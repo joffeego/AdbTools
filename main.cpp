@@ -140,6 +140,53 @@ std::string formatSize(long long bytes) {
     return buf;
 }
 
+// Atomically replace `path` with `contents`.
+//
+// The app persists its settings, bookmarks, commands and recent paths next to
+// the executable. Writing those with a plain truncating ofstream means a crash
+// (or the power going out) mid-write leaves a half-written or empty file, and
+// the user silently loses their configuration. Instead we write a sibling
+// temporary file, flush it, then rename it over the target - a rename within
+// one directory is atomic on NTFS, so readers only ever observe the old file or
+// the complete new one.
+//
+// Returns false if the file could not be written; callers keep running with
+// in-memory state either way.
+bool writeFileAtomic(const std::string& path, const std::string& contents) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path target(path);
+    const fs::path parent = target.parent_path();
+    const fs::path temp = parent / (target.filename().string() + ".tmp");
+
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        out.flush();
+        if (!out) {  // disk full / write error: do not touch the real file
+            out.close();
+            fs::remove(temp, ec);
+            return false;
+        }
+    }
+
+    fs::rename(temp, target, ec);
+    if (ec) {
+        // Some filesystems refuse to replace an existing file; retry after
+        // removing it, but only now that the complete new file exists.
+        ec.clear();
+        fs::remove(target, ec);
+        ec.clear();
+        fs::rename(temp, target, ec);
+        if (ec) {
+            fs::remove(temp, ec);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool isMonthName(const std::string& s) {
     static const char* kMonths[] = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -339,7 +386,12 @@ ProcessResult runProcessWindows(const std::string& program,
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - start).count();
         if (timeoutMs > 0 && elapsed > timeoutMs) {
+            // TerminateProcess only *requests* termination, so wait for it to
+            // take effect before reading the exit code - otherwise
+            // GetExitCodeProcess below can still report STILL_ACTIVE (259),
+            // which callers would mistake for a real exit code.
             TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 5000);
             timedOut = true;
             break;
         }
@@ -780,7 +832,11 @@ std::atomic<long long> g_logcatSeq{0};
 std::atomic<bool> g_logcatStop{false};
 std::atomic<bool> g_logcatRunning{false};
 #ifdef _WIN32
-static HANDLE g_logcatProcess = nullptr;
+// Handle of the running `adb logcat` process. Written by the logcat reader
+// thread (#ifdef branch below) and read by stopLogcat() on the UI thread, so it
+// is atomic: a plain HANDLE read concurrently with a write is a data race, and
+// the reads here must never be able to take a stale value.
+static std::atomic<HANDLE> g_logcatProcess{nullptr};
 #endif
 
 components::theme::ThemeColorTokens themeTokens() {
@@ -861,6 +917,32 @@ void toast(const std::string& title, const std::string& message) {
     state.toastVisible = true;
 }
 
+// -----------------------------------------------------------------------------
+// Batch-operation summaries.
+//
+// Batch steps run one item at a time through the async queue. They used to give
+// up on the first failure: the items after it were silently skipped and the
+// toast named only one error, so the user could not tell what had actually
+// happened on the device. Now every item is attempted and the batch ends with a
+// single "succeeded N, failed M" report naming the first few failures.
+// -----------------------------------------------------------------------------
+std::string batchSummary(const std::string& verb, std::size_t ok, const std::vector<std::string>& failures) {
+    if (failures.empty()) {
+        return verb + " " + std::to_string(ok) + " 项，全部成功。";
+    }
+    std::string msg = verb + " " + std::to_string(ok) + " 项，失败 " +
+                      std::to_string(failures.size()) + " 项。\n失败项：";
+    const std::size_t shown = failures.size() < 3 ? failures.size() : 3;
+    for (std::size_t i = 0; i < shown; ++i) {
+        if (i > 0) msg += "、";
+        msg += "\"" + shorten(failures[i], 28) + "\"";
+    }
+    if (failures.size() > shown) {
+        msg += " 等 " + std::to_string(failures.size()) + " 项";
+    }
+    return msg;
+}
+
 std::vector<std::string> selectedNames() {
     std::vector<std::string> names;
     if (!state.selectedSet.empty()) {
@@ -894,22 +976,23 @@ std::string settingsFilePath() {
 }
 
 void saveSettings() {
-    std::ofstream out(settingsFilePath(), std::ios::trunc);
-    if (!out) return;
-    out << "fontFamily=" << settings.fontFamily << "\n";
-    out << "fontWeight=" << settings.fontWeight << "\n";
-    out << "uiScale=" << settings.uiScale << "\n";
-    out << "darkMode=" << (settings.darkMode ? 1 : 0) << "\n";
-    out << "fontScale=" << settings.fontSizeScale << "\n";
-    out << "accent=" << settings.accentR << "," << settings.accentG << "," << settings.accentB << "\n";
-    out << "sortColumn=" << state.sortColumn << "\n";
-    out << "sortAscending=" << (state.sortAscending ? 1 : 0) << "\n";
-    out << "showHidden=" << (state.showHidden ? 1 : 0) << "\n";
-    out << "selectedDevice=" << state.selectedDevice << "\n";
-    out << "mirrorW=" << settings.mirrorW << "\n";
-    out << "mirrorH=" << settings.mirrorH << "\n";
-    out << "windowW=" << settings.windowW << "\n";
-    out << "windowH=" << settings.windowH << "\n";
+    std::string text;
+    text += "fontFamily=" + settings.fontFamily + "\n";
+    text += "fontWeight=" + std::to_string(settings.fontWeight) + "\n";
+    text += "uiScale=" + std::to_string(settings.uiScale) + "\n";
+    text += "darkMode=" + std::string(settings.darkMode ? "1" : "0") + "\n";
+    text += "fontScale=" + std::to_string(settings.fontSizeScale) + "\n";
+    text += "accent=" + std::to_string(settings.accentR) + "," + std::to_string(settings.accentG) + "," +
+            std::to_string(settings.accentB) + "\n";
+    text += "sortColumn=" + std::to_string(state.sortColumn) + "\n";
+    text += "sortAscending=" + std::string(state.sortAscending ? "1" : "0") + "\n";
+    text += "showHidden=" + std::string(state.showHidden ? "1" : "0") + "\n";
+    text += "selectedDevice=" + state.selectedDevice + "\n";
+    text += "mirrorW=" + std::to_string(settings.mirrorW) + "\n";
+    text += "mirrorH=" + std::to_string(settings.mirrorH) + "\n";
+    text += "windowW=" + std::to_string(settings.windowW) + "\n";
+    text += "windowH=" + std::to_string(settings.windowH) + "\n";
+    writeFileAtomic(settingsFilePath(), text);
 }
 
 #ifdef _WIN32
@@ -1252,11 +1335,11 @@ std::string bookmarksFilePath() { return executableDir() + "\\adb_file_browser_b
 std::string commandsFilePath() { return executableDir() + "\\adb_file_browser_commands.txt"; }
 
 void saveBookmarks() {
-    std::ofstream out(bookmarksFilePath(), std::ios::trunc);
-    if (!out) return;
+    std::string text;
     for (const Bookmark& b : bookmarks) {
-        out << b.name << "\t" << b.path << "\n";
+        text += b.name + "\t" + b.path + "\n";
     }
+    writeFileAtomic(bookmarksFilePath(), text);
 }
 
 void loadBookmarks() {
@@ -1275,11 +1358,11 @@ void loadBookmarks() {
 }
 
 void saveCommands() {
-    std::ofstream out(commandsFilePath(), std::ios::trunc);
-    if (!out) return;
+    std::string text;
     for (const CommandEntry& c : commands) {
-        out << c.name << "\t" << (c.shell ? "shell" : "cmd") << "\t" << c.command << "\n";
+        text += c.name + "\t" + (c.shell ? "shell" : "cmd") + "\t" + c.command + "\n";
     }
+    writeFileAtomic(commandsFilePath(), text);
 }
 
 void loadCommands() {
@@ -1303,11 +1386,11 @@ void loadCommands() {
 std::string lastPathsFilePath() { return executableDir() + "\\adb_file_browser_lastpaths.txt"; }
 
 void saveLastPaths() {
-    std::ofstream out(lastPathsFilePath(), std::ios::trunc);
-    if (!out) return;
+    std::string text;
     for (const auto& kv : state.lastPaths) {
-        out << kv.first << "\t" << kv.second << "\n";
+        text += kv.first + "\t" + kv.second + "\n";
     }
+    writeFileAtomic(lastPathsFilePath(), text);
 }
 
 void loadLastPaths() {
@@ -1750,7 +1833,8 @@ void openDeviceMenu(float x, float y) {
     state.deviceMenuY = y;
 }
 
-void pullBatchStep(std::vector<std::string> names, std::size_t index);
+void pullBatchStep(std::vector<std::string> names, std::size_t index,
+                   std::size_t ok = 0, std::vector<std::string> failures = {});
 
 void doPull() {
     std::vector<std::string> names = selectedNames();
@@ -1760,12 +1844,14 @@ void doPull() {
     pullBatchStep(names, 0);
 }
 
-void pullBatchStep(std::vector<std::string> names, std::size_t index) {
+void pullBatchStep(std::vector<std::string> names, std::size_t index,
+                   std::size_t ok, std::vector<std::string> failures) {
     if (index >= names.size()) {
         state.busy = false;
         state.progress = 0.0f;
         state.progressLabel.clear();
-        toast("下载完成", "已保存到 " + state.downloadDir);
+        toast(failures.empty() ? "下载完成" : "下载完成（有失败）",
+              batchSummary("已下载到 " + state.downloadDir + "：", ok, failures));
         return;
     }
     const std::string adb = state.adbPath;
@@ -1786,15 +1872,9 @@ void pullBatchStep(std::vector<std::string> names, std::size_t index) {
             }
             return app::async::success();
         },
-        [names, index](const app::async::Result<void>& result) {
-            if (!result.ok) {
-                state.busy = false;
-                state.progress = 0.0f;
-                state.progressLabel.clear();
-                toast("下载失败", result.error);
-                return;
-            }
-            pullBatchStep(names, index + 1);
+        [names, index, ok, failures](const app::async::Result<void>& result) mutable {
+            if (!result.ok) failures.push_back(names[index]);
+            pullBatchStep(names, index + 1, result.ok ? ok + 1 : ok, failures);
         });
 }
 
@@ -1832,7 +1912,8 @@ void doPush() {
         });
 }
 
-void pushBatchStep(std::vector<std::string> files, std::size_t index);
+void pushBatchStep(std::vector<std::string> files, std::size_t index,
+                   std::size_t ok = 0, std::vector<std::string> failures = {});
 
 void pushFiles(const std::vector<std::string>& files) {
     if (files.empty() || state.selectedDevice.empty()) return;
@@ -1841,12 +1922,13 @@ void pushFiles(const std::vector<std::string>& files) {
     pushBatchStep(files, 0);
 }
 
-void pushBatchStep(std::vector<std::string> files, std::size_t index) {
+void pushBatchStep(std::vector<std::string> files, std::size_t index,
+                   std::size_t ok, std::vector<std::string> failures) {
     if (index >= files.size()) {
         state.busy = false;
         state.progress = 0.0f;
         state.progressLabel.clear();
-        toast("上传完成", "已上传 " + std::to_string(files.size()) + " 个文件");
+        toast(failures.empty() ? "上传完成" : "上传完成（有失败）", batchSummary("已上传", ok, failures));
         refreshListing(true);
         return;
     }
@@ -1865,19 +1947,14 @@ void pushBatchStep(std::vector<std::string> files, std::size_t index) {
             }
             return app::async::success();
         },
-        [files, index](const app::async::Result<void>& result) {
-            if (!result.ok) {
-                state.busy = false;
-                state.progress = 0.0f;
-                state.progressLabel.clear();
-                toast("上传失败", result.error);
-                return;
-            }
-            pushBatchStep(files, index + 1);
+        [files, index, ok, failures](const app::async::Result<void>& result) mutable {
+            if (!result.ok) failures.push_back(files[index]);
+            pushBatchStep(files, index + 1, result.ok ? ok + 1 : ok, failures);
         });
 }
 
-void deleteBatchStep(std::vector<std::string> names, std::size_t index);
+void deleteBatchStep(std::vector<std::string> names, std::size_t index,
+                     std::size_t ok = 0, std::vector<std::string> failures = {});
 void doDeleteConfirmed();
 
 // Generic confirm dialog helper: shows title/message with a primary button that
@@ -1912,12 +1989,13 @@ void doDeleteConfirmed() {
     deleteBatchStep(names, 0);
 }
 
-void deleteBatchStep(std::vector<std::string> names, std::size_t index) {
+void deleteBatchStep(std::vector<std::string> names, std::size_t index,
+                     std::size_t ok, std::vector<std::string> failures) {
     if (index >= names.size()) {
         state.busy = false;
         state.progress = 0.0f;
         state.progressLabel.clear();
-        toast("完成", "已删除 " + std::to_string(names.size()) + " 项");
+        toast(failures.empty() ? "删除完成" : "删除完成（有失败）", batchSummary("已删除", ok, failures));
         refreshListing(true);
         return;
     }
@@ -1936,16 +2014,9 @@ void deleteBatchStep(std::vector<std::string> names, std::size_t index) {
             }
             return app::async::success();
         },
-        [names, index](const app::async::Result<void>& result) {
-            if (!result.ok) {
-                state.busy = false;
-                state.progress = 0.0f;
-                state.progressLabel.clear();
-                toast("删除失败", result.error);
-                refreshListing(true);
-                return;
-            }
-            deleteBatchStep(names, index + 1);
+        [names, index, ok, failures](const app::async::Result<void>& result) mutable {
+            if (!result.ok) failures.push_back(names[index]);
+            deleteBatchStep(names, index + 1, result.ok ? ok + 1 : ok, failures);
         });
 }
 
@@ -2245,7 +2316,9 @@ void stopLogcat() {
     // Force the adb logcat process to exit so the reader thread unblocks. The
     // reader owns the process handle and closes it on exit, so don't close it
     // here (that would double-close a handle the reader is still using).
-    HANDLE proc = g_logcatProcess;
+    // A handle that the reader closed meanwhile simply makes TerminateProcess
+    // fail harmlessly.
+    HANDLE proc = g_logcatProcess.load();
     if (proc != nullptr) {
         TerminateProcess(proc, 0);
     }
@@ -2346,10 +2419,18 @@ void streamLogcatWorker(const std::string& adb, const std::string& serial) {
         if (!ReadFile(readPipe, buffer, toRead, &read, nullptr) || read == 0) break;
         drain(buffer, read);
     }
+    // Publish "no process" BEFORE closing the handle: once stopLogcat() on the
+    // UI thread can no longer observe this value, nobody else holds it and it
+    // is safe for the reader thread to close.
+    HANDLE expected = pi.hProcess;
+    g_logcatProcess.compare_exchange_strong(expected, nullptr);
+    // TerminateProcess is a request: wait for the process to actually be gone
+    // before closing the handle and reporting, so we never leave a half-killed
+    // adb behind.
     TerminateProcess(pi.hProcess, 0);
+    WaitForSingleObject(pi.hProcess, 5000);
     CloseHandle(pi.hProcess);
     CloseHandle(readPipe);
-    if (g_logcatProcess == pi.hProcess) g_logcatProcess = nullptr;
     g_logcatRunning = false;
     app::requestUpdate();
 }
@@ -3359,17 +3440,66 @@ app::async::Result<std::string> installAppUpdateWorker(const std::string& url, c
     }
 
     // Best-effort: also refresh assets/ and scrcpy/ if the package carries them.
+    //
+    // These used to be replaced by remove_all(dst) followed by copy(). If that
+    // copy failed halfway - disk full, antivirus locking a file, a locked
+    // scrcpy.exe - the app was left with an EMPTY assets/ or scrcpy/ directory,
+    // i.e. a freshly "updated" program with no fonts, no icon and no adb. Now
+    // the old directory is moved aside first and only deleted once the new one
+    // is fully in place; a failure rolls it back and is reported.
+    std::string subError;
     for (const char* sub : {"assets", "scrcpy"}) {
         const std::filesystem::path src = std::filesystem::path(srcDir) / sub;
         if (!std::filesystem::exists(src, ec)) continue;
+        ec.clear();
         const std::filesystem::path dst = std::filesystem::path(exeDir) / sub;
-        std::filesystem::remove_all(dst, ec);
+        const std::filesystem::path backup = std::filesystem::path(exeDir) / (std::string(sub) + ".old");
+
+        // Drop a leftover backup from an earlier update; ignore failures here,
+        // a locked scrcpy.exe must not prevent the update itself.
+        std::filesystem::remove_all(backup, ec);
         ec.clear();
-        std::filesystem::copy(src, dst, std::filesystem::copy_options::recursive, ec);
+
+        const bool hadExisting = std::filesystem::exists(dst, ec);
         ec.clear();
+        if (hadExisting) {
+            std::filesystem::rename(dst, backup, ec);
+            if (ec) {
+                subError = std::string("无法更新 ") + sub + " 目录：" + ec.message();
+                break;
+            }
+        }
+
+        std::filesystem::copy(src, dst,
+                              std::filesystem::copy_options::recursive |
+                                  std::filesystem::copy_options::overwrite_existing,
+                              ec);
+        if (ec) {
+            const std::string reason = ec.message();
+            ec.clear();
+            if (hadExisting) {
+                std::filesystem::remove_all(dst, ec);   // undo the partial copy
+                ec.clear();
+                std::filesystem::rename(backup, dst, ec);  // then restore originals
+                ec.clear();
+            }
+            subError = std::string("更新 ") + sub + " 目录失败（已保留原目录）：" + reason;
+            break;
+        }
+
+        if (hadExisting) {
+            std::filesystem::remove_all(backup, ec);
+            ec.clear();
+        }
     }
 
     cleanupDir(work);
+    if (!subError.empty()) {
+        // adb_browser.exe was already replaced, so say so explicitly: the app
+        // is updated, only the accompanying folders were left untouched.
+        return app::async::failure<std::string>(
+            "已更新到 " + version + "，但 " + subError + "。重启程序后新版本生效。");
+    }
     return app::async::success<std::string>("已更新到 " + version + "，重启程序后生效。");
 }
 #endif  // _WIN32
@@ -3655,7 +3785,15 @@ void checkForUpdates() {
             }
             g_update = result.value;
             if (g_update.adbUpdate || g_update.scrcpyUpdate || g_update.appUpdate) {
-                state.updateStatus = "发现新版本，点击下方按钮即可更新。";
+                // Distinguish "newer release exists but has no downloadable ZIP"
+                // from a normal update, so the status line does not promise an
+                // update the button cannot perform.
+                if (g_update.appUpdate && g_update.appUrl.empty()) {
+                    state.updateStatus = "有更新的版本 " + g_update.appLatest +
+                                         "，但该 Release 没有可用的下载包，请到 Releases 页面手动下载。";
+                } else {
+                    state.updateStatus = "发现新版本，点击下方按钮即可更新。";
+                }
             } else if (!g_update.adbLatest.empty() || !g_update.scrcpyLatest.empty() || !g_update.appLatest.empty()) {
                 state.updateStatus = "已是最新版本。";
             } else {
@@ -5642,7 +5780,11 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
 
     const bool adbHas = g_update.adbUpdate && !g_update.adbLatest.empty();
     const bool scHas = g_update.scrcpyUpdate && !g_update.scrcpyLatest.empty();
-    const bool appHas = g_update.appUpdate && !g_update.appLatest.empty();
+    // A newer release only counts as updatable when it actually carries the
+    // portable ZIP. A release with a tag but no matching asset (someone forgot
+    // to upload it, or only published the installer) used to leave this button
+    // enabled; clicking it failed with "未获取到本软件的下载地址".
+    const bool appHas = g_update.appUpdate && !g_update.appLatest.empty() && !g_update.appUrl.empty();
     const std::string adbBtn = g_update.adbCurrent.empty() && !g_update.adbLatest.empty()
                                    ? "安装 " + g_update.adbLatest
                                    : (adbHas ? "更新到 " + g_update.adbLatest
@@ -5652,7 +5794,11 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
                                   : (scHas ? "更新到 " + g_update.scrcpyLatest
                                            : (!g_update.scrcpyLatest.empty() ? "已是最新" : "无更新信息"));
     const std::string appBtn = appHas ? ("更新到 " + g_update.appLatest)
-                                      : (!g_update.appLatest.empty() ? "已是最新" : "无更新信息");
+                                      : (g_update.appLatest.empty()
+                                             ? "无更新信息"
+                                             : (g_update.appUrl.empty() && g_update.appUpdate
+                                                    ? "新版本缺少下载包"
+                                                    : "已是最新"));
     const bool busy = state.updateChecking || state.updateWorking;
 
     components::dialog(ui, "update.dialog")
