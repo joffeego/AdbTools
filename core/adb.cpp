@@ -107,6 +107,14 @@ std::string buildListCommand(const std::string& path) {
            "test -w " + quoted + " && echo 1 || echo 0; exit $__r";
 }
 
+std::vector<std::string> listArgs(const std::string& serial, const std::string& path) {
+    return {"-s", serial, "shell", buildListCommand(path)};
+}
+
+std::vector<std::string> thirdPartyPackagesArgs(const std::string& serial) {
+    return {"-s", serial, "shell", "pm", "list", "packages", "-3"};
+}
+
 ListingResult parseListingOutput(const std::string& output) {
     ListingResult result;
     const std::size_t marker = output.find(kWriteMarker);

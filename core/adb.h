@@ -66,6 +66,12 @@ std::vector<FsEntry> parseLsLa(const std::string& output);
 // preserved so a failure is still a failure.
 std::string buildListCommand(const std::string& path);
 
+// The same command as an argv for runProcess: `adb -s <serial> shell <cmd>`.
+std::vector<std::string> listArgs(const std::string& serial, const std::string& path);
+
+// `adb -s <serial> shell pm list packages -3` (third-party packages only).
+std::vector<std::string> thirdPartyPackagesArgs(const std::string& serial);
+
 // Marker emitted by buildListCommand between the listing and the writable flag.
 extern const char* const kWriteMarker;
 

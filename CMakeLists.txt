@@ -25,9 +25,11 @@ set(EUI_ENABLE_TRAY OFF CACHE BOOL "" FORCE)
 # -----------------------------------------------------------------------------
 set(ADBTOOLS_CORE_SOURCES
     core/adb.cpp
+    core/adbpath.cpp
     core/fileio.cpp
     core/package.cpp
     core/paths.cpp
+    core/process.cpp
     core/sha256.cpp
     core/store.cpp
     core/strings.cpp
@@ -52,8 +54,44 @@ else()
     set(ADB_BROWSER_RC "")
 endif()
 
-add_executable(adb_browser main.cpp regex_wrap.cpp ${ADBTOOLS_CORE_SOURCES} ${ADB_BROWSER_RC})
+# One executable, two modes: app_main.cpp routes to the CLI when arguments are
+# present and to the GUI otherwise. EUI_APP_RUNNER_LIBRARY makes the framework's
+# own main() in core/app/glfw_app_main.cpp compile out, so no vendored file needs
+# editing for this.
+add_executable(adb_browser
+    app_main.cpp
+    main.cpp
+    cli/cli.cpp
+    regex_wrap.cpp
+    ${ADBTOOLS_CORE_SOURCES}
+    ${ADB_BROWSER_RC}
+)
 eui_neo_configure_app(adb_browser)
+
+# The framework's app entry (core/app/glfw_app_main.cpp) ends with
+#
+#     #ifndef EUI_APP_RUNNER_LIBRARY
+#     int main() { return eui_app_run(); }
+#     #endif
+#
+# so defining the macro on THAT file compiles the framework's main() out and
+# leaves eui_app_run() available for app_main.cpp to call. Defining it on
+# app_main.cpp instead (or on the whole target) does nothing useful: the first
+# leaves two main()s, the second also removes eui_app_run().
+set(ADBTOOLS_FRAMEWORK_ENTRY "${CMAKE_CURRENT_SOURCE_DIR}/3rd/EUI-NEO/core/app/glfw_app_main.cpp")
+if(EXISTS "${ADBTOOLS_FRAMEWORK_ENTRY}")
+    set_source_files_properties("${ADBTOOLS_FRAMEWORK_ENTRY}" PROPERTIES
+        COMPILE_DEFINITIONS "EUI_APP_RUNNER_LIBRARY=1")
+else()
+    message(FATAL_ERROR
+        "The framework app entry point moved: ${ADBTOOLS_FRAMEWORK_ENTRY} not found. "
+        "app_main.cpp relies on defining EUI_APP_RUNNER_LIBRARY there to replace main().")
+endif()
+
+# cli/ is compiled like core/ (normal C++), not with the app template's
+# -fno-exceptions: it uses std::filesystem and std::string operations whose
+# failures are exceptions, and a CLI that terminate()s on a bad path is useless.
+set_source_files_properties(cli/cli.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions;-fno-rtti")
 
 # The app template compiles with -fno-exceptions -fno-rtti and -Os, which suits
 # the GUI but is deliberately NOT applied to the core or the tests: they are

@@ -17,9 +17,11 @@
 #include "eui_neo.h"
 
 #include "core/adb.h"
+#include "core/adbpath.h"
 #include "core/fileio.h"
 #include "core/package.h"
 #include "core/paths.h"
+#include "core/process.h"
 #include "core/sha256.h"
 #include "core/store.h"
 #include "core/strings.h"
@@ -132,183 +134,16 @@ float approxTextWidth(const std::string& s, float fontSize) {
     return width;
 }
 
-// =============================================================================
-// Subprocess execution (adb)
-// =============================================================================
-struct ProcessResult {
-    int exitCode = -1;
-    std::string out;
-    std::string err;
-};
-
+// Subprocess execution now lives in core/process.cpp so the GUI and the CLI
+// share one implementation (and one place to fix process-handling bugs).
+using adb::core::ProcessResult;
+using adb::core::runProcess;
 #ifdef _WIN32
-
-std::wstring toWide(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring w(static_cast<std::size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
-    return w;
-}
-
-std::string toUtf8(const std::wstring& w) {
-    if (w.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string s(static_cast<std::size_t>(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
-    return s;
-}
-
-// Quote a single argument for the Windows command line (CommandLineToArgvW rules).
-std::wstring quoteWinArg(const std::wstring& arg) {
-    if (arg.empty()) return L"\"\"";
-    bool needQuotes = false;
-    for (wchar_t c : arg) {
-        if (c == L' ' || c == L'\t' || c == L'"' || c == L'\n') { needQuotes = true; break; }
-    }
-    if (!needQuotes) return arg;
-    std::wstring out = L"\"";
-    int backslashes = 0;
-    for (wchar_t c : arg) {
-        if (c == L'\\') {
-            ++backslashes;
-            continue;
-        }
-        if (c == L'"') {
-            out.append(static_cast<std::size_t>(backslashes * 2 + 1), L'\\');
-            out.push_back(L'"');
-            backslashes = 0;
-        } else {
-            out.append(static_cast<std::size_t>(backslashes), L'\\');
-            out.push_back(c);
-            backslashes = 0;
-        }
-    }
-    out.append(static_cast<std::size_t>(backslashes * 2), L'\\');
-    out.push_back(L'"');
-    return out;
-}
-
-ProcessResult runProcessWindows(const std::string& program,
-                                const std::vector<std::string>& args,
-                                int timeoutMs) {
-    std::wstring cmd = quoteWinArg(toWide(program));
-    for (const std::string& a : args) {
-        cmd += L" ";
-        cmd += quoteWinArg(toWide(a));
-    }
-
-    HANDLE readPipe = nullptr;
-    HANDLE writePipe = nullptr;
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) {
-        return {-1, "", "CreatePipe failed"};
-    }
-    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    si.hStdOutput = writePipe;   // merge stderr into stdout to avoid deadlock
-    si.hStdError = writePipe;
-
-    PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
-    mutableCmd.push_back(L'\0');
-
-    BOOL created = CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE,
-                                  CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(writePipe);
-    if (!created) {
-        CloseHandle(readPipe);
-        return {-1, "", "CreateProcessW failed (" + std::to_string(GetLastError()) + ")"};
-    }
-    CloseHandle(pi.hThread);
-
-    std::string output;
-    char buffer[8192];
-    auto start = std::chrono::steady_clock::now();
-    bool timedOut = false;
-    for (;;) {
-        DWORD wait = WaitForSingleObject(pi.hProcess, 0);
-        bool exited = (wait == WAIT_OBJECT_0);
-        DWORD available = 0;
-        if (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
-            DWORD toRead = available > sizeof(buffer) ? sizeof(buffer) : available;
-            DWORD read = 0;
-            if (ReadFile(readPipe, buffer, toRead, &read, nullptr) && read > 0) {
-                output.append(buffer, read);
-            }
-            continue;
-        }
-        if (exited) break;
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - start).count();
-        if (timeoutMs > 0 && elapsed > timeoutMs) {
-            // TerminateProcess only *requests* termination, so wait for it to
-            // take effect before reading the exit code - otherwise
-            // GetExitCodeProcess below can still report STILL_ACTIVE (259),
-            // which callers would mistake for a real exit code.
-            TerminateProcess(pi.hProcess, 1);
-            WaitForSingleObject(pi.hProcess, 5000);
-            timedOut = true;
-            break;
-        }
-        Sleep(8);
-    }
-    // Drain whatever remains.
-    for (;;) {
-        DWORD available = 0;
-        if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) || available == 0) break;
-        DWORD toRead = available > sizeof(buffer) ? sizeof(buffer) : available;
-        DWORD read = 0;
-        if (!ReadFile(readPipe, buffer, toRead, &read, nullptr) || read == 0) break;
-        output.append(buffer, read);
-    }
-    DWORD code = 0;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(readPipe);
-    return {static_cast<int>(code), output, timedOut ? "timed out" : ""};
-}
-
-#else
-
-ProcessResult runProcessPosix(const std::string& program, const std::vector<std::string>& args) {
-    std::string cmd = core::shellQuote(program);
-    for (const std::string& a : args) {
-        cmd += " ";
-        cmd += core::shellQuote(a);
-    }
-    cmd += " 2>&1";
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return {-1, "", "popen failed"};
-    std::string output;
-    char buffer[4096];
-    std::size_t n = 0;
-    while ((n = std::fread(buffer, 1, sizeof(buffer), pipe)) > 0) {
-        output.append(buffer, n);
-    }
-    int rc = pclose(pipe);
-    int exitCode = (WIFEXITED(rc) != 0) ? WEXITSTATUS(rc) : -1;
-    return {exitCode, output, ""};
-}
-
+using adb::core::quoteWinArg;
+using adb::core::toUtf8;
+using adb::core::toWide;
 #endif
 
-ProcessResult runProcess(const std::string& program,
-                         const std::vector<std::string>& args,
-                         int timeoutMs = 60000) {
-#ifdef _WIN32
-    return runProcessWindows(program, args, timeoutMs);
-#else
-    (void)timeoutMs;
-    return runProcessPosix(program, args);
-#endif
-}
 
 // =============================================================================
 // Data model & adb output parsing - see core/adb.h
@@ -321,71 +156,18 @@ using adb::core::FsEntry;
 using adb::core::ListingResult;
 
 // =============================================================================
-// ADB discovery
+// ADB discovery - see core/adbpath.h
 // =============================================================================
+// findAdb() and defaultDownloadDir() moved to core/adbpath.cpp so the GUI and
+// the CLI resolve adb (and the download folder) identically. executableDir()
+// stays here because this file defines it below and needs it for the settings
+// paths; core has its own copy for the CLI.
+using adb::core::defaultDownloadDir;
+using adb::core::findAdb;
+
+// Defined further down (it needs GetModuleFileNameW and the settings paths use
+// it early), declared here so everything above the definition sees it.
 std::string executableDir();
-
-std::string findAdb() {
-    std::vector<std::string> candidates;
-
-    const char* sdkRoot = std::getenv("ANDROID_SDK_ROOT");
-    if (sdkRoot == nullptr || *sdkRoot == '\0') sdkRoot = std::getenv("ANDROID_HOME");
-    if (sdkRoot != nullptr && *sdkRoot != '\0') {
-        candidates.push_back(std::string(sdkRoot) + "\\platform-tools\\adb.exe");
-        candidates.push_back(std::string(sdkRoot) + "/platform-tools/adb.exe");
-        candidates.push_back(std::string(sdkRoot) + "/platform-tools/adb");
-    }
-
-    const char* localAppData = std::getenv("LOCALAPPDATA");
-    if (localAppData != nullptr && *localAppData != '\0') {
-        candidates.push_back(std::string(localAppData) + "\\Android\\Sdk\\platform-tools\\adb.exe");
-    }
-    const char* programFiles = std::getenv("ProgramFiles");
-    if (programFiles != nullptr && *programFiles != '\0') {
-        candidates.push_back(std::string(programFiles) + "\\Android\\Sdk\\platform-tools\\adb.exe");
-    }
-
-    const char* pathEnv = std::getenv("PATH");
-    if (pathEnv != nullptr && *pathEnv != '\0') {
-        std::string pathStr = pathEnv;
-        std::size_t start = 0;
-        while (start <= pathStr.size()) {
-            std::size_t end = pathStr.find(';', start);
-            std::string dir = pathStr.substr(start, end == std::string::npos ? std::string::npos : end - start);
-            start = (end == std::string::npos) ? pathStr.size() + 1 : end + 1;
-            if (!dir.empty()) {
-                candidates.push_back(dir + "\\adb.exe");
-                candidates.push_back(dir + "/adb");
-            }
-        }
-    }
-
-    // A copy shipped next to the executable (and in the bundled scrcpy folder),
-    // used as a fallback when no SDK / PATH adb is present.
-    {
-        const std::string dir = executableDir();
-        candidates.push_back(dir + "\\adb.exe");
-        candidates.push_back(dir + "\\scrcpy\\adb.exe");
-        candidates.push_back(dir + "/adb");
-        candidates.push_back(dir + "/scrcpy/adb");
-    }
-
-    for (const std::string& candidate : candidates) {
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec) && !ec) return candidate;
-    }
-    return "";
-}
-
-// Kept here rather than in core/: it reads the process environment
-// (USERPROFILE / HOME) instead of doing pure computation.
-std::string defaultDownloadDir() {
-    const char* profile = std::getenv("USERPROFILE");
-    if (profile != nullptr && *profile != '\0') return std::string(profile) + "\\Downloads";
-    const char* home = std::getenv("HOME");
-    if (home != nullptr && *home != '\0') return std::string(home) + "/Downloads";
-    return ".";
-}
 
 
 // =============================================================================
@@ -772,7 +554,7 @@ void saveSettings() {
 static std::vector<std::string> g_fontNames;
 
 int CALLBACK enumFontFamiliesProc(const LOGFONTW* logFont, const TEXTMETRICW*, DWORD, LPARAM) {
-    std::string name = toUtf8(std::wstring(logFont->lfFaceName));
+    std::string name = core::toUtf8(std::wstring(logFont->lfFaceName));
     if (name.empty() || name[0] == '@') return 1;
     if (std::find(g_fontNames.begin(), g_fontNames.end(), name) == g_fontNames.end()) {
         g_fontNames.push_back(name);
@@ -815,8 +597,8 @@ std::string resolveFontFileForFamily(const std::string& family, int weight) {
             if (result != ERROR_SUCCESS) break;
             ++index;
 
-            const std::string name = core::lower(toUtf8(valueName));
-            const std::string data = toUtf8(valueData);
+            const std::string name = core::lower(core::toUtf8(valueName));
+            const std::string data = core::toUtf8(valueData);
             const std::size_t paren = name.find(" (");
             const std::string display = paren == std::string::npos ? name : name.substr(0, paren);
 
@@ -2070,7 +1852,7 @@ void streamLogcatWorker(const std::string& adb, const std::string& serial) {
     // Clear the device log buffer so the stream starts fresh (no old history).
     runProcess(adb, core::logcatClearArgs(serial), 15000);
 
-    const std::wstring cmd = quoteWinArg(toWide(adb)) + L" -s " + quoteWinArg(toWide(serial)) + L" logcat";
+    const std::wstring cmd = core::quoteWinArg(core::toWide(adb)) + L" -s " + core::quoteWinArg(core::toWide(serial)) + L" logcat";
     HANDLE readPipe = nullptr;
     HANDLE writePipe = nullptr;
     SECURITY_ATTRIBUTES sa{};
@@ -2211,7 +1993,7 @@ std::string executableDir() {
     const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
     if (n > 0 && n < MAX_PATH) {
         std::error_code ec;
-        std::filesystem::path p(toUtf8(std::wstring(buf, static_cast<std::size_t>(n))));
+        std::filesystem::path p(core::toUtf8(std::wstring(buf, static_cast<std::size_t>(n))));
         return p.parent_path().string();
     }
 #endif
@@ -2503,7 +2285,7 @@ void openMirror() {
     // Launch scrcpy off-screen: it briefly shows its own window before being
     // embedded into the mirror window, which otherwise flashes in the middle
     // of the screen. --window-x/y place it far outside any visible area.
-    std::wstring cmd = quoteWinArg(toWide(scrcpy)) + L" -s " + quoteWinArg(toWide(serial)) +
+    std::wstring cmd = core::quoteWinArg(core::toWide(scrcpy)) + L" -s " + core::quoteWinArg(core::toWide(serial)) +
                        L" --window-title=adb_browser_scrcpy --window-borderless --stay-awake"
                        L" --window-x=-32000 --window-y=-32000";
     STARTUPINFOW si{};
@@ -2646,7 +2428,7 @@ struct WinHttpRequest {
 };
 
 bool openWinHttpRequest(const std::string& url, WinHttpRequest& wr, std::string& err) {
-    std::wstring current = toWide(url);
+    std::wstring current = core::toWide(url);
     for (int hop = 0; hop < 8; ++hop) {
         URL_COMPONENTS uc{};
         uc.dwStructSize = sizeof(uc);
@@ -2820,14 +2602,14 @@ app::async::Result<std::string> installScrcpyWorker(const std::string& url, cons
     std::string err;
 
     g_dlStage = 1;
-    if (!downloadFileWithFallback(url, toWide(zip), err)) {
+    if (!downloadFileWithFallback(url, core::toWide(zip), err)) {
         cleanupDir(work);
         return app::async::failure<std::string>("下载失败：" + err);
     }
     // Downloads can travel via a third-party GitHub mirror, so verify the
     // archive against the checksum published in the release before unpacking.
     if (!expectedSha256.empty()) {
-        const std::string actual = core::sha256FileHex(toWide(zip), err);
+        const std::string actual = core::sha256FileHex(core::toWide(zip), err);
         if (actual.empty()) {
             cleanupDir(work);
             return app::async::failure<std::string>("校验失败：" + err);
@@ -2872,10 +2654,10 @@ app::async::Result<std::string> installAdbWorker(const std::string& url, const s
     std::string err;
 
     g_dlStage = 1;
-    if (!downloadFile(url, toWide(zip), err)) {
+    if (!downloadFile(url, core::toWide(zip), err)) {
         // Fallback to the always-current "latest" URL if the versioned one fails.
         const std::string fallback = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip";
-        if (!downloadFile(fallback, toWide(zip), err)) {
+        if (!downloadFile(fallback, core::toWide(zip), err)) {
             cleanupDir(work);
             return app::async::failure<std::string>("下载失败：" + err);
         }
@@ -2886,7 +2668,7 @@ app::async::Result<std::string> installAdbWorker(const std::string& url, const s
     std::string adbVerifyWarning;
     if (!expectedSha1.empty()) {
         std::string hashErr;
-        const std::string actual = core::sha1FileHex(toWide(zip), hashErr);
+        const std::string actual = core::sha1FileHex(core::toWide(zip), hashErr);
         if (!actual.empty() && core::lower(actual) != core::lower(expectedSha1)) {
             adbVerifyWarning = "（注意：下载包校验值与官方公布的不一致，可能不是官方文件）";
         }
@@ -2928,14 +2710,14 @@ app::async::Result<std::string> installAppUpdateWorker(const std::string& url, c
     std::string err;
 
     g_dlStage = 1;
-    if (!downloadFileWithFallback(url, toWide(zip), err)) {
+    if (!downloadFileWithFallback(url, core::toWide(zip), err)) {
         cleanupDir(work);
         return app::async::failure<std::string>("下载失败：" + err);
     }
     // Verify the archive before anything is unpacked or executed. The digest
     // comes from the GitHub release metadata (or its .sha256 sidecar).
     if (!expectedSha256.empty()) {
-        const std::string actual = core::sha256FileHex(toWide(zip), err);
+        const std::string actual = core::sha256FileHex(core::toWide(zip), err);
         if (actual.empty()) {
             cleanupDir(work);
             return app::async::failure<std::string>("校验失败：" + err);

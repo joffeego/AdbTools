@@ -44,8 +44,27 @@ file-system helpers, all inside one anonymous namespace. Two consequences:
 | `package.h/.cpp` | GitHub release JSON and Google repository XML parsers |
 | `sha256.h/.cpp` | sha256sum-sidecar parsing, file hashing (CNG) |
 | `fileio.h/.cpp` | `writeFileAtomic` |
-| `adb.h/.cpp` | device/listing model, `adb` output parsers, every adb command line the app builds |
+| `adb.h/.cpp` | device/listing model, `adb` output parsers, every adb command line |
 | `store.h/.cpp` | on-disk text formats: settings, bookmarks, quick commands, recent paths |
+| `process.h/.cpp` | `runProcess` — the one place a child process is started (GUI + CLI) |
+| `adbpath.h/.cpp` | locating this executable and the adb it should drive |
+| `appinfo.h` | the version constant, so GUI and CLI cannot report different ones |
+
+## Two categories, on purpose
+
+Most of this directory is **pure logic with unit tests**. Two files are not, and
+they are listed here so the exception does not get "fixed" by mistake:
+
+- `process.h/.cpp` spawns processes. It has no unit tests; it is exercised by
+  the CLI against a real device. It lives here (rather than in the GUI layer)
+  because the GUI and the CLI must share exactly one implementation — this is
+  where the process-handling bugs were, and two copies would mean fixing each
+  one twice.
+- `adbpath.h/.cpp` reads the environment and the filesystem to find adb. Same
+  reasoning: the CLI has to resolve adb identically to the GUI.
+
+Both compile without the UI framework, which is what the CI `core-purity` job
+enforces.
 
 ## Tests
 

@@ -112,7 +112,9 @@ cmake --build build --parallel
 
 ```
 AdbTools/
+├── app_main.cpp            # 入口：有参数走命令行，无参数开图形界面
 ├── main.cpp                # 界面与交互（GUI 层）
+├── cli/                    # 命令行模式（见 cli/README.md）
 ├── core/                   # 纯逻辑（无 UI 依赖，有单元测试）——见 core/README.md
 ├── tests/                  # core 的单元测试（ctest，无第三方框架）
 ├── regex_wrap.cpp          # std::regex 的异常隔离封装（logcat 过滤用）
@@ -128,11 +130,39 @@ AdbTools/
 └── 3rd/EUI-NEO/            # 框架源码（bundled，含少量定制修改）
 ```
 
+---
+
+## 命令行模式
+
+**同一个 exe，两种模式**：不带参数开图形界面，带参数则执行命令后退出。
+
+```bash
+adb_browser.exe                       # 图形界面
+adb_browser.exe help                  # 命令行帮助
+adb_browser.exe devices               # 列出设备
+adb_browser.exe list /sdcard/Download # 列目录（含可写标志）
+adb_browser.exe push ./a.apk /sdcard/ # 上传
+adb_browser.exe pull /sdcard/a.txt .  # 下载
+adb_browser.exe rm /sdcard/a.txt      # 删除
+adb_browser.exe shell getprop ro.product.model
+adb_browser.exe screenshot shot.png   # 截屏（实测输出为标准 PNG）
+adb_browser.exe packages --json       # JSON 输出，便于脚本处理
+```
+
+- 退出码：`0` 成功 / `1` 操作失败 / `2` 用法错误
+- 多设备时用 `--serial <序列号>` 指定
+- 批量命令（push / pull / rm）会**尝试全部参数**并汇总 `已完成 N，失败 M` —— 与图形界面的批量操作同一条规则
+- 图形界面与命令行共用 `core/` 的全部逻辑，不存在两份实现
+
+> Windows 上程序是 GUI 子系统（没有自己的控制台），命令行模式会挂到调用者的控制台上；如果输出已被重定向（管道/文件），则**不会**改动它，避免把输出从读取方抢走。
+
+---
+
 ### 架构：`main.cpp` 与 `core/`
 
-**`core/` 里只放纯逻辑**：没有 UI、没有全局状态、没有平台头文件。这条规则由 CI 强制检查（`core-purity` job），不是靠自觉。
+**`core/` 里放纯逻辑**：没有 UI、没有全局状态、没有平台头文件（`process`/`adbpath` 两个例外在 `core/README.md` 里说明了原因）。这条规则由 CI 强制检查（`core-purity` job），不是靠自觉。
 
-这样做有两个直接好处：
+这样做有三个直接好处：
 
 1. **能写单元测试** —— 版本比较、更新包的 JSON/XML 解析、sha256 校验文件解析、原子写文件等，全部可以脱离界面验证；
 2. **能查出真 bug** —— 补测试的过程里立刻暴露了 3 个问题：`parseSize()` 会接受负数、`adbShortVersion()` 大小写敏感导致漏读真实 adb 输出、以及更新 sidecar 回退路径以前从未被验证过。
