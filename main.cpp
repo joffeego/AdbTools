@@ -18,6 +18,7 @@
 
 #include "core/adb.h"
 #include "core/adbpath.h"
+#include "core/appinfo.h"
 #include "core/batch.h"
 #include "core/fileio.h"
 #include "core/package.h"
@@ -106,9 +107,11 @@ constexpr float kTitleBarHeight = 36.0f;
 constexpr float kMirrorWindowWidth = 320.0f;
 constexpr float kMirrorWindowHeight = 640.0f;
 
-// Application version and the GitHub repo used for the app's own update check.
-constexpr const char* kAppVersion = "0.9.8";
-constexpr const char* kAppUpdateRepo = "joffeego/AdbTools";
+// The version and update repository live in core/appinfo.h: the CLI prints the
+// same version, and two copies would eventually disagree about which release is
+// installed.
+using adb::core::kAppUpdateRepo;
+using adb::core::kAppVersion;
 
 constexpr float kScrollbarWidth = 10.0f;
 constexpr float kRowHeight = 36.0f;
