@@ -1,0 +1,113 @@
+// Minimal test harness.
+//
+// The project has no third-party dependency in its build, so rather than pull in
+// a framework this is ~60 lines that register test functions and report
+// failures with the expression, file and line. Enough for pure-logic tests and
+// it keeps `cmake --build` dependency-free.
+#pragma once
+
+#include <functional>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace adb::test {
+
+struct Case {
+    const char* name;
+    void (*fn)();
+};
+
+inline std::vector<Case>& registry() {
+    static std::vector<Case> cases;
+    return cases;
+}
+
+inline int& failureCount() {
+    static int failures = 0;
+    return failures;
+}
+
+inline const char*& currentCase() {
+    static const char* name = "";
+    return name;
+}
+
+struct Registrar {
+    Registrar(const char* name, void (*fn)()) { registry().push_back({name, fn}); }
+};
+
+// Report a failure with the failing expression and its location.
+inline void reportFailure(const char* expr, const char* file, int line, const std::string& extra) {
+    ++failureCount();
+    std::cout << "  FAIL [" << currentCase() << "] " << file << ":" << line << "\n"
+              << "       " << expr << "\n";
+    if (!extra.empty()) std::cout << "       -> " << extra << "\n";
+}
+
+template <typename T>
+std::string describe(const T& value) {
+    std::ostringstream out;
+    out << value;
+    return out.str();
+}
+
+inline std::string describe(const std::string& value) { return "\"" + value + "\""; }
+
+template <typename T>
+std::string describe(const std::vector<T>& value) {
+    std::ostringstream out;
+    out << "[";
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (i) out << ", ";
+        out << value[i];
+    }
+    out << "]";
+    return out.str();
+}
+
+inline std::string describe(bool value) { return value ? "true" : "false"; }
+
+inline int runAll() {
+    std::cout << "Running " << registry().size() << " test cases" << std::endl;
+    for (const Case& c : registry()) {
+        currentCase() = c.name;
+        // Flush before running: if a case crashes the process, the last printed
+        // name is the only clue to which one it was.
+        std::cout << "  ...  " << c.name << std::endl;
+        const int before = failureCount();
+        c.fn();
+        std::cout << (failureCount() == before ? "  ok   " : "  FAIL ") << c.name << std::endl;
+    }
+    std::cout << std::endl;
+    if (failureCount() == 0) {
+        std::cout << "All tests passed (" << registry().size() << " cases)" << std::endl;
+        return 0;
+    }
+    std::cout << failureCount() << " assertion(s) failed" << std::endl;
+    return 1;
+}
+
+}  // namespace adb::test
+
+#define ADB_TEST(name)                                                        \
+    static void name();                                                       \
+    static ::adb::test::Registrar adb_test_registrar_##name(#name, &name);     \
+    static void name()
+
+#define ADB_CHECK(expr)                                                       \
+    do {                                                                      \
+        if (!(expr)) ::adb::test::reportFailure(#expr, __FILE__, __LINE__, ""); \
+    } while (0)
+
+#define ADB_CHECK_EQ(actual, expected)                                        \
+    do {                                                                      \
+        const auto& adb_actual_ = (actual);                                   \
+        const auto& adb_expected_ = (expected);                               \
+        if (!(adb_actual_ == adb_expected_)) {                                \
+            ::adb::test::reportFailure(#actual " == " #expected, __FILE__, __LINE__, \
+                                       ::adb::test::describe(adb_actual_) + " != " + \
+                                           ::adb::test::describe(adb_expected_));    \
+        }                                                                     \
+    } while (0)

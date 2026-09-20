@@ -16,6 +16,14 @@
 
 #include "eui_neo.h"
 
+#include "core/fileio.h"
+#include "core/package.h"
+#include "core/paths.h"
+#include "core/sha256.h"
+#include "core/strings.h"
+#include "core/version.h"
+
+
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -59,6 +67,13 @@ extern "C" void adbRegexFree(void* handle);
 namespace app {
 namespace {
 
+// The app's pure logic lives in adb::core (see core/*.h) so it can be unit
+// tested without the GUI. This alias keeps the call sites readable and makes it
+// obvious which helpers are now part of that separately testable module.
+// It is declared inside `namespace app` on purpose: a namespace alias declared
+// at global scope is looked up from here as app::<target>, which does not exist.
+namespace core = ::adb::core;
+
 // =============================================================================
 // Colors (dark theme)
 // =============================================================================
@@ -93,161 +108,6 @@ constexpr const char* kAppUpdateRepo = "joffeego/AdbTools";
 constexpr float kScrollbarWidth = 10.0f;
 constexpr float kRowHeight = 36.0f;
 
-// =============================================================================
-// Small utilities
-// =============================================================================
-std::string trim(const std::string& s) {
-    std::size_t a = 0;
-    std::size_t b = s.size();
-    while (a < b && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
-    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
-    return s.substr(a, b - a);
-}
-
-std::vector<std::string> splitWs(const std::string& s) {
-    std::vector<std::string> out;
-    std::istringstream in(s);
-    std::string token;
-    while (in >> token) out.push_back(token);
-    return out;
-}
-
-std::string lower(std::string s) {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
-
-std::string shorten(const std::string& s, int limit) {
-    if (limit < 4 || static_cast<int>(s.size()) <= limit) return s;
-    return s.substr(0, static_cast<std::size_t>(limit - 3)) + "...";
-}
-
-std::string formatSize(long long bytes) {
-    if (bytes < 0) return "";
-    static const char* kUnits[] = {"B", "KB", "MB", "GB", "TB"};
-    double value = static_cast<double>(bytes);
-    int unit = 0;
-    while (value >= 1024.0 && unit < 4) {
-        value /= 1024.0;
-        ++unit;
-    }
-    char buf[64]{};
-    if (unit == 0) {
-        std::snprintf(buf, sizeof(buf), "%lld B", bytes);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%.1f %s", value, kUnits[unit]);
-    }
-    return buf;
-}
-
-// Atomically replace `path` with `contents`.
-//
-// The app persists its settings, bookmarks, commands and recent paths next to
-// the executable. Writing those with a plain truncating ofstream means a crash
-// (or the power going out) mid-write leaves a half-written or empty file, and
-// the user silently loses their configuration. Instead we write a sibling
-// temporary file, flush it, then rename it over the target - a rename within
-// one directory is atomic on NTFS, so readers only ever observe the old file or
-// the complete new one.
-//
-// Returns false if the file could not be written; callers keep running with
-// in-memory state either way.
-bool writeFileAtomic(const std::string& path, const std::string& contents) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    const fs::path target(path);
-    const fs::path parent = target.parent_path();
-    const fs::path temp = parent / (target.filename().string() + ".tmp");
-
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-        out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        out.flush();
-        if (!out) {  // disk full / write error: do not touch the real file
-            out.close();
-            fs::remove(temp, ec);
-            return false;
-        }
-    }
-
-    fs::rename(temp, target, ec);
-    if (ec) {
-        // Some filesystems refuse to replace an existing file; retry after
-        // removing it, but only now that the complete new file exists.
-        ec.clear();
-        fs::remove(target, ec);
-        ec.clear();
-        fs::rename(temp, target, ec);
-        if (ec) {
-            fs::remove(temp, ec);
-            return false;
-        }
-    }
-    return true;
-}
-
-bool isMonthName(const std::string& s) {
-    static const char* kMonths[] = {
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    if (s.size() != 3) return false;
-    for (const char* m : kMonths) if (s == m) return true;
-    return false;
-}
-
-long long parseSize(const std::string& s) {
-    long long value = 0;
-    const char* begin = s.c_str();
-    const char* end = begin + s.size();
-    const std::from_chars_result result = std::from_chars(begin, end, value);
-    if (result.ec != std::errc() || result.ptr != end) return 0;
-    return value;
-}
-
-// Quote a path for the device-side POSIX shell (adb shell ...).
-// Wrapping in single quotes makes everything except a single quote literal.
-std::string shellQuote(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') out += "'\\''";
-        else out += c;
-    }
-    out += "'";
-    return out;
-}
-
-std::string joinPath(const std::string& base, const std::string& name) {
-    if (base.empty() || base == "/") return "/" + name;
-    if (base.back() == '/') return base + name;
-    return base + "/" + name;
-}
-
-std::string parentPath(const std::string& p) {
-    if (p.empty() || p == "/") return "/";
-    std::string s = p;
-    while (s.size() > 1 && s.back() == '/') s.pop_back();
-    std::size_t pos = s.rfind('/');
-    if (pos == std::string::npos) return "/";
-    if (pos == 0) return "/";
-    return s.substr(0, pos);
-}
-
-std::vector<std::string> splitPath(const std::string& p) {
-    std::vector<std::string> parts;
-    if (p.empty() || p == "/") return parts;
-    std::size_t start = (p[0] == '/') ? 1 : 0;
-    std::string current;
-    for (std::size_t i = start; i <= p.size(); ++i) {
-        if (i == p.size() || p[i] == '/') {
-            if (!current.empty()) parts.push_back(current);
-            current.clear();
-        } else {
-            current += p[i];
-        }
-    }
-    return parts;
-}
 
 // Rough visual width estimate for laying out breadcrumb segments (ASCII vs CJK).
 float approxTextWidth(const std::string& s, float fontSize) {
@@ -416,10 +276,10 @@ ProcessResult runProcessWindows(const std::string& program,
 #else
 
 ProcessResult runProcessPosix(const std::string& program, const std::vector<std::string>& args) {
-    std::string cmd = shellQuote(program);
+    std::string cmd = core::shellQuote(program);
     for (const std::string& a : args) {
         cmd += " ";
-        cmd += shellQuote(a);
+        cmd += core::shellQuote(a);
     }
     cmd += " 2>&1";
     FILE* pipe = popen(cmd.c_str(), "r");
@@ -546,12 +406,12 @@ std::vector<Device> parseDevices(const std::string& output) {
     std::string line;
     bool first = true;
     while (std::getline(in, line)) {
-        line = trim(line);
+        line = core::trim(line);
         if (line.empty()) continue;
         if (line.find("daemon") != std::string::npos) continue;
         if (first && line.rfind("List of devices", 0) == 0) { first = false; continue; }
         first = false;
-        std::vector<std::string> tokens = splitWs(line);
+        std::vector<std::string> tokens = core::splitWs(line);
         if (tokens.empty() || tokens[0].empty()) continue;
         Device d;
         d.serial = tokens[0];
@@ -567,11 +427,11 @@ std::vector<FsEntry> parseLsLa(const std::string& output) {
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        std::string trimmed = trim(line);
+        std::string trimmed = core::trim(line);
         if (trimmed.empty()) continue;
         if (trimmed.rfind("total ", 0) == 0) continue;
 
-        std::vector<std::string> tokens = splitWs(trimmed);
+        std::vector<std::string> tokens = core::splitWs(trimmed);
         if (tokens.size() < 6) continue;
 
         FsEntry e;
@@ -582,13 +442,13 @@ std::vector<FsEntry> parseLsLa(const std::string& output) {
             e.isLink = (c == 'l');
             e.isOther = !(c == '-' || c == 'd' || c == 'l');
         }
-        e.size = parseSize(tokens[4]);
+        e.size = core::parseSize(tokens[4]);
 
         // The name starts after the date columns. `ls -l` shows either
         // "Mon DD HH:MM" / "Mon DD YYYY" (8 metadata fields) or an ISO date
         // "YYYY-MM-DD HH:MM" (7 metadata fields).
         int nameStart = 8;
-        if (tokens.size() >= 7 && isMonthName(tokens[5])) {
+        if (tokens.size() >= 7 && core::isMonthName(tokens[5])) {
             nameStart = 8;
         } else {
             nameStart = 7;
@@ -877,15 +737,15 @@ void sortEntries(std::vector<FsEntry>& entries) {
         if (a.isDir != b.isDir) return a.isDir;  // directories first
         int cmp = 0;
         if (a.isDir) {
-            cmp = lower(a.name).compare(lower(b.name));
+            cmp = core::lower(a.name).compare(core::lower(b.name));
         } else if (col == 1) {  // size
             if (a.size != b.size) cmp = (a.size < b.size) ? -1 : 1;
-            else cmp = lower(a.name).compare(lower(b.name));
+            else cmp = core::lower(a.name).compare(core::lower(b.name));
         } else if (col == 2) {  // date
             cmp = a.date.compare(b.date);
-            if (cmp == 0) cmp = lower(a.name).compare(lower(b.name));
+            if (cmp == 0) cmp = core::lower(a.name).compare(core::lower(b.name));
         } else {  // name
-            cmp = lower(a.name).compare(lower(b.name));
+            cmp = core::lower(a.name).compare(core::lower(b.name));
         }
         return asc ? (cmp < 0) : (cmp > 0);
     });
@@ -896,10 +756,10 @@ void applyFileFilter() {
         state.displayEntries = state.entries;
         return;
     }
-    const std::string needle = lower(state.fileFilter);
+    const std::string needle = core::lower(state.fileFilter);
     state.displayEntries.clear();
     for (const FsEntry& e : state.entries) {
-        if (lower(e.name).find(needle) != std::string::npos) {
+        if (core::lower(e.name).find(needle) != std::string::npos) {
             state.displayEntries.push_back(e);
         }
     }
@@ -935,7 +795,7 @@ std::string batchSummary(const std::string& verb, std::size_t ok, const std::vec
     const std::size_t shown = failures.size() < 3 ? failures.size() : 3;
     for (std::size_t i = 0; i < shown; ++i) {
         if (i > 0) msg += "、";
-        msg += "\"" + shorten(failures[i], 28) + "\"";
+        msg += "\"" + core::shorten(failures[i], 28) + "\"";
     }
     if (failures.size() > shown) {
         msg += " 等 " + std::to_string(failures.size()) + " 项";
@@ -992,7 +852,7 @@ void saveSettings() {
     text += "mirrorH=" + std::to_string(settings.mirrorH) + "\n";
     text += "windowW=" + std::to_string(settings.windowW) + "\n";
     text += "windowH=" + std::to_string(settings.windowH) + "\n";
-    writeFileAtomic(settingsFilePath(), text);
+    core::writeFileAtomic(settingsFilePath(), text);
 }
 
 #ifdef _WIN32
@@ -1024,7 +884,7 @@ std::vector<std::string> listSystemFonts() {
 // HKCU and often point to a full path outside C:\Windows\Fonts).
 std::string resolveFontFileForFamily(const std::string& family, int weight) {
     std::string regularFile, boldFile, lightFile;
-    const std::string target = lower(family);
+    const std::string target = core::lower(family);
 
     auto readHive = [&](HKEY root, const wchar_t* subkey) {
         HKEY key = nullptr;
@@ -1042,7 +902,7 @@ std::string resolveFontFileForFamily(const std::string& family, int weight) {
             if (result != ERROR_SUCCESS) break;
             ++index;
 
-            const std::string name = lower(toUtf8(valueName));
+            const std::string name = core::lower(toUtf8(valueName));
             const std::string data = toUtf8(valueData);
             const std::size_t paren = name.find(" (");
             const std::string display = paren == std::string::npos ? name : name.substr(0, paren);
@@ -1339,7 +1199,7 @@ void saveBookmarks() {
     for (const Bookmark& b : bookmarks) {
         text += b.name + "\t" + b.path + "\n";
     }
-    writeFileAtomic(bookmarksFilePath(), text);
+    core::writeFileAtomic(bookmarksFilePath(), text);
 }
 
 void loadBookmarks() {
@@ -1362,7 +1222,7 @@ void saveCommands() {
     for (const CommandEntry& c : commands) {
         text += c.name + "\t" + (c.shell ? "shell" : "cmd") + "\t" + c.command + "\n";
     }
-    writeFileAtomic(commandsFilePath(), text);
+    core::writeFileAtomic(commandsFilePath(), text);
 }
 
 void loadCommands() {
@@ -1390,7 +1250,7 @@ void saveLastPaths() {
     for (const auto& kv : state.lastPaths) {
         text += kv.first + "\t" + kv.second + "\n";
     }
-    writeFileAtomic(lastPathsFilePath(), text);
+    core::writeFileAtomic(lastPathsFilePath(), text);
 }
 
 void loadLastPaths() {
@@ -1453,15 +1313,15 @@ void runCommandEntry(const CommandEntry& cmd) {
             } else {
                 r = runProcess("cmd", {"/c", cmd.command}, 60000);
             }
-            const std::string lowerCmd = lower(cmd.command);
+            const std::string lowerCmd = core::lower(cmd.command);
             const bool rebootsDevice = lowerCmd.find("reboot") != std::string::npos;
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 if (rebootsDevice) {
                     // adb reboot / adb shell reboot drop the connection while the
                     // device reboots, which often surfaces as exit code 255
                     // ("device offline" / "closed") even though it succeeded.
-                    const std::string lowerOut = lower(msg);
+                    const std::string lowerOut = core::lower(msg);
                     const bool deviceWasNotReady =
                         lowerOut.find("unauthorized") != std::string::npos ||
                         lowerOut.find("not found") != std::string::npos ||
@@ -1483,7 +1343,7 @@ void runCommandEntry(const CommandEntry& cmd) {
                 msg = "命令：" + cmd.command + "\n\n" + msg;
                 return app::async::failure<std::string>(msg);
             }
-            return app::async::success(trim(r.out));
+            return app::async::success(core::trim(r.out));
         },
         [](const app::async::Result<std::string>& result) {
             state.commandOutputTitle = result.ok ? "命令输出" : "命令失败";
@@ -1553,7 +1413,7 @@ void restartAdbServer() {
             std::this_thread::sleep_for(std::chrono::milliseconds(600));
             ProcessResult r = runProcess(adb, {"devices"}, 15000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::vector<Device>>(
                     msg.empty() ? "重启 adb 失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
@@ -1586,7 +1446,7 @@ void schedulePollDevices() {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             ProcessResult r = runProcess(adb, {"devices"}, 15000);
             if (r.exitCode != 0) {
-                return app::async::failure<std::vector<Device>>(trim(r.out));
+                return app::async::failure<std::vector<Device>>(core::trim(r.out));
             }
             return app::async::success(parseDevices(r.out));
         },
@@ -1644,7 +1504,7 @@ void refreshDevices() {
         [adb]() -> app::async::Result<std::vector<Device>> {
             ProcessResult r = runProcess(adb, {"devices"}, 15000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::vector<Device>>(
                     msg.empty() ? "获取设备列表失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
@@ -1694,16 +1554,16 @@ void refreshListing(bool force) {
         [adb, serial, path]() -> app::async::Result<ListingResult> {
             // One round-trip for both the listing and the writable check.
             const std::string shellCmd =
-                "ls -la " + shellQuote(path) + " 2>&1; __r=$?; echo __WRITE__; "
-                "test -w " + shellQuote(path) + " && echo 1 || echo 0; exit $__r";
+                "ls -la " + core::shellQuote(path) + " 2>&1; __r=$?; echo __WRITE__; "
+                "test -w " + core::shellQuote(path) + " && echo 1 || echo 0; exit $__r";
             ProcessResult r = runProcess(adb, {"-s", serial, "shell", shellCmd}, 30000);
             // Retry once on a transient adb drop (e.g. device still reconnecting).
-            if (r.exitCode == 255 && trim(r.out).empty()) {
+            if (r.exitCode == 255 && core::trim(r.out).empty()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(800));
                 r = runProcess(adb, {"-s", serial, "shell", shellCmd}, 30000);
             }
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 if (msg.empty()) {
                     msg = "读取目录失败（退出码 " + std::to_string(r.exitCode) + "）";
                     if (r.exitCode == 255) {
@@ -1718,7 +1578,7 @@ void refreshListing(bool force) {
             const std::string lsOut = marker == std::string::npos ? r.out : r.out.substr(0, marker);
             const std::string writeOut = marker == std::string::npos ? std::string{} : r.out.substr(marker + 9);
             result.entries = parseLsLa(lsOut);
-            result.writable = (trim(writeOut) == "1");
+            result.writable = (core::trim(writeOut) == "1");
             return app::async::success(result);
         },
         [cacheKey](const app::async::Result<ListingResult>& result) {
@@ -1758,18 +1618,18 @@ void navigateTo(const std::string& path) {
 }
 
 void goToPath(const std::string& raw) {
-    std::string path = trim(raw);
+    std::string path = core::trim(raw);
     if (path.empty()) path = "/";
     while (path.size() > 1 && path.back() == '/') path.pop_back();
     navigateTo(path);
 }
 
 void goUp() {
-    navigateTo(parentPath(state.currentPath));
+    navigateTo(core::parentPath(state.currentPath));
 }
 
 void enterDir(const std::string& name) {
-    navigateTo(joinPath(state.currentPath, name));
+    navigateTo(core::joinPath(state.currentPath, name));
 }
 
 void goBack() {
@@ -1856,7 +1716,7 @@ void pullBatchStep(std::vector<std::string> names, std::size_t index,
     }
     const std::string adb = state.adbPath;
     const std::string serial = state.selectedDevice;
-    const std::string remote = joinPath(state.currentPath, names[index]);
+    const std::string remote = core::joinPath(state.currentPath, names[index]);
     const std::string localDir = state.downloadDir;
     state.progress = static_cast<float>(index) / static_cast<float>(names.size());
     state.progressLabel = "下载 " + std::to_string(index + 1) + "/" + std::to_string(names.size());
@@ -1867,7 +1727,7 @@ void pullBatchStep(std::vector<std::string> names, std::size_t index,
             std::filesystem::create_directories(localDir, ec);
             ProcessResult r = runProcess(adb, {"-s", serial, "pull", remote, localDir}, 600000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure(msg.empty() ? "下载失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
             return app::async::success();
@@ -1893,11 +1753,11 @@ void doPush() {
         [adb, serial, local, remoteDir]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, {"-s", serial, "push", local, remoteDir}, 600000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
                     msg.empty() ? "上传失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
-            return app::async::success(trim(r.out));
+            return app::async::success(core::trim(r.out));
         },
         [](const app::async::Result<std::string>& result) {
             state.busy = false;
@@ -1905,7 +1765,7 @@ void doPush() {
             state.progressLabel.clear();
             state.toastTitle = result.ok ? "上传完成" : "上传失败";
             state.toastMessage = result.ok
-                ? (result.value.empty() ? "已上传" : shorten(result.value, 220))
+                ? (result.value.empty() ? "已上传" : core::shorten(result.value, 220))
                 : result.error;
             state.toastVisible = true;
             if (result.ok) refreshListing(true);
@@ -1942,7 +1802,7 @@ void pushBatchStep(std::vector<std::string> files, std::size_t index,
         [adb, serial, file = files[index], remoteDir]() -> app::async::Result<void> {
             ProcessResult r = runProcess(adb, {"-s", serial, "push", file, remoteDir}, 600000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure(msg.empty() ? "上传失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
             return app::async::success();
@@ -2001,15 +1861,15 @@ void deleteBatchStep(std::vector<std::string> names, std::size_t index,
     }
     const std::string adb = state.adbPath;
     const std::string serial = state.selectedDevice;
-    const std::string remote = joinPath(state.currentPath, names[index]);
+    const std::string remote = core::joinPath(state.currentPath, names[index]);
     state.progress = static_cast<float>(index) / static_cast<float>(names.size());
     state.progressLabel = "删除 " + std::to_string(index + 1) + "/" + std::to_string(names.size());
     app::async::restart(
         "adb.delete.one",
         [adb, serial, remote]() -> app::async::Result<void> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "shell", "rm", "-rf", shellQuote(remote)}, 60000);
+            ProcessResult r = runProcess(adb, {"-s", serial, "shell", "rm", "-rf", core::shellQuote(remote)}, 60000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure(msg.empty() ? "删除失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
             return app::async::success();
@@ -2036,7 +1896,7 @@ void promptRename() {
 }
 
 void confirmPrompt() {
-    std::string value = trim(state.promptValue);
+    std::string value = core::trim(state.promptValue);
     state.promptOpen = false;
     if (state.promptMode == 2) {
         // Wireless connect.
@@ -2048,10 +1908,10 @@ void confirmPrompt() {
             [adb, value]() -> app::async::Result<std::string> {
                 ProcessResult r = runProcess(adb, {"connect", value}, 20000);
                 if (r.exitCode != 0) {
-                    std::string msg = trim(r.out);
+                    std::string msg = core::trim(r.out);
                     return app::async::failure<std::string>(msg.empty() ? "连接失败" : msg);
                 }
-                return app::async::success(trim(r.out));
+                return app::async::success(core::trim(r.out));
             },
             [](const app::async::Result<std::string>& result) {
                 state.busy = false;
@@ -2073,12 +1933,12 @@ void confirmPrompt() {
     std::vector<std::string> args;
     std::string summary;
     if (state.promptMode == 0) {
-        args = {"-s", serial, "shell", "mkdir", "-p", shellQuote(joinPath(state.currentPath, value))};
+        args = {"-s", serial, "shell", "mkdir", "-p", core::shellQuote(core::joinPath(state.currentPath, value))};
         summary = "已创建 " + value;
     } else {
         args = {"-s", serial, "shell", "mv",
-                shellQuote(joinPath(state.currentPath, state.selectedEntry)),
-                shellQuote(joinPath(state.currentPath, value))};
+                core::shellQuote(core::joinPath(state.currentPath, state.selectedEntry)),
+                core::shellQuote(core::joinPath(state.currentPath, value))};
         summary = "已重命名为 " + value;
     }
     state.busy = true;
@@ -2087,7 +1947,7 @@ void confirmPrompt() {
         [adb, args = std::move(args), summary]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, args, 60000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
                     msg.empty() ? "操作失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
@@ -2116,7 +1976,7 @@ void setDownloadDir() {
 void doCopy() {
     if (state.selectedEntry.empty()) return;
     state.clipboardCut = false;
-    state.clipboardPath = joinPath(state.currentPath, state.selectedEntry);
+    state.clipboardPath = core::joinPath(state.currentPath, state.selectedEntry);
     state.clipboardName = state.selectedEntry;
     toast("已复制", state.clipboardName);
 }
@@ -2124,14 +1984,14 @@ void doCopy() {
 void doMove() {
     if (state.selectedEntry.empty()) return;
     state.clipboardCut = true;
-    state.clipboardPath = joinPath(state.currentPath, state.selectedEntry);
+    state.clipboardPath = core::joinPath(state.currentPath, state.selectedEntry);
     state.clipboardName = state.selectedEntry;
     toast("已剪切", state.clipboardName);
 }
 
 void doPaste() {
     if (state.clipboardPath.empty() || state.selectedDevice.empty()) return;
-    const std::string dest = joinPath(state.currentPath, state.clipboardName);
+    const std::string dest = core::joinPath(state.currentPath, state.clipboardName);
     if (dest == state.clipboardPath) {
         toast("无法粘贴", "源文件和目标位置相同。");
         return;
@@ -2145,10 +2005,10 @@ void doPaste() {
         "adb.paste",
         [adb, serial, src, dest, cut]() -> app::async::Result<std::string> {
             std::vector<std::string> args = {"-s", serial, "shell", cut ? "mv" : "cp", "-r",
-                                             shellQuote(src), shellQuote(dest)};
+                                             core::shellQuote(src), core::shellQuote(dest)};
             ProcessResult r = runProcess(adb, args, 120000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
                     msg.empty() ? (cut ? "移动失败（退出码 " : "复制失败（退出码 ") + std::to_string(r.exitCode) + "）" : msg);
             }
@@ -2181,7 +2041,7 @@ void doScreenshot() {
             std::filesystem::create_directories(dir, ec);
             ProcessResult r = runProcess(adb, {"-s", serial, "exec-out", "screencap", "-p"}, 30000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
                     msg.empty() ? "截图失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
@@ -2216,11 +2076,11 @@ void doInstallApk() {
         [adb, serial, apk]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, {"-s", serial, "install", "-r", apk}, 300000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
                     msg.empty() ? "安装失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
-            return app::async::success(trim(r.out));
+            return app::async::success(core::trim(r.out));
         },
         [](const app::async::Result<std::string>& result) {
             state.busy = false;
@@ -2237,8 +2097,8 @@ void fetchAdbVersion() {
         "adb.version",
         [adb]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, {"version"}, 15000);
-            if (r.exitCode != 0) return app::async::failure<std::string>(trim(r.out));
-            return app::async::success(trim(r.out));
+            if (r.exitCode != 0) return app::async::failure<std::string>(core::trim(r.out));
+            return app::async::success(core::trim(r.out));
         },
         [](const app::async::Result<std::string>& result) {
             if (result.ok) state.adbVersion = result.value;
@@ -2261,10 +2121,10 @@ void openDeviceInfo() {
                 "echo '存储:'; df /data | tail -1";
             ProcessResult r = runProcess(adb, {"-s", serial, "shell", cmd}, 30000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(msg.empty() ? "获取设备信息失败" : msg);
             }
-            return app::async::success(trim(r.out));
+            return app::async::success(core::trim(r.out));
         },
         [](const app::async::Result<std::string>& result) {
             const std::string prefix = state.adbVersion.empty() ? std::string{} : ("adb: " + state.adbVersion + "\n\n");
@@ -2524,7 +2384,7 @@ int g_mirrorDeviceH = 2340;
 
 void queryDeviceSize(const std::string& adb, const std::string& serial) {
     ProcessResult r = runProcess(adb, {"-s", serial, "shell", "wm", "size"}, 10000);
-    const std::string out = trim(r.out);
+    const std::string out = core::trim(r.out);
     const std::size_t x = out.rfind('x');
     if (x == std::string::npos) return;
     std::size_t ws = x;
@@ -2791,206 +2651,16 @@ void openMirror() {
     std::thread([] { scrcpyEmbedLoop(); }).detach();
 #else
     state.scrcpyOpen = true;
-    const std::string cmd = shellQuote(scrcpy) + " -s " + shellQuote(serial) + " &";
+    const std::string cmd = core::shellQuote(scrcpy) + " -s " + core::shellQuote(serial) + " &";
     std::system(cmd.c_str());
 #endif
     toast("已启动投屏", "正在连接设备，连接后画面会显示在投屏窗口内。");
 }
 
-// -----------------------------------------------------------------------------
-// CNG hashing - used to verify downloaded update packages before they are
-// installed. Without this the updater would happily copy an executable served
-// by a mirror/proxy or a MITM straight over the running binary.
-// -----------------------------------------------------------------------------
-#ifdef _WIN32
-std::string hashFileHex(const std::wstring& path, LPCWSTR algorithm, std::string& err) {
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    std::string result;
-    auto cleanup = [&] {
-        if (hash != nullptr) BCryptDestroyHash(hash);
-        if (alg != nullptr) BCryptCloseAlgorithmProvider(alg, 0);
-    };
-
-    if (BCryptOpenAlgorithmProvider(&alg, algorithm, nullptr, 0) < 0) {
-        err = "无法初始化哈希算法";
-        cleanup();
-        return result;
-    }
-    DWORD objectSize = 0;
-    DWORD cb = 0;
-    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
-                          sizeof(objectSize), &cb, 0) < 0) {
-        err = "无法读取哈希属性";
-        cleanup();
-        return result;
-    }
-    DWORD digestSize = 0;
-    if (BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&digestSize),
-                          sizeof(digestSize), &cb, 0) < 0) {
-        err = "无法读取哈希长度";
-        cleanup();
-        return result;
-    }
-    std::vector<unsigned char> object(objectSize);
-    if (BCryptCreateHash(alg, &hash, object.data(), objectSize, nullptr, 0, 0) < 0) {
-        err = "无法创建哈希上下文";
-        cleanup();
-        return result;
-    }
-
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        err = "无法读取下载的文件";
-        cleanup();
-        return result;
-    }
-    std::vector<unsigned char> buf(65536);
-    for (;;) {
-        DWORD read = 0;
-        if (!ReadFile(file, buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr)) {
-            err = "读取下载的文件失败";
-            break;
-        }
-        if (read == 0) break;
-        if (BCryptHashData(hash, buf.data(), read, 0) < 0) {
-            err = "哈希计算失败";
-            break;
-        }
-    }
-    CloseHandle(file);
-    if (!err.empty()) {
-        cleanup();
-        return result;
-    }
-
-    std::vector<unsigned char> digest(digestSize);
-    if (BCryptFinishHash(hash, digest.data(), digestSize, 0) < 0) {
-        err = "哈希计算失败";
-        cleanup();
-        return result;
-    }
-    cleanup();
-
-    static const char* kHex = "0123456789abcdef";
-    result.reserve(digest.size() * 2);
-    for (unsigned char byte : digest) {
-        result += kHex[byte >> 4];
-        result += kHex[byte & 0x0F];
-    }
-    return result;
-}
-
-std::string sha256FileHex(const std::wstring& path, std::string& err) {
-    return hashFileHex(path, BCRYPT_SHA256_ALGORITHM, err);
-}
-
-std::string sha1FileHex(const std::wstring& path, std::string& err) {
-    return hashFileHex(path, BCRYPT_SHA1_ALGORITHM, err);
-}
-
-// Extract "<hex>  <filename>" rows from a sha256sum-style / GitHub digest blob.
-// GitHub's release "digest" field (and "sha256:..." values in general) carry a
-// "sha256:" prefix, so accept both that and the plain sha256sum format.
-std::vector<std::pair<std::string, std::string>> parseSha256Rows(const std::string& text) {
-    std::vector<std::pair<std::string, std::string>> rows;
-    std::size_t pos = 0;
-    while (pos < text.size()) {
-        std::size_t end = text.find('\n', pos);
-        if (end == std::string::npos) end = text.size();
-        std::string line = trim(text.substr(pos, end - pos));
-        pos = end + 1;
-
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.rfind("sha256:", 0) == 0) line = trim(line.substr(7));
-        if (line.size() < 64) continue;
-
-        std::string hex;
-        hex.reserve(64);
-        std::size_t i = 0;
-        for (; i < line.size() && hex.size() < 64; ++i) {
-            const char c = line[i];
-            if (std::isxdigit(static_cast<unsigned char>(c))) hex += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            else break;
-        }
-        if (hex.size() != 64) continue;
-
-        std::string name = trim(line.substr(i));
-        if (!name.empty() && (name[0] == '*' || name[0] == ' ')) name = trim(name.substr(1));
-        if (name.empty()) continue;
-        rows.emplace_back(name, hex);
-    }
-    return rows;
-}
-#endif  // _WIN32
 
 // -----------------------------------------------------------------------------
 // Update checker & installer (adb / scrcpy / this app)
 // -----------------------------------------------------------------------------
-std::vector<int> parseVersionParts(const std::string& v) {
-    std::vector<int> parts;
-    std::string cur;
-    for (char c : v) {
-        if (c >= '0' && c <= '9') {
-            cur += c;
-        } else if (c == '.' || c == '-' || c == '_') {
-            if (!cur.empty()) { parts.push_back(std::atoi(cur.c_str())); cur.clear(); }
-        } else {
-            break;  // stop at the first non-version character (e.g. a space)
-        }
-    }
-    if (!cur.empty()) parts.push_back(std::atoi(cur.c_str()));
-    return parts;
-}
-
-int compareVersions(const std::string& a, const std::string& b) {
-    const std::vector<int> pa = parseVersionParts(a);
-    const std::vector<int> pb = parseVersionParts(b);
-    const std::size_t n = std::max(pa.size(), pb.size());
-    for (std::size_t i = 0; i < n; ++i) {
-        const int x = i < pa.size() ? pa[i] : 0;
-        const int y = i < pb.size() ? pb[i] : 0;
-        if (x != y) return x < y ? -1 : 1;
-    }
-    return 0;
-}
-
-std::string adbShortVersion(const std::string& out) {
-    std::istringstream in(out);
-    std::string line;
-    while (std::getline(in, line)) {
-        const std::size_t p = line.find("Version ");
-        if (p == std::string::npos) continue;
-        std::string rest = trim(line.substr(p + 8));
-        std::string v;
-        for (char c : rest) {
-            if ((c >= '0' && c <= '9') || c == '.') v += c;
-            else break;
-        }
-        if (!v.empty()) return v;
-    }
-    return "";
-}
-
-std::string scrcpyShortVersion(const std::string& out) {
-    const std::size_t p = out.find("scrcpy");
-    if (p == std::string::npos) return "";
-    std::size_t i = p + 6;  // len("scrcpy")
-    while (i < out.size()) {
-        const char c = out[i];
-        if (c == ' ' || c == '\t' || c == 'v' || c == 'V') ++i;
-        else break;
-    }
-    std::string v;
-    while (i < out.size()) {
-        const char c = out[i];
-        if ((c >= '0' && c <= '9') || c == '.') v += c;
-        else break;
-        ++i;
-    }
-    return v;
-}
 
 std::string scrcpyTargetDir() {
     const std::string s = findScrcpy();
@@ -3034,7 +2704,7 @@ bool extractZip(const std::string& zipPath, const std::string& destDir, std::str
     const std::string ps = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Expand-Archive -LiteralPath '" + zipPath + "' -DestinationPath '" + destDir + "' -Force";
     ProcessResult r2 = runProcess("powershell", {"-NoProfile", "-NonInteractive", "-Command", ps}, 600000);
     if (r2.exitCode == 0) return true;
-    err = "解压失败：" + (trim(r2.out).empty() ? r2.err : trim(r2.out));
+    err = "解压失败：" + (core::trim(r2.out).empty() ? r2.err : core::trim(r2.out));
     return false;
 }
 
@@ -3279,12 +2949,12 @@ app::async::Result<std::string> installScrcpyWorker(const std::string& url, cons
     // Downloads can travel via a third-party GitHub mirror, so verify the
     // archive against the checksum published in the release before unpacking.
     if (!expectedSha256.empty()) {
-        const std::string actual = sha256FileHex(toWide(zip), err);
+        const std::string actual = core::sha256FileHex(toWide(zip), err);
         if (actual.empty()) {
             cleanupDir(work);
             return app::async::failure<std::string>("校验失败：" + err);
         }
-        if (lower(actual) != lower(expectedSha256)) {
+        if (core::lower(actual) != core::lower(expectedSha256)) {
             cleanupDir(work);
             return app::async::failure<std::string>("scrcpy 更新包校验失败（SHA-256 不匹配），已取消安装。");
         }
@@ -3338,8 +3008,8 @@ app::async::Result<std::string> installAdbWorker(const std::string& url, const s
     std::string adbVerifyWarning;
     if (!expectedSha1.empty()) {
         std::string hashErr;
-        const std::string actual = sha1FileHex(toWide(zip), hashErr);
-        if (!actual.empty() && lower(actual) != lower(expectedSha1)) {
+        const std::string actual = core::sha1FileHex(toWide(zip), hashErr);
+        if (!actual.empty() && core::lower(actual) != core::lower(expectedSha1)) {
             adbVerifyWarning = "（注意：下载包校验值与官方公布的不一致，可能不是官方文件）";
         }
     }
@@ -3387,12 +3057,12 @@ app::async::Result<std::string> installAppUpdateWorker(const std::string& url, c
     // Verify the archive before anything is unpacked or executed. The digest
     // comes from the GitHub release metadata (or its .sha256 sidecar).
     if (!expectedSha256.empty()) {
-        const std::string actual = sha256FileHex(toWide(zip), err);
+        const std::string actual = core::sha256FileHex(toWide(zip), err);
         if (actual.empty()) {
             cleanupDir(work);
             return app::async::failure<std::string>("校验失败：" + err);
         }
-        if (lower(actual) != lower(expectedSha256)) {
+        if (core::lower(actual) != core::lower(expectedSha256)) {
             cleanupDir(work);
             return app::async::failure<std::string>("更新包校验失败（SHA-256 不匹配），已取消安装。");
         }
@@ -3504,197 +3174,12 @@ app::async::Result<std::string> installAppUpdateWorker(const std::string& url, c
 }
 #endif  // _WIN32
 
-std::string jsonStringValue(const std::string& json, const std::string& key) {
-    const std::string needle = "\"" + key + "\":\"";
-    const std::size_t p = json.find(needle);
-    if (p == std::string::npos) return "";
-    const std::size_t start = p + needle.size();
-    const std::size_t end = json.find('"', start);
-    if (end == std::string::npos) return "";
-    return json.substr(start, end - start);
-}
 
-// End index of the JSON string that opens at "openQuote". Skips escaped
-// characters so a quoted "}" or "{" can never be mistaken for structure.
-std::size_t jsonStringEnd(const std::string& json, std::size_t openQuote) {
-    for (std::size_t i = openQuote + 1; i < json.size(); ++i) {
-        const char c = json[i];
-        if (c == '\\') { ++i; continue; }
-        if (c == '"') return i;
-    }
-    return std::string::npos;
-}
 
-// End index (the closing brace) of the JSON object that opens at "brace".
-// String-aware: braces inside string literals are ignored. That matters a lot
-// here, because GitHub's API JSON is full of URL templates such as
-// "https://api.github.com/users/x/following{/other_user}", and a naive
-// brace counter walks straight out of the object it was asked about.
-std::size_t jsonObjectEnd(const std::string& json, std::size_t brace) {
-    int depth = 0;
-    for (std::size_t i = brace; i < json.size(); ++i) {
-        const char c = json[i];
-        if (c == '"') {
-            const std::size_t end = jsonStringEnd(json, i);
-            if (end == std::string::npos) return std::string::npos;
-            i = end;
-            continue;
-        }
-        if (c == '{') {
-            ++depth;
-        } else if (c == '}') {
-            if (--depth == 0) return i;
-        }
-    }
-    return std::string::npos;
-}
 
-// Locate the release asset the in-app self-update should install: the first
-// asset whose name ends in ".zip". GitHub also exposes zipball/tarball URLs,
-// but those are separate JSON fields and never show up as
-// "browser_download_url" entries, so they cannot be picked up here.
-//
-// The asset's own "digest" field ("sha256:<hex>", published by GitHub for
-// uploaded assets) is returned as well so the updater can verify what it
-// downloaded before replacing its own executable. An empty digest means "not
-// published": the caller then falls back to the "<asset>.sha256" sidecar and
-// only reports the update as unverified when that is missing too.
-//
-// The "assets":[ array is walked object by object instead of searching for a
-// URL and then looking backwards for its object, because GitHub's own JSON is
-// full of URL templates containing braces (".../events{/privacy}") that make
-// naive backward brace matching land inside a string literal.
-bool findAppReleaseAsset(const std::string& json, std::string& url, std::string& row, std::string& sha) {
-    url.clear();
-    row.clear();
-    sha.clear();
 
-    const std::string assetsNeedle = "\"assets\":[";
-    const std::size_t assets = json.find(assetsNeedle);
-    if (assets == std::string::npos) return false;
 
-    std::size_t i = assets + assetsNeedle.size();
-    while (i < json.size()) {
-        if (json[i] != '{') {
-            if (json[i] == ']') break;  // end of the asset array
-            ++i;
-            continue;
-        }
-        const std::size_t objEnd = jsonObjectEnd(json, i);
-        if (objEnd == std::string::npos) break;
-        const std::string entry = json.substr(i, objEnd - i + 1);
-        i = objEnd + 1;
 
-        const std::string name = jsonStringValue(entry, "name");
-        const std::string assetUrl = jsonStringValue(entry, "browser_download_url");
-        const bool zip = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".zip") == 0) ||
-                         (assetUrl.size() >= 4 && assetUrl.compare(assetUrl.size() - 4, 4, ".zip") == 0);
-        if (!zip) continue;
-
-        const std::size_t lastSlash = assetUrl.find_last_of('/');
-        url = assetUrl;
-        row = !name.empty() ? name : (lastSlash == std::string::npos ? assetUrl : assetUrl.substr(lastSlash + 1));
-
-        const std::string digest = jsonStringValue(entry, "digest");
-        if (digest.rfind("sha256:", 0) == 0) sha = lower(trim(digest.substr(7)));
-        return true;
-    }
-    return false;
-}
-
-std::string findWin64AssetUrl(const std::string& json) {
-    const std::size_t namePos = json.find("\"name\":\"scrcpy-win64-");
-    if (namePos == std::string::npos) return "";
-    const std::string needle = "\"browser_download_url\":\"";
-    const std::size_t p = json.find(needle, namePos);
-    if (p == std::string::npos) return "";
-    const std::size_t start = p + needle.size();
-    const std::size_t end = json.find('"', start);
-    if (end == std::string::npos) return "";
-    return json.substr(start, end - start);
-}
-
-// Resolve the published sha256 for an asset URL, using the GitHub release
-// metadata first ("digest" on the asset) and the "<url>.sha256" sidecar as a
-// fallback. Returns an empty string when the release publishes no digest; the
-// callers treat that as "cannot verify" rather than "verified".
-std::string resolveAssetSha256(const std::string& releaseJson, const std::string& url) {
-    if (url.empty()) return "";
-    // The release payload already carries the asset digest when we have the
-    // whole release JSON; find it through the same asset walk.
-    std::string foundUrl, foundRow, foundSha;
-    (void)findAppReleaseAsset(releaseJson, foundUrl, foundRow, foundSha);
-    if (foundUrl == url && foundSha.size() == 64) return foundSha;
-
-    HttpResult hr = httpGetString(url + ".sha256", 64 * 1024);
-    if (!hr.ok) return "";
-    const std::string body = trim(hr.body);
-    if (body.empty() || body[0] == '<') return "";  // an HTML error page, not a digest
-    const std::vector<std::pair<std::string, std::string>> rows = parseSha256Rows(body);
-    return rows.empty() ? std::string() : rows.front().second;
-}
-
-// -----------------------------------------------------------------------------
-// Google's SDK repository XML (repository2-1.xml): the <remotePackage
-// path="platform-tools"> entry carries the current revision plus, for every
-// host OS, the exact archive URL and its checksum. Reading it directly means we
-// download a pinned file we can verify instead of guessing a URL from a version
-// number (the Windows archive is named "-win.zip", not "-windows.zip").
-// -----------------------------------------------------------------------------
-std::string xmlValue(const std::string& block, const std::string& name) {
-    const std::string open = "<" + name + ">";
-    const std::string close = "</" + name + ">";
-    const std::size_t a = block.find(open);
-    if (a == std::string::npos) return "";
-    const std::size_t b = block.find(close, a);
-    if (b == std::string::npos) return "";
-    return trim(block.substr(a + open.size(), b - a - open.size()));
-}
-
-std::string parsePlatformToolsVersion(const std::string& xml) {
-    const std::size_t pkg = xml.find("<remotePackage path=\"platform-tools\"");
-    if (pkg == std::string::npos) return "";
-    const std::size_t rev = xml.find("<revision>", pkg);
-    if (rev == std::string::npos) return "";
-    const std::size_t revEnd = xml.find("</revision>", rev);
-    if (revEnd == std::string::npos) return "";
-    const std::string revBlock = xml.substr(rev, revEnd - rev);
-    const std::string major = xmlValue(revBlock, "major");
-    if (major.empty()) return "";
-    std::string v = major;
-    const std::string minor = xmlValue(revBlock, "minor");
-    const std::string micro = xmlValue(revBlock, "micro");
-    if (!minor.empty()) v += "." + minor;
-    if (!micro.empty()) v += "." + micro;
-    return v;
-}
-
-// Windows archive of the platform-tools remote package: returns the absolute
-// download URL and its published checksum (SHA-1).
-void parsePlatformToolsWindowsArchive(const std::string& xml, std::string& url, std::string& checksum) {
-    url.clear();
-    checksum.clear();
-    const std::size_t pkg = xml.find("<remotePackage path=\"platform-tools\"");
-    if (pkg == std::string::npos) return;
-    const std::size_t pkgEnd = xml.find("</remotePackage>", pkg);
-    const std::string pkgBlock = xml.substr(pkg, pkgEnd == std::string::npos ? std::string::npos
-                                                                             : pkgEnd - pkg);
-    const std::size_t archives = pkgBlock.find("<archives>");
-    if (archives == std::string::npos) return;
-
-    std::size_t pos = archives;
-    while ((pos = pkgBlock.find("<archive>", pos)) != std::string::npos) {
-        const std::size_t end = pkgBlock.find("</archive>", pos);
-        if (end == std::string::npos) return;
-        const std::string block = pkgBlock.substr(pos, end - pos);
-        pos = end + 1;
-        if (xmlValue(block, "host-os") != "windows") continue;
-        const std::string base = "https://dl.google.com/android/repository/";
-        url = base + xmlValue(block, "url");
-        checksum = lower(xmlValue(block, "checksum"));
-        return;
-    }
-}
 
 void checkForUpdates();
 void openUpdateDialog() {
@@ -3715,24 +3200,24 @@ void checkForUpdates() {
             UpdateInfo info;
             if (!adb.empty()) {
                 ProcessResult r = runProcess(adb, {"version"}, 15000);
-                if (r.exitCode == 0) info.adbCurrent = adbShortVersion(r.out);
+                if (r.exitCode == 0) info.adbCurrent = core::adbShortVersion(r.out);
             }
             if (!scrcpy.empty()) {
                 ProcessResult r = runProcess(scrcpy, {"--version"}, 15000);
-                if (r.exitCode == 0) info.scrcpyCurrent = scrcpyShortVersion(r.out);
+                if (r.exitCode == 0) info.scrcpyCurrent = core::scrcpyShortVersion(r.out);
             }
 #ifdef _WIN32
             HttpResult hr = httpGetString("https://api.github.com/repos/Genymobile/scrcpy/releases/latest", 4 * 1024 * 1024);
             if (hr.ok) {
-                std::string tag = jsonStringValue(hr.body, "tag_name");
+                std::string tag = core::jsonStringValue(hr.body, "tag_name");
                 if (!tag.empty() && tag[0] == 'v') tag = tag.substr(1);
                 info.scrcpyLatest = tag;
-                info.scrcpyUrl = findWin64AssetUrl(hr.body);
+                info.scrcpyUrl = core::findWin64AssetUrl(hr.body);
                 if (info.scrcpyUrl.empty() && !tag.empty()) {
                     info.scrcpyUrl = "https://github.com/Genymobile/scrcpy/releases/download/v" + tag +
                                      "/scrcpy-win64-v" + tag + ".zip";
                 }
-                info.scrcpySha256 = resolveAssetSha256(hr.body, info.scrcpyUrl);
+                info.scrcpySha256 = core::findAssetSha256(hr.body, info.scrcpyUrl);
             } else if (info.error.empty()) {
                 info.error = "获取 scrcpy 最新版本失败：" + hr.error;
             }
@@ -3740,9 +3225,9 @@ void checkForUpdates() {
             // (dl.google.com is reachable even where GitHub is not).
             HttpResult hr2 = httpGetString("https://dl.google.com/android/repository/repository2-1.xml", 8 * 1024 * 1024);
             if (hr2.ok) {
-                info.adbLatest = parsePlatformToolsVersion(hr2.body);
+                info.adbLatest = core::parsePlatformToolsVersion(hr2.body);
                 // Prefer the exact archive URL + checksum published for Windows.
-                parsePlatformToolsWindowsArchive(hr2.body, info.adbUrl, info.adbSha1);
+                core::parsePlatformToolsWindowsArchive(hr2.body, info.adbUrl, info.adbSha1);
                 if (info.adbUrl.empty() && !info.adbLatest.empty()) {
                     info.adbUrl = "https://dl.google.com/android/repository/platform-tools_r" +
                                   info.adbLatest + "-windows.zip";
@@ -3754,14 +3239,24 @@ void checkForUpdates() {
             info.appCurrent = kAppVersion;
             HttpResult hr3 = httpGetString(std::string("https://api.github.com/repos/") + kAppUpdateRepo + "/releases/latest", 2 * 1024 * 1024);
             if (hr3.ok) {
-                std::string tag = jsonStringValue(hr3.body, "tag_name");
+                std::string tag = core::jsonStringValue(hr3.body, "tag_name");
                 if (!tag.empty() && tag[0] == 'v') tag = tag.substr(1);
                 info.appLatest = tag;
-                findAppReleaseAsset(hr3.body, info.appUrl, info.appRow, info.appSha256);
+                core::findAppReleaseAsset(hr3.body, info.appUrl, info.appRow, info.appSha256);
                 // Older releases carry no asset "digest"; fall back to the
-                // ".sha256" sidecar the release workflow publishes.
+                // ".sha256" sidecar the release workflow publishes next to each
+                // artifact (the digest lookup itself lives in core/package).
                 if (info.appSha256.empty() && !info.appUrl.empty()) {
-                    info.appSha256 = resolveAssetSha256("", info.appUrl);
+                    HttpResult hrSha = httpGetString(info.appUrl + ".sha256", 64 * 1024);
+                    if (hrSha.ok) {
+                        const std::string body = core::trim(hrSha.body);
+                        // A mirror answering with an HTML error page must not be
+                        // mistaken for a digest.
+                        if (!body.empty() && body[0] != '<') {
+                            const auto rows = core::parseSha256Rows(body);
+                            if (!rows.empty()) info.appSha256 = rows.front().second;
+                        }
+                    }
                 }
             } else if (info.error.empty()) {
                 info.error = "获取本软件最新版本失败：" + hr3.error;
@@ -3770,11 +3265,11 @@ void checkForUpdates() {
             if (info.error.empty()) info.error = "此平台暂不支持在线检查更新。";
 #endif
             info.adbUpdate = !info.adbLatest.empty() &&
-                             (info.adbCurrent.empty() || compareVersions(info.adbCurrent, info.adbLatest) < 0);
+                             (info.adbCurrent.empty() || core::compareVersions(info.adbCurrent, info.adbLatest) < 0);
             info.scrcpyUpdate = !info.scrcpyLatest.empty() &&
-                                (info.scrcpyCurrent.empty() || compareVersions(info.scrcpyCurrent, info.scrcpyLatest) < 0);
+                                (info.scrcpyCurrent.empty() || core::compareVersions(info.scrcpyCurrent, info.scrcpyLatest) < 0);
             info.appUpdate = !info.appLatest.empty() &&
-                             compareVersions(info.appCurrent, info.appLatest) < 0;
+                             core::compareVersions(info.appCurrent, info.appLatest) < 0;
             return app::async::success(info);
         },
         [](const app::async::Result<UpdateInfo>& result) {
@@ -3929,16 +3424,16 @@ void openTextPreview(const std::string& name) {
     if (state.selectedDevice.empty()) return;
     const std::string adb = state.adbPath;
     const std::string serial = state.selectedDevice;
-    const std::string remote = joinPath(state.currentPath, name);
+    const std::string remote = core::joinPath(state.currentPath, name);
     state.textPreviewOpen = true;
     state.textPreviewContent = "加载中…";
     state.textPreviewRemote = remote;
     app::async::restart(
         "adb.text.read",
         [adb, serial, remote]() -> app::async::Result<std::string> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "shell", "cat", shellQuote(remote)}, 30000);
+            ProcessResult r = runProcess(adb, {"-s", serial, "shell", "cat", core::shellQuote(remote)}, 30000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(msg.empty() ? "读取文件失败" : msg);
             }
             return app::async::success(r.out);
@@ -3968,7 +3463,7 @@ void saveTextPreview() {
             std::error_code ec;
             std::filesystem::remove(tmp, ec);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(
                     msg.empty() ? "保存失败（退出码 " + std::to_string(r.exitCode) + "）" : msg);
             }
@@ -3983,14 +3478,16 @@ void saveTextPreview() {
 // --- Copy path / filename ---
 void copyPathToClipboard() {
     if (state.selectedEntry.empty()) return;
-    const std::string path = joinPath(state.currentPath, state.selectedEntry);
-    core::window::setClipboardText(path);
+    const std::string path = core::joinPath(state.currentPath, state.selectedEntry);
+    // ::core is the framework's namespace; the unqualified "core" inside
+    // namespace app is the alias for adb::core declared above.
+    ::core::window::setClipboardText(path);
     toast("已复制路径", path);
 }
 
 void copyFileNameToClipboard() {
     if (state.selectedEntry.empty()) return;
-    core::window::setClipboardText(state.selectedEntry);
+    ::core::window::setClipboardText(state.selectedEntry);
     toast("已复制文件名", state.selectedEntry);
 }
 
@@ -4000,9 +3497,9 @@ void openFileProperties() {
     if (e == nullptr) return;
     std::string text;
     text += "名称: " + e->name + "\n";
-    text += "路径: " + joinPath(state.currentPath, e->name) + "\n";
+    text += "路径: " + core::joinPath(state.currentPath, e->name) + "\n";
     text += "类型: " + std::string(e->isDir ? "文件夹" : (e->isLink ? "符号链接" : "文件")) + "\n";
-    text += "大小: " + (e->isDir ? "-" : formatSize(e->size)) + "\n";
+    text += "大小: " + (e->isDir ? "-" : core::formatSize(e->size)) + "\n";
     text += "权限: " + e->perms + "\n";
     text += "修改时间: " + e->date + "\n";
     if (e->isLink) text += "链接目标: " + e->linkTarget + "\n";
@@ -4029,14 +3526,14 @@ void fetchAppList() {
         [adb, serial]() -> app::async::Result<std::vector<std::string>> {
             ProcessResult r = runProcess(adb, {"-s", serial, "shell", "pm", "list", "packages", "-3"}, 30000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::vector<std::string>>(msg.empty() ? "获取应用列表失败" : msg);
             }
             std::vector<std::string> packages;
             std::istringstream iss(r.out);
             std::string line;
             while (std::getline(iss, line)) {
-                const std::string pkg = trim(line);
+                const std::string pkg = core::trim(line);
                 if (pkg.rfind("package:", 0) == 0) {
                     packages.push_back(pkg.substr(8));
                 }
@@ -4073,7 +3570,7 @@ void uninstallSelectedApp() {
         [adb, serial, pkg]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, {"-s", serial, "uninstall", pkg}, 120000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(msg.empty() ? "卸载失败" : msg);
             }
             return app::async::success<std::string>("已卸载 " + pkg);
@@ -4096,7 +3593,7 @@ void clearSelectedAppData() {
         [adb, serial, pkg]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, {"-s", serial, "shell", "pm", "clear", pkg}, 120000);
             if (r.exitCode != 0) {
-                std::string msg = trim(r.out);
+                std::string msg = core::trim(r.out);
                 return app::async::failure<std::string>(msg.empty() ? "清数据失败" : msg);
             }
             return app::async::success<std::string>("已清理 " + pkg + " 的数据");
@@ -4112,7 +3609,7 @@ void openImagePreview(const std::string& name) {
     if (state.selectedDevice.empty()) return;
     const std::string adb = state.adbPath;
     const std::string serial = state.selectedDevice;
-    const std::string remote = joinPath(state.currentPath, name);
+    const std::string remote = core::joinPath(state.currentPath, name);
     const std::string base = remote.substr(remote.find_last_of('/') + 1);
     const std::string tmp = ".adb_preview_" + base;
     state.imagePreviewRemote = remote;
@@ -4340,7 +3837,7 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
 
             ui.text(rowId + ".name")
                 .x(34.0f).y(0.0f).size(c.nameW, h)
-                .text(shorten(displayName, static_cast<int>(c.nameW / 9.0f)))
+                .text(core::shorten(displayName, static_cast<int>(c.nameW / 9.0f)))
                 .fontSize(15.0f)
                 .lineHeight(15.0f)
                 .color(kInk)
@@ -4349,7 +3846,7 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
 
             ui.text(rowId + ".size")
                 .x(c.sizeX).y(0.0f).size(78.0f, h)
-                .text(e.isDir ? "" : formatSize(e.size))
+                .text(e.isDir ? "" : core::formatSize(e.size))
                 .fontSize(13.0f)
                 .lineHeight(13.0f)
                 .color(kMuted)
@@ -4706,7 +4203,7 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
                 .build();
             ui.text("topbar.device.name")
                 .x(42.0f).y(0.0f).size(devW - 74.0f, h)
-                .text(shorten(deviceLabel, static_cast<int>((devW - 74.0f) / 8.0f)))
+                .text(core::shorten(deviceLabel, static_cast<int>((devW - 74.0f) / 8.0f)))
                 .fontSize(14.0f)
                 .lineHeight(14.0f)
                 .color(kInk)
@@ -4813,11 +4310,11 @@ void updatePathSuggestions() {
 
     const std::string adb = state.adbPath;
     const std::string serial = state.selectedDevice;
-    const std::string partialLower = lower(partial);
+    const std::string partialLower = core::lower(partial);
     app::async::restart(
         "path.suggest",
         [adb, serial, dirPart, partialLower]() -> app::async::Result<std::vector<std::string>> {
-            ProcessResult r = runProcess(adb, {"-s", serial, "shell", "ls", "-la", shellQuote(dirPart)}, 15000);
+            ProcessResult r = runProcess(adb, {"-s", serial, "shell", "ls", "-la", core::shellQuote(dirPart)}, 15000);
             if (r.exitCode != 0) {
                 return app::async::success(std::vector<std::string>{});
             }
@@ -4825,7 +4322,7 @@ void updatePathSuggestions() {
             std::vector<std::string> suggestions;
             for (const FsEntry& e : entries) {
                 if (!e.isDir) continue;
-                if (lower(e.name).rfind(partialLower, 0) != 0) continue;
+                if (core::lower(e.name).rfind(partialLower, 0) != 0) continue;
                 suggestions.push_back((dirPart == "/" ? "/" : dirPart + "/") + e.name);
             }
             std::sort(suggestions.begin(), suggestions.end());
@@ -4957,7 +4454,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                 .x(4.0f).y(0.0f).size(segW, h)
                 .clip()
                 .content([&] {
-                    const std::vector<std::string> parts = splitPath(state.currentPath);
+                    const std::vector<std::string> parts = core::splitPath(state.currentPath);
                     const float fontSize = 13.0f;
                     const float sepW = 16.0f;
                     float cursorX = 6.0f;
@@ -5457,8 +4954,8 @@ void composeCommandManageDialog(eui::Ui& ui, float w, float h) {
                 }).build();
             toolButton(ui, "command.manage.add", pw - 24.0f - 100.0f, 180.0f, 100.0f, 32.0f,
                        0xF067, "添加", true, true, [] {
-                           const std::string name = trim(state.commandNameInput);
-                           const std::string cmd = trim(state.commandCmdInput);
+                           const std::string name = core::trim(state.commandNameInput);
+                           const std::string cmd = core::trim(state.commandCmdInput);
                            if (!name.empty() && !cmd.empty()) {
                                addCommand(name, state.commandShellType, cmd);
                                state.commandNameInput.clear();
@@ -5496,7 +4993,7 @@ void composeCommandManageDialog(eui::Ui& ui, float w, float h) {
                                     body.text(id + ".name").x(10.0f).y(2.0f).size(cw - 170.0f, 18.0f)
                                         .text(c.name).fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
                                     body.text(id + ".cmd").x(10.0f).y(21.0f).size(cw - 170.0f, 14.0f)
-                                        .text(shorten(c.command, 50)).fontSize(11.0f).lineHeight(11.0f).color(kMuted).build();
+                                        .text(core::shorten(c.command, 50)).fontSize(11.0f).lineHeight(11.0f).color(kMuted).build();
                                     body.text(id + ".type").x(cw - 160.0f).y(9.0f).size(100.0f, 18.0f)
                                         .text(c.shell ? "adb shell" : "cmd").fontSize(11.0f).lineHeight(11.0f)
                                         .color(c.shell ? kAccent : kAmber).horizontalAlign(eui::HorizontalAlign::Center).build();

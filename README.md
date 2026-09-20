@@ -112,7 +112,9 @@ cmake --build build --parallel
 
 ```
 AdbTools/
-├── main.cpp                # 应用主体（全部界面与逻辑）
+├── main.cpp                # 界面与交互（GUI 层）
+├── core/                   # 纯逻辑（无 UI 依赖，有单元测试）——见 core/README.md
+├── tests/                  # core 的单元测试（ctest，无第三方框架）
 ├── regex_wrap.cpp          # std::regex 的异常隔离封装（logcat 过滤用）
 ├── adb_browser.rc          # Windows 资源脚本（版本信息 + 内嵌 manifest）
 ├── adb_browser.manifest    # 应用清单（asInvoker / longPathAware）
@@ -122,9 +124,28 @@ AdbTools/
 ├── scripts/
 │   └── fetch_scrcpy.ps1    # 下载并解压 scrcpy（内含 adb）
 ├── screenshots/            # README 截图
-├── .github/workflows/      # CI 自动构建 / 发版
+├── .github/workflows/      # CI（构建 + 单元测试）与发版
 └── 3rd/EUI-NEO/            # 框架源码（bundled，含少量定制修改）
 ```
+
+### 架构：`main.cpp` 与 `core/`
+
+**`core/` 里只放纯逻辑**：没有 UI、没有全局状态、没有平台头文件。这条规则由 CI 强制检查（`core-purity` job），不是靠自觉。
+
+这样做有两个直接好处：
+
+1. **能写单元测试** —— 版本比较、更新包的 JSON/XML 解析、sha256 校验文件解析、原子写文件等，全部可以脱离界面验证；
+2. **能查出真 bug** —— 补测试的过程里立刻暴露了 3 个问题：`parseSize()` 会接受负数、`adbShortVersion()` 大小写敏感导致漏读真实 adb 输出、以及更新 sidecar 回退路径以前从未被验证过。
+
+运行测试：
+
+```bash
+cmake --build build --parallel
+cd build && ctest --output-on-failure
+# 或直接看每个用例： ./adbtools_tests.exe
+```
+
+新增代码时：纯逻辑放 `core/`（并补测试），界面相关放 `main.cpp`。判断标准很简单 —— **如果一个函数需要"应用上下文"才能工作，它还不适合进 core，先拆分**。
 
 ---
 
