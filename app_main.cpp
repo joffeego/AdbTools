@@ -32,30 +32,47 @@ int eui_app_run();
 
 namespace {
 
-// The executable is built for the WINDOWS subsystem (no console of its own), so
-// a CLI run started from a shell usually has nowhere to write: without this the
-// output is silently dropped and the user sees a program that "does nothing".
+// The executable is built for the WINDOWS subsystem, so it has no console of its
+// own and a CLI run has to make its output reach the caller. What stdout actually
+// is depends on how we were launched, and each case needs different handling:
 //
-// Two cases must be told apart, and getting this wrong breaks one of them:
+//   * a pipe or a disk file - the caller is capturing us (`... | findstr`,
+//     `> out.txt`, a parent reading our output). Usable as-is; re-pointing it at
+//     a console would STEAL the output from them.
+//   * a console handle we own - launched from a shell with nothing redirected.
+//     Usable as-is; attaching again opens a SECOND console handle and sends the
+//     output somewhere the waiting shell is not printing.
+//   * an unusable handle (null, or FILE_TYPE_UNKNOWN) - a GUI-subsystem process
+//     launched without a console inherits nothing useful. Attach to the parent's
+//     console and point the streams at it.
 //
-//   * stdout already redirected (a pipe or a file: `... | findstr`, `> out.txt`,
-//     or a parent capturing the process) - it is already usable, and re-pointing
-//     it at a console would STEAL the output from whoever is reading it.
-//   * stdout inherited from a GUI-subsystem parent, where it is invalid - only
-//     then does attaching to the parent console help.
+// "A console we own" is determined with GetConsoleMode: it succeeds only when the
+// handle refers to a console this process is attached to. A console handle
+// inherited from a parent that we are NOT attached to fails it, which is the case
+// that used to swallow output.
 //
-// std::cout also has to be re-synced afterwards: freopen rebinds the C stdio
-// streams, but the C++ streams keep their own buffer and stay pointed at the
-// handle the process started with.
+// std::cout must be re-synced after any redirect: freopen rebinds the C stdio
+// streams only, and the C++ streams keep their own buffer on the old handle.
 void attachParentConsole() {
     const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    bool usable = false;
     if (out != nullptr && out != INVALID_HANDLE_VALUE) {
         const DWORD type = GetFileType(out);
-        // A pipe or a disk file means someone is already reading us.
-        if (type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK) return;
+        if (type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK) {
+            usable = true;
+        } else if (type == FILE_TYPE_CHAR) {
+            DWORD mode = 0;
+            usable = (GetConsoleMode(out, &mode) != 0);
+        }
     }
+    if (usable) return;
 
-    if (AttachConsole(ATTACH_PARENT_PROCESS) == 0) return;
+    if (AttachConsole(ATTACH_PARENT_PROCESS) == 0) {
+        // No console to attach to (double-clicked from Explorer, or a GUI parent)
+        // and stdout is unusable. There is nothing to write to and nobody who
+        // could have read it; the exit code still works.
+        return;
+    }
 
     FILE* dummy = nullptr;
     freopen_s(&dummy, "CONOUT$", "w", stdout);

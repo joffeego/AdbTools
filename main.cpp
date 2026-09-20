@@ -18,6 +18,7 @@
 
 #include "core/adb.h"
 #include "core/adbpath.h"
+#include "core/batch.h"
 #include "core/fileio.h"
 #include "core/package.h"
 #include "core/paths.h"
@@ -470,30 +471,30 @@ void toast(const std::string& title, const std::string& message) {
 }
 
 // -----------------------------------------------------------------------------
-// Batch-operation summaries.
+// Batch-operation reporting
 //
-// Batch steps run one item at a time through the async queue. They used to give
-// up on the first failure: the items after it were silently skipped and the
-// toast named only one error, so the user could not tell what had actually
-// happened on the device. Now every item is attempted and the batch ends with a
-// single "succeeded N, failed M" report naming the first few failures.
+// The accounting itself (per-item outcome, totals, "was every item attempted")
+// lives in core/batch.cpp so the GUI and the CLI share one implementation and it
+// can be unit tested. These helpers only turn an outcome into app wording.
 // -----------------------------------------------------------------------------
-std::string batchSummary(const std::string& verb, std::size_t ok, const std::vector<std::string>& failures) {
-    if (failures.empty()) {
-        return verb + " " + std::to_string(ok) + " 项，全部成功。";
-    }
-    std::string msg = verb + " " + std::to_string(ok) + " 项，失败 " +
-                      std::to_string(failures.size()) + " 项。\n失败项：";
-    const std::size_t shown = failures.size() < 3 ? failures.size() : 3;
-    for (std::size_t i = 0; i < shown; ++i) {
-        if (i > 0) msg += "、";
-        msg += "\"" + core::shorten(failures[i], 28) + "\"";
-    }
-    if (failures.size() > shown) {
-        msg += " 等 " + std::to_string(failures.size()) + " 项";
-    }
-    return msg;
+using adb::core::BatchOutcome;
+
+std::string batchSummary(const std::string& verb, const BatchOutcome& outcome) {
+    return verb + "：" + outcome.text();
 }
+
+// A batch item is identified by its path on the device, but the label shown to
+// the user should be just the file name.
+BatchOutcome makeBatchOutcome(const std::vector<std::string>& names) {
+    std::vector<std::string> labels;
+    labels.reserve(names.size());
+    for (const std::string& name : names) {
+        std::filesystem::path p(name);
+        labels.push_back(p.filename().string().empty() ? name : p.filename().string());
+    }
+    return BatchOutcome(std::move(labels));
+}
+
 
 std::vector<std::string> selectedNames() {
     std::vector<std::string> names;
@@ -1353,25 +1354,23 @@ void openDeviceMenu(float x, float y) {
     state.deviceMenuY = y;
 }
 
-void pullBatchStep(std::vector<std::string> names, std::size_t index,
-                   std::size_t ok = 0, std::vector<std::string> failures = {});
+void pullBatchStep(std::vector<std::string> names, std::size_t index, BatchOutcome outcome);
 
 void doPull() {
     std::vector<std::string> names = selectedNames();
     if (names.empty() || state.selectedDevice.empty()) return;
     state.busy = true;
     state.progress = 0.0f;
-    pullBatchStep(names, 0);
+    pullBatchStep(names, 0, makeBatchOutcome(names));
 }
 
-void pullBatchStep(std::vector<std::string> names, std::size_t index,
-                   std::size_t ok, std::vector<std::string> failures) {
+void pullBatchStep(std::vector<std::string> names, std::size_t index, BatchOutcome outcome) {
     if (index >= names.size()) {
         state.busy = false;
         state.progress = 0.0f;
         state.progressLabel.clear();
-        toast(failures.empty() ? "下载完成" : "下载完成（有失败）",
-              batchSummary("已下载到 " + state.downloadDir + "：", ok, failures));
+        toast(outcome.toastTitle("下载完成"),
+              batchSummary("已下载到 " + state.downloadDir, outcome));
         return;
     }
     const std::string adb = state.adbPath;
@@ -1392,9 +1391,9 @@ void pullBatchStep(std::vector<std::string> names, std::size_t index,
             }
             return app::async::success();
         },
-        [names, index, ok, failures](const app::async::Result<void>& result) mutable {
-            if (!result.ok) failures.push_back(names[index]);
-            pullBatchStep(names, index + 1, result.ok ? ok + 1 : ok, failures);
+        [names, index, outcome](const app::async::Result<void>& result) mutable {
+            outcome.record(index, result.ok, result.error);
+            pullBatchStep(names, index + 1, std::move(outcome));
         });
 }
 
@@ -1432,23 +1431,21 @@ void doPush() {
         });
 }
 
-void pushBatchStep(std::vector<std::string> files, std::size_t index,
-                   std::size_t ok = 0, std::vector<std::string> failures = {});
+void pushBatchStep(std::vector<std::string> files, std::size_t index, BatchOutcome outcome);
 
 void pushFiles(const std::vector<std::string>& files) {
     if (files.empty() || state.selectedDevice.empty()) return;
     state.busy = true;
     state.progress = 0.0f;
-    pushBatchStep(files, 0);
+    pushBatchStep(files, 0, makeBatchOutcome(files));
 }
 
-void pushBatchStep(std::vector<std::string> files, std::size_t index,
-                   std::size_t ok, std::vector<std::string> failures) {
+void pushBatchStep(std::vector<std::string> files, std::size_t index, BatchOutcome outcome) {
     if (index >= files.size()) {
         state.busy = false;
         state.progress = 0.0f;
         state.progressLabel.clear();
-        toast(failures.empty() ? "上传完成" : "上传完成（有失败）", batchSummary("已上传", ok, failures));
+        toast(outcome.toastTitle("上传完成"), batchSummary("已上传", outcome));
         refreshListing(true);
         return;
     }
@@ -1467,14 +1464,13 @@ void pushBatchStep(std::vector<std::string> files, std::size_t index,
             }
             return app::async::success();
         },
-        [files, index, ok, failures](const app::async::Result<void>& result) mutable {
-            if (!result.ok) failures.push_back(files[index]);
-            pushBatchStep(files, index + 1, result.ok ? ok + 1 : ok, failures);
+        [files, index, outcome](const app::async::Result<void>& result) mutable {
+            outcome.record(index, result.ok, result.error);
+            pushBatchStep(files, index + 1, std::move(outcome));
         });
 }
 
-void deleteBatchStep(std::vector<std::string> names, std::size_t index,
-                     std::size_t ok = 0, std::vector<std::string> failures = {});
+void deleteBatchStep(std::vector<std::string> names, std::size_t index, BatchOutcome outcome);
 void doDeleteConfirmed();
 
 // Generic confirm dialog helper: shows title/message with a primary button that
@@ -1506,16 +1502,15 @@ void doDeleteConfirmed() {
     if (names.empty() || state.selectedDevice.empty()) return;
     state.busy = true;
     state.progress = 0.0f;
-    deleteBatchStep(names, 0);
+    deleteBatchStep(names, 0, makeBatchOutcome(names));
 }
 
-void deleteBatchStep(std::vector<std::string> names, std::size_t index,
-                     std::size_t ok, std::vector<std::string> failures) {
+void deleteBatchStep(std::vector<std::string> names, std::size_t index, BatchOutcome outcome) {
     if (index >= names.size()) {
         state.busy = false;
         state.progress = 0.0f;
         state.progressLabel.clear();
-        toast(failures.empty() ? "删除完成" : "删除完成（有失败）", batchSummary("已删除", ok, failures));
+        toast(outcome.toastTitle("删除完成"), batchSummary("已删除", outcome));
         refreshListing(true);
         return;
     }
@@ -1534,9 +1529,9 @@ void deleteBatchStep(std::vector<std::string> names, std::size_t index,
             }
             return app::async::success();
         },
-        [names, index, ok, failures](const app::async::Result<void>& result) mutable {
-            if (!result.ok) failures.push_back(names[index]);
-            deleteBatchStep(names, index + 1, result.ok ? ok + 1 : ok, failures);
+        [names, index, outcome](const app::async::Result<void>& result) mutable {
+            outcome.record(index, result.ok, result.error);
+            deleteBatchStep(names, index + 1, std::move(outcome));
         });
 }
 

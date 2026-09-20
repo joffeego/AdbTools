@@ -45,6 +45,7 @@ file-system helpers, all inside one anonymous namespace. Two consequences:
 | `sha256.h/.cpp` | sha256sum-sidecar parsing, file hashing (CNG) |
 | `fileio.h/.cpp` | `writeFileAtomic` |
 | `adb.h/.cpp` | device/listing model, `adb` output parsers, every adb command line |
+| `batch.h/.cpp` | batch accounting: per-item outcome, totals, "was every item attempted", summary and JSON |
 | `store.h/.cpp` | on-disk text formats: settings, bookmarks, quick commands, recent paths |
 | `process.h/.cpp` | `runProcess` — the one place a child process is started (GUI + CLI) |
 | `adbpath.h/.cpp` | locating this executable and the adb it should drive |
@@ -97,14 +98,13 @@ permanently:
 
 ## Next steps
 
-The remaining pure logic that is still in `main.cpp` and worth moving:
+The remaining pure logic that is still in `main.cpp`:
 
-- The batch step drivers (`pullBatchStep` / `pushBatchStep` / `deleteBatchStep`)
-  currently mix "what to do for one item" with the async restart plumbing. Pulling
-  out the per-item decision (which item, what counts as success, how the summary
-  is worded) would make the batching testable — the last time it was changed it
-  needed a temporary self-test hook injected into a build-only copy of `main.cpp`
-  to verify against a device.
+- The update download layer (WinHTTP) sits next to the GUI code; the verification
+  half is already here in `sha256.h`.
+- `logcat` filtering has its regex isolated in `regex_wrap.cpp`, but the line
+  filtering itself lives in the GUI's streaming loop.
 
-Once that exists, both a CLI and an end-to-end test driver become thin layers on
-top instead of new copies of the logic.
+With `core/adb`, `core/batch` and the CLI in place, a new command is now a thin
+function in `cli/cli.cpp` rather than a new copy of the logic - and the device
+end-to-end tests (`tests/device_tests.ps1`) can assert it against a real phone.

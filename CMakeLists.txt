@@ -25,6 +25,7 @@ set(EUI_ENABLE_TRAY OFF CACHE BOOL "" FORCE)
 # -----------------------------------------------------------------------------
 set(ADBTOOLS_CORE_SOURCES
     core/adb.cpp
+    core/batch.cpp
     core/adbpath.cpp
     core/fileio.cpp
     core/package.cpp
@@ -135,6 +136,7 @@ if(ADBTOOLS_BUILD_TESTS)
         ${ADBTOOLS_CORE_SOURCES}
         tests/test_main.cpp
         tests/test_adb.cpp
+        tests/test_batch.cpp
         tests/test_fileio.cpp
         tests/test_package.cpp
         tests/test_paths.cpp
