@@ -234,30 +234,84 @@ ADB_TEST(command_builders_quote_device_paths) {
 }
 
 ADB_TEST(command_builders_shape) {
+    // Each builder is assigned to a named vector and its size asserted before
+    // any index is touched: indexing a temporary's element directly is what made
+    // an earlier version of this test able to crash instead of reporting a
+    // failure (it took down the whole run on CI, where the assert fired as
+    // std::bad_alloc with no indication of which case it was).
     const std::vector<std::string> pull = pullArgs("S1", "/sdcard/a.txt", "C:\\out");
     ADB_CHECK_EQ(pull.size(), static_cast<std::size_t>(5));
-    ADB_CHECK_EQ(pull[0], std::string("-s"));
-    ADB_CHECK_EQ(pull[1], std::string("S1"));
-    ADB_CHECK_EQ(pull[2], std::string("pull"));
-    ADB_CHECK_EQ(pull[3], std::string("/sdcard/a.txt"));
-    // Local paths are NOT shell-quoted: they go through CreateProcess as
-    // separate argv entries via runProcess, which quotes them itself.
-    ADB_CHECK_EQ(pull[4], std::string("C:\\out"));
+    if (pull.size() == 5) {
+        ADB_CHECK_EQ(pull[0], std::string("-s"));
+        ADB_CHECK_EQ(pull[1], std::string("S1"));
+        ADB_CHECK_EQ(pull[2], std::string("pull"));
+        ADB_CHECK_EQ(pull[3], std::string("/sdcard/a.txt"));
+        // Local paths are NOT shell-quoted: they go through CreateProcess as
+        // separate argv entries via runProcess, which quotes them itself.
+        ADB_CHECK_EQ(pull[4], std::string("C:\\out"));
+    }
 
     const std::vector<std::string> push = pushArgs("S1", "C:\\my file.apk", "/sdcard/My Dir");
     ADB_CHECK_EQ(push.size(), static_cast<std::size_t>(5));
-    ADB_CHECK_EQ(push[2], std::string("push"));
-    ADB_CHECK_EQ(push[3], std::string("C:\\my file.apk"));
-    // The remote side is a directory argument, not a shell snippet: adb quotes
-    // it itself, so it must not arrive pre-quoted.
-    ADB_CHECK_EQ(push[4], std::string("/sdcard/My Dir"));
+    if (push.size() == 5) {
+        ADB_CHECK_EQ(push[2], std::string("push"));
+        ADB_CHECK_EQ(push[3], std::string("C:\\my file.apk"));
+        // The remote side is a directory argument, not a shell snippet: adb
+        // quotes it itself, so it must not arrive pre-quoted.
+        ADB_CHECK_EQ(push[4], std::string("/sdcard/My Dir"));
+    }
 
-    ADB_CHECK_EQ(installApkArgs("S1", "C:\\a.apk")[3], std::string("-r"));    ADB_CHECK_EQ(uninstallArgs("S1", "com.x")[2], std::string("uninstall"));
-    ADB_CHECK_EQ(clearAppDataArgs("S1", "com.x").size(), static_cast<std::size_t>(6));
-    ADB_CHECK_EQ(screencapArgs("S1")[2], std::string("exec-out"));
-    ADB_CHECK_EQ(logcatClearArgs("S1")[3], std::string("-c"));
-    ADB_CHECK_EQ(connectArgs("192.168.1.5:5555")[0], std::string("connect"));
-    ADB_CHECK_EQ(killServerArgs()[0], std::string("kill-server"));
+    const std::vector<std::string> install = installApkArgs("S1", "C:\\a.apk");
+    ADB_CHECK_EQ(install.size(), static_cast<std::size_t>(5));
+    if (install.size() == 5) {
+        ADB_CHECK_EQ(install[2], std::string("install"));
+        ADB_CHECK_EQ(install[3], std::string("-r"));
+        ADB_CHECK_EQ(install[4], std::string("C:\\a.apk"));
+    }
+
+    const std::vector<std::string> uninstall = uninstallArgs("S1", "com.x");
+    ADB_CHECK_EQ(uninstall.size(), static_cast<std::size_t>(4));
+    if (uninstall.size() == 4) {
+        ADB_CHECK_EQ(uninstall[2], std::string("uninstall"));
+        ADB_CHECK_EQ(uninstall[3], std::string("com.x"));
+    }
+
+    const std::vector<std::string> clear = clearAppDataArgs("S1", "com.x");
+    ADB_CHECK_EQ(clear.size(), static_cast<std::size_t>(6));
+    if (clear.size() == 6) {
+        ADB_CHECK_EQ(clear[2], std::string("shell"));
+        ADB_CHECK_EQ(clear[3], std::string("pm"));
+        ADB_CHECK_EQ(clear[4], std::string("clear"));
+        ADB_CHECK_EQ(clear[5], std::string("com.x"));
+    }
+
+    const std::vector<std::string> screencap = screencapArgs("S1");
+    ADB_CHECK_EQ(screencap.size(), static_cast<std::size_t>(5));
+    if (screencap.size() == 5) {
+        ADB_CHECK_EQ(screencap[2], std::string("exec-out"));
+        ADB_CHECK_EQ(screencap[3], std::string("screencap"));
+        ADB_CHECK_EQ(screencap[4], std::string("-p"));
+    }
+
+    const std::vector<std::string> logcatClear = logcatClearArgs("S1");
+    ADB_CHECK_EQ(logcatClear.size(), static_cast<std::size_t>(4));
+    if (logcatClear.size() == 4) {
+        ADB_CHECK_EQ(logcatClear[2], std::string("logcat"));
+        ADB_CHECK_EQ(logcatClear[3], std::string("-c"));
+    }
+
+    const std::vector<std::string> connect = connectArgs("192.168.1.5:5555");
+    ADB_CHECK_EQ(connect.size(), static_cast<std::size_t>(2));
+    if (connect.size() == 2) {
+        ADB_CHECK_EQ(connect[0], std::string("connect"));
+        ADB_CHECK_EQ(connect[1], std::string("192.168.1.5:5555"));
+    }
+
+    const std::vector<std::string> kill = killServerArgs();
+    ADB_CHECK_EQ(kill.size(), static_cast<std::size_t>(1));
+    if (kill.size() == 1) {
+        ADB_CHECK_EQ(kill[0], std::string("kill-server"));
+    }
 }
 
 ADB_TEST(devicesArgs_requests_long_format) {
