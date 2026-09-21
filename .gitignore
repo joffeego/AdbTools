@@ -1,5 +1,8 @@
 # ---- Build output ----
 /build/
+# Any out-of-tree build directory. A bare "/build/" misses build-dbg, build-sym,
+# build-relg, ... which is how a scratch build once ended up staged for commit.
+/build*/
 /dist/
 cmake-build-*/
 

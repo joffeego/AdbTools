@@ -107,3 +107,84 @@ ADB_TEST(writeFileAtomic_empty_content_truncates) {
     ADB_CHECK_EQ(readAll(target), std::string(""));
     ADB_CHECK(fs::exists(target));
 }
+
+// -----------------------------------------------------------------------------
+// isRegularFileNoThrow
+//
+// This exists because scanning PATH with std::filesystem aborted the GUI: a PATH
+// entry with non-ASCII characters holds ANSI bytes (GBK on a Chinese Windows),
+// libstdc++ builds a std::filesystem::path from narrow strings as UTF-8, and the
+// conversion error that produces is fatal in a translation unit compiled with
+// -fno-exceptions. These cases pin down the "must never throw" contract.
+// -----------------------------------------------------------------------------
+
+ADB_TEST(isRegularFileNoThrow_true_for_a_regular_file) {
+    TempDir dir("adbtools-test-isfile-yes");
+    const std::string target = dir.file("scrcpy.exe");
+    ADB_CHECK(writeFileAtomic(target, "x"));
+    ADB_CHECK(isRegularFileNoThrow(target));
+}
+
+ADB_TEST(isRegularFileNoThrow_false_for_a_directory) {
+    TempDir dir("adbtools-test-isfile-dir");
+    // The candidate list contains "<dir>/scrcpy", which names a *directory* when
+    // scrcpy is unpacked; treating that as the executable made scrcpy fail to
+    // launch with a confusing error.
+    ADB_CHECK(!isRegularFileNoThrow(dir.path.string()));
+    ADB_CHECK(!isRegularFileNoThrow("."));
+}
+
+ADB_TEST(isRegularFileNoThrow_false_for_missing_and_empty) {
+    TempDir dir("adbtools-test-isfile-missing");
+    ADB_CHECK(!isRegularFileNoThrow(dir.file("no-such-file.exe")));
+    ADB_CHECK(!isRegularFileNoThrow(""));
+}
+
+ADB_TEST(isRegularFileNoThrow_survives_a_non_utf8_path) {
+    // GBK bytes for a real directory name, exactly as they appear in the process
+    // environment on a Chinese Windows. Constructing a std::filesystem::path from
+    // this string throws, which is what aborted the app; the helper must simply
+    // report "not a file".
+    const std::string gbk =
+        "C:\\Program Files (x86)\\Tencent\\\xCE\xA2\xD0\xC5web\xB0\xB2\xC8\xAB\xB9\xDC\xBC\xD2\\scrcpy.exe";
+    bool threw = false;
+    try {
+        (void)isRegularFileNoThrow(gbk);
+    } catch (...) {
+        threw = true;
+    }
+    ADB_CHECK(!threw);
+    ADB_CHECK(!isRegularFileNoThrow(gbk));
+}
+
+ADB_TEST(isRegularFileNoThrow_survives_embedded_nul_and_junk) {
+    // Environment entries are attacker-adjacent input as far as this code is
+    // concerned: whatever PATH contains must not be able to kill the process.
+    std::string odd = "C:\\temp\\x";
+    odd.push_back('\0');
+    odd += "y\\scrcpy.exe";
+    bool threw = false;
+    try {
+        (void)isRegularFileNoThrow(odd);
+        (void)isRegularFileNoThrow(std::string("\xFF\xFE\xFD"));
+        (void)isRegularFileNoThrow(std::string(4096, 'A'));
+    } catch (...) {
+        threw = true;
+    }
+    ADB_CHECK(!threw);
+}
+
+ADB_TEST(writeFileAtomic_survives_a_non_utf8_path) {
+    // The same hazard applies to the settings/bookmark/command writers: they are
+    // called from the GUI's -fno-exceptions code, so a throw here aborts the app
+    // rather than failing the write.
+    bool threw = false;
+    bool ok = true;
+    try {
+        ok = writeFileAtomic("C:\\\xCE\xA2\xD0\xC5\\settings.txt", "x=1\n");
+    } catch (...) {
+        threw = true;
+    }
+    ADB_CHECK(!threw);
+    ADB_CHECK(!ok);  // the directory does not exist, so this must fail cleanly
+}

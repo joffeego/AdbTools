@@ -2084,11 +2084,17 @@ std::string findScrcpy() {
         }
     }
     for (const std::string& candidate : candidates) {
-        std::error_code ec;
-        // is_regular_file, not exists(): the "C:\dir/scrcpy" candidate also
-        // names the scrcpy *directory*, so exists() would happily return that
-        // directory and scrcpy would then fail to launch with a confusing error.
-        if (std::filesystem::is_regular_file(candidate, ec) && !ec) return candidate;
+        // is_regular_file semantics, not exists(): the "C:\dir/scrcpy" candidate
+        // also names the scrcpy *directory*, so a plain existence check would
+        // return that directory and scrcpy would then fail to launch with a
+        // confusing error.
+        //
+        // core::isRegularFileNoThrow rather than std::filesystem directly: the
+        // candidates include every PATH entry, and on a non-UTF-8 locale a PATH
+        // entry with non-ASCII characters holds ANSI bytes, so constructing a
+        // std::filesystem::path from it throws - and this file is compiled with
+        // -fno-exceptions, where that throw becomes an abort.
+        if (core::isRegularFileNoThrow(candidate)) return candidate;
     }
     return "";
 }

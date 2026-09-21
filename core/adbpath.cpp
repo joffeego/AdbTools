@@ -4,6 +4,7 @@
 #include <filesystem>
 
 #include "core/process.h"
+#include "core/fileio.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -77,8 +78,13 @@ std::string findAdb() {
     }
 
     for (const std::string& candidate : candidates) {
-        std::error_code ec;
-        if (std::filesystem::exists(candidate, ec) && !ec) return candidate;
+        // Never std::filesystem directly here: the candidates include every PATH
+        // entry, and a PATH entry with non-ASCII characters holds ANSI bytes (not
+        // UTF-8) on a non-UTF-8 locale, which makes path construction throw. This
+        // file is built with exceptions, but the caller is not - and an escaping
+        // throw there aborts the process (that is how scanning PATH crashed the
+        // GUI on startup). See core/fileio.h.
+        if (isRegularFileNoThrow(candidate)) return candidate;
     }
     return "";
 }

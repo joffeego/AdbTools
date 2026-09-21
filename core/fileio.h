@@ -20,4 +20,27 @@ namespace adb::core {
 // running with their in-memory state either way.
 bool writeFileAtomic(const std::string& path, const std::string& contents);
 
+// True when `path` names an existing regular file. Never throws.
+//
+// This exists because the obvious spelling is a landmine on Windows:
+//
+//     std::filesystem::is_regular_file(candidate, ec)   // still throws!
+//
+// The std::string -> std::filesystem::path conversion happens *before* the call,
+// and libstdc++ converts narrow strings as UTF-8. A PATH entry holding non-ASCII
+// characters does not contain UTF-8 on a Chinese Windows - the environment block
+// is in the ANSI code page (GBK) - so the conversion raises
+// filesystem_error("Cannot convert character sequence: Illegal byte sequence").
+// The error_code overload cannot help, because the argument is built first.
+//
+// That matters because the GUI is compiled with -fno-exceptions: an escaping
+// throw becomes std::terminate -> abort(). Scanning PATH with std::filesystem
+// therefore aborted the app whenever a non-ASCII PATH entry was reached - which
+// is a very common PATH on Windows in this locale.
+//
+// This helper converts through the Win32 wide API instead (trying UTF-8, then
+// the ANSI code page, which is what the environment actually uses), so a
+// mismatched entry simply reports "not found" rather than killing the process.
+bool isRegularFileNoThrow(const std::string& path);
+
 }  // namespace adb::core
