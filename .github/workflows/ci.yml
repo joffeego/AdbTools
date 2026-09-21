@@ -95,21 +95,23 @@ jobs:
             status=1
           fi
 
-          # Three files are allowed a platform header, each for a documented
+          # Four files are allowed a platform header, each for a documented
           # reason: sha256 (CNG hashing), process (CreateProcess/pipes), adbpath
-          # (GetModuleFileNameW). Everything else must be portable, and each of
-          # the three must guard its include with #ifdef _WIN32 so core/ still
-          # builds on the Linux job.
-          allowed='^(core/sha256\.cpp|core/process\.cpp|core/adbpath\.cpp):'
+          # (GetModuleFileNameW) and fileio (GetFileAttributesW, used to answer
+          # "is this a regular file?" without constructing a std::filesystem::path
+          # - see core/fileio.h for why that matters). Everything else must be
+          # portable, and each of the four must guard its include with
+          # #ifdef _WIN32 so core/ still builds on the Linux job.
+          allowed='^(core/sha256\.cpp|core/process\.cpp|core/adbpath\.cpp|core/fileio\.cpp):'
           offenders=$(grep -rn --include='*.cpp' --include='*.h' '#include <windows.h>' core/ \
                         | grep -vE "$allowed" || true)
           if [ -n "$offenders" ]; then
-            echo "::error::only sha256.cpp, process.cpp and adbpath.cpp may include <windows.h>"
+            echo "::error::only sha256.cpp, process.cpp, adbpath.cpp and fileio.cpp may include <windows.h>"
             echo "$offenders"
             status=1
           fi
 
-          for f in core/sha256.cpp core/process.cpp core/adbpath.cpp; do
+          for f in core/sha256.cpp core/process.cpp core/adbpath.cpp core/fileio.cpp; do
             if ! grep -q '#ifdef _WIN32' "$f"; then
               echo "::error::$f must guard its Windows include with #ifdef _WIN32"
               status=1
