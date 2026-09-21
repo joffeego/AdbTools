@@ -344,6 +344,14 @@ struct AppState {
     bool updateWorking = false;
     std::string updateStatus;
 
+    // First-run setup. adb and scrcpy no longer ship with the installer (see
+    // g_pendingAdbInstall), so the app offers to fetch whichever is missing the
+    // first time it starts - otherwise a fresh install silently cannot reach a
+    // device until the user finds "check for updates" on their own.
+    bool setupOpen = false;
+    bool setupDontAsk = false;         // the checkbox, as currently ticked
+    bool setupPromptDismissed = false; // persisted: never show the dialog again
+
     // Generic confirm dialog (title/message + primary action).
     std::string confirmPrimaryText = "删除";
     std::function<void()> confirmAction;
@@ -376,37 +384,58 @@ struct UpdateInfo {
 
 UpdateInfo g_update;
 
+// which component a download request refers to.
+enum class PendingInstall { adb, scrcpy };
+
 // The release packages deliberately ship no third-party binaries (bundled
 // adb.exe / scrcpy.exe are what antivirus products flag, taking our exe down
 // with them), so adb and scrcpy are fetched on demand instead. A download can be
-// requested from outside the update dialog - the "no adb installed" empty state
-// and the mirroring button - where the download URL may not be known yet,
-// because it comes from the update check. Remember the request so the check's
-// completion handler starts the download, rather than making the user click
-// twice.
-enum class PendingInstall { none, adb, scrcpy };
-PendingInstall g_pendingInstall = PendingInstall::none;
+// requested from outside the update dialog - the first-run setup dialog, the
+// "no adb installed" empty state, the mirroring button - where the download URL
+// may not be known yet, because it comes from the update check.
+//
+// One request can cover both components (the setup dialog's "download
+// everything"), and the two downloads cannot run at the same time, so this is a
+// queue: a request that cannot start yet is remembered, and whichever handler
+// finishes next starts the remaining one.
+bool g_pendingAdbInstall = false;
+bool g_pendingScrcpyInstall = false;
 
 void toast(const std::string& title, const std::string& message);
 void checkForUpdates();
 void startUpdateAdb();
 void startUpdateScrcpy();
 
-// Starts the download for `what`, fetching the version information first when it
-// is not known yet. Returns true when the caller should start the install now;
-// false when a check was kicked off instead (or nothing could be started), in
-// which case the user has already been told what is happening.
-bool ensureToolsDownloadable(PendingInstall what) {
-    if (state.updateWorking || state.updateChecking) {
-        toast("请稍候", "已有下载或检查正在进行，请等它结束后重试。");
-        return false;
+// Starts the next queued install whose download URL is known. Returns true when
+// one was started.
+bool advanceInstallQueue() {
+    if (state.updateWorking || state.updateChecking) return false;
+    if (g_pendingAdbInstall && !g_update.adbUrl.empty() && !g_update.adbLatest.empty()) {
+        g_pendingAdbInstall = false;
+        startUpdateAdb();
+        return true;
     }
-    const bool haveUrl = (what == PendingInstall::adb)
-                             ? (!g_update.adbUrl.empty() && !g_update.adbLatest.empty())
-                             : (!g_update.scrcpyUrl.empty() && !g_update.scrcpyLatest.empty());
-    if (haveUrl) return true;
-    g_pendingInstall = what;
-    checkForUpdates();
+    if (g_pendingScrcpyInstall && !g_update.scrcpyUrl.empty() && !g_update.scrcpyLatest.empty()) {
+        g_pendingScrcpyInstall = false;
+        startUpdateScrcpy();
+        return true;
+    }
+    return false;
+}
+
+// Requests the download for `what`, fetching the version information first when
+// the URL is not known yet. Returns true when the install has started; false
+// means "not yet" - either a check or the other component's download is running
+// and will pick this up, or nothing could be started at all.
+bool ensureToolsDownloadable(PendingInstall what) {
+    if (what == PendingInstall::adb) {
+        g_pendingAdbInstall = true;
+    } else {
+        g_pendingScrcpyInstall = true;
+    }
+    if (advanceInstallQueue()) return true;
+    if (state.updateWorking) return false;  // the running install will chain to us
+    if (!state.updateChecking) checkForUpdates();
     return false;
 }
 
@@ -584,6 +613,7 @@ void saveSettings() {
         {"mirrorH", std::to_string(settings.mirrorH)},
         {"windowW", std::to_string(settings.windowW)},
         {"windowH", std::to_string(settings.windowH)},
+        {"setupPromptDismissed", state.setupPromptDismissed ? "1" : "0"},
     };
     core::writeFileAtomic(settingsFilePath(), core::serializeKeyValues(values));
 }
@@ -843,6 +873,7 @@ void loadSettings() {
         else if (key == "mirrorH") settings.mirrorH = std::atoi(value.c_str());
         else if (key == "windowW") settings.windowW = std::atoi(value.c_str());
         else if (key == "windowH") settings.windowH = std::atoi(value.c_str());
+        else if (key == "setupPromptDismissed") state.setupPromptDismissed = (std::atoi(value.c_str()) != 0);
     }
 #ifdef _WIN32
     settings.fontFile = resolveFontFileForFamily(settings.fontFamily, settings.fontWeight);
@@ -2309,11 +2340,10 @@ void openMirror() {
     }
     const std::string scrcpy = findScrcpy();
     if (scrcpy.empty()) {
-        // scrcpy is not shipped with the app any more (see PendingInstall), so
-        // fetch it instead of telling the user to install it by hand.
+        // scrcpy is not shipped with the app any more (see g_pendingScrcpyInstall),
+        // so fetch it instead of telling the user to install it by hand.
         if (ensureToolsDownloadable(PendingInstall::scrcpy)) {
             toast("未找到 scrcpy", "正在下载 scrcpy…下载完成后请重新点击投屏。");
-            startUpdateScrcpy();
         } else {
             toast("未找到 scrcpy", "正在获取下载地址，拿到后会自动开始下载，请稍后再点投屏。");
         }
@@ -2981,21 +3011,15 @@ void checkForUpdates() {
                 return;
             }
             g_update = result.value;
-            // A download requested from the "no adb installed" state or the
-            // mirroring button could not start until this check produced a URL.
-            if (g_pendingInstall != PendingInstall::none) {
-                const PendingInstall pending = g_pendingInstall;
-                g_pendingInstall = PendingInstall::none;
-                const bool haveUrl = (pending == PendingInstall::adb)
-                                         ? (!g_update.adbUrl.empty() && !g_update.adbLatest.empty())
-                                         : (!g_update.scrcpyUrl.empty() && !g_update.scrcpyLatest.empty());
-                if (!haveUrl) {
+            // An install requested before this check ran (the setup dialog, the
+            // "no adb installed" state, the mirroring button) could only get its
+            // download URL now.
+            if (g_pendingAdbInstall || g_pendingScrcpyInstall) {
+                if (!advanceInstallQueue()) {
+                    g_pendingAdbInstall = false;
+                    g_pendingScrcpyInstall = false;
                     state.updateStatus = "未能获取下载地址，请检查网络后重试。";
                     toast("下载失败", state.updateStatus);
-                } else if (pending == PendingInstall::adb) {
-                    startUpdateAdb();
-                } else {
-                    startUpdateScrcpy();
                 }
                 return;
             }
@@ -3050,6 +3074,9 @@ void startUpdateScrcpy() {
                 state.updateStatus = result.error;
                 toast("更新失败", result.error);
             }
+            // Nothing else is normally queued behind scrcpy, but keep the queue
+            // draining in one place so a failure mid-chain cannot strand it.
+            advanceInstallQueue();
         });
 #else
     state.updateWorking = false;
@@ -3093,6 +3120,8 @@ void startUpdateAdb() {
                 state.updateStatus = result.error;
                 toast("更新失败", result.error);
             }
+            // "Download everything" still owes scrcpy, if it is missing.
+            advanceInstallQueue();
         });
 #else
     state.updateWorking = false;
@@ -3657,7 +3686,6 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
                    0xF019, "下载并安装 adb", true, true, [] {
                        if (ensureToolsDownloadable(PendingInstall::adb)) {
                            toast("正在下载 adb", "下载完成后会自动放到程序目录并启用。");
-                           startUpdateAdb();
                        } else {
                            toast("正在获取下载地址", "拿到地址后会自动开始下载 adb，请稍候。");
                        }
@@ -5154,6 +5182,193 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
         .build();
 }
 
+// -----------------------------------------------------------------------------
+// First-run setup.
+//
+// adb and scrcpy are deliberately not shipped with the app (unsigned third-party
+// binaries inside the archive are what got the whole download flagged by
+// antivirus), and the app is useless without adb, so a fresh install has to say
+// so instead of leaving the user to discover "check for updates" on their own.
+//
+// Shown once at startup when either component is missing, and never again once
+// the user ticks "do not show this again".
+// -----------------------------------------------------------------------------
+void closeSetupDialog() {
+    state.setupOpen = false;
+    if (state.setupDontAsk != state.setupPromptDismissed) {
+        state.setupPromptDismissed = state.setupDontAsk;
+        saveSettings();
+    }
+}
+
+// The row status: whether the component is usable, and its version when known.
+std::string toolRowStatus(bool present, const std::string& version, const std::string& ready) {
+    if (!present) return "未安装";
+    if (version.empty()) return ready;
+    return ready + "（" + version + "）";
+}
+
+void composeSetupDialog(eui::Ui& ui, float w, float h) {
+    // The dialog asks for a network download, so it must not claim to work when
+    // the check has not returned yet: the buttons stay disabled until the URLs
+    // (and versions) are known.
+    const bool adbPresent = state.adbFound;
+    const std::string adbVersion = g_update.adbCurrent.empty() ? state.adbVersion : g_update.adbCurrent;
+    const bool scrcpyPresent = !findScrcpy().empty();
+    const std::string scrcpyVersion = g_update.scrcpyCurrent;
+
+    const bool adbDownloadable = !adbPresent && !g_update.adbUrl.empty() && !g_update.adbLatest.empty();
+    const bool scrcpyDownloadable = !scrcpyPresent && !g_update.scrcpyUrl.empty() && !g_update.scrcpyLatest.empty();
+    const bool anyMissing = !adbPresent || !scrcpyPresent;
+    const bool busy = state.updateChecking || state.updateWorking;
+
+    const float pw = std::min(560.0f, std::max(360.0f, w - 48.0f));
+    const float ph = 372.0f;
+    const float rowX = 24.0f;
+    const float rowW = pw - 48.0f;
+    const float btnW = 132.0f;
+
+    components::dialog(ui, "setup.dialog")
+        .screen(w, h)
+        .open(state.setupOpen)
+        .theme(themeTokens())
+        .size(pw, ph)
+        .zIndex(1400)
+        .content([&] {
+            ui.text("setup.title")
+                .x(rowX).y(16.0f).size(pw - 48.0f, 30.0f)
+                .text("首次使用设置")
+                .fontSize(19.0f).lineHeight(19.0f)
+                .color(kInk)
+                .build();
+            ui.text("setup.intro")
+                .x(rowX).y(50.0f).size(rowW, 44.0f)
+                .text("adb 和 scrcpy 不再随安装包提供（无签名的第三方程序容易被杀毒软件误报）。"
+                      "可以在这里一键下载，程序会校验官方公布的校验值。")
+                .fontSize(12.5f).lineHeight(16.0f)
+                .color(kMuted)
+                .wrap(true).maxWidth(rowW)
+                .build();
+
+            // --- adb ---
+            ui.text("setup.adb.title")
+                .x(rowX).y(106.0f).size(200.0f, 24.0f)
+                .text("adb（Android 调试桥）")
+                .fontSize(15.0f).lineHeight(15.0f)
+                .color(kInk)
+                .build();
+            ui.text("setup.adb.state")
+                .x(rowX).y(130.0f).size(rowW - btnW - 16.0f, 20.0f)
+                .text(adbPresent ? toolRowStatus(true, adbVersion, "已就绪，可以连接手机了")
+                                 : (g_update.adbLatest.empty() ? "未安装（正在获取版本信息…）"
+                                                               : "未安装，最新版 " + g_update.adbLatest))
+                .fontSize(12.5f).lineHeight(12.5f)
+                .color(adbPresent ? kMuted : kAccent)
+                .build();
+            toolButton(ui, "setup.adb.btn", rowX + rowW - btnW, 120.0f, btnW, 36.0f,
+                       0xF019, adbPresent ? "已安装" : (adbDownloadable ? "下载并安装" : "获取中…"),
+                       !adbPresent, adbDownloadable && !busy, [] {
+                           if (ensureToolsDownloadable(PendingInstall::adb)) {
+                               toast("正在下载 adb", "下载完成后会自动放到程序目录并启用。");
+                           }
+                       });
+
+            // --- scrcpy ---
+            ui.text("setup.scrcpy.title")
+                .x(rowX).y(182.0f).size(200.0f, 24.0f)
+                .text("scrcpy（投屏）")
+                .fontSize(15.0f).lineHeight(15.0f)
+                .color(kInk)
+                .build();
+            ui.text("setup.scrcpy.state")
+                .x(rowX).y(206.0f).size(rowW - btnW - 16.0f, 20.0f)
+                .text(scrcpyPresent ? toolRowStatus(true, scrcpyVersion, "已就绪，可以投屏了")
+                                    : (g_update.scrcpyLatest.empty() ? "未安装（正在获取版本信息…）"
+                                                                     : "未安装，最新版 " + g_update.scrcpyLatest))
+                .fontSize(12.5f).lineHeight(12.5f)
+                .color(scrcpyPresent ? kMuted : kAccent)
+                .build();
+            toolButton(ui, "setup.scrcpy.btn", rowX + rowW - btnW, 196.0f, btnW, 36.0f,
+                       0xF019, scrcpyPresent ? "已安装" : (scrcpyDownloadable ? "下载并安装" : "获取中…"),
+                       !scrcpyPresent, scrcpyDownloadable && !busy, [] {
+                           if (ensureToolsDownloadable(PendingInstall::scrcpy)) {
+                               toast("正在下载 scrcpy", "下载完成后即可在工具栏点「投屏」。");
+                           }
+                       });
+
+            ui.text("setup.note")
+                .x(rowX).y(248.0f).size(rowW, 16.0f)
+                .text("也可以点「稍后再说」，之后在标题栏最左侧的更新按钮里单独安装。")
+                .fontSize(11.5f).lineHeight(11.5f)
+                .color(kMuted)
+                .build();
+
+            // --- bottom: install everything / dismiss + do-not-ask ---
+            toolButton(ui, "setup.all", rowX, 274.0f, 150.0f, 36.0f,
+                       0xF019, anyMissing ? "全部下载" : "都装好了",
+                       true, anyMissing && !busy, [] {
+                           const bool needAdb = !state.adbFound;
+                           const bool needScrcpy = findScrcpy().empty();
+                           if (!needAdb && !needScrcpy) return;
+                           g_pendingAdbInstall = needAdb;
+                           g_pendingScrcpyInstall = needScrcpy;
+                           if (!advanceInstallQueue() && !state.updateChecking) {
+                               checkForUpdates();
+                           }
+                       });
+            toolButton(ui, "setup.close", rowX + 158.0f, 274.0f, 110.0f, 36.0f,
+                       0xF00D, anyMissing ? "稍后再说" : "关闭", false, true, [] { closeSetupDialog(); });
+
+            ui.stack("setup.dontask.wrap")
+                .x(rowX + 286.0f).y(274.0f).size(rowW - 286.0f, 36.0f)
+                .content([&] {
+                    components::checkbox(ui, "setup.dontask")
+                        .size(rowW - 286.0f, 36.0f)
+                        .text("不再提示")
+                        .fontSize(12.5f)
+                        .theme(themeTokens())
+                        .checked(state.setupDontAsk)
+                        .onChange([](bool v) { state.setupDontAsk = v; })
+                        .build();
+                })
+                .build();
+
+            ui.text("setup.status")
+                .x(rowX).y(316.0f).size(rowW, 16.0f)
+                .text(busy ? (state.updateStatus.empty() ? "正在处理…" : state.updateStatus)
+                           : (anyMissing ? "缺少的组件下载完成后会立刻可用，不用重启。"
+                                         : "adb 与 scrcpy 都已就绪。"))
+                .fontSize(11.5f).lineHeight(11.5f)
+                .color(kMuted)
+                .build();
+
+            if (state.updateWorking) {
+                const long long total = g_dlTotal.load();
+                const long long got = g_dlReceived.load();
+                float frac = total > 0 ? static_cast<float>(static_cast<double>(got) / static_cast<double>(total)) : 0.0f;
+                frac = std::max(0.0f, std::min(1.0f, frac));
+                ui.rect("setup.progress.bg")
+                    .x(rowX).y(340.0f).size(rowW, 8.0f)
+                    .color(kBorder)
+                    .radius(4.0f)
+                    .build();
+                ui.rect("setup.progress.fill")
+                    .x(rowX).y(340.0f).size(rowW * frac, 8.0f)
+                    .color(kAccent)
+                    .radius(4.0f)
+                    .build();
+            }
+        })
+        .onOpenChange([](bool v) {
+            if (!v) {
+                closeSetupDialog();
+            } else {
+                state.setupOpen = true;
+            }
+        })
+        .build();
+}
+
 void composeConfirmDialog(eui::Ui& ui, float w, float h) {
     components::dialog(ui, "confirm.dialog")
         .screen(w, h)
@@ -5624,6 +5839,14 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
         applyMinWindowSize();
         fetchAdbVersion();
         refreshDevices();
+        // Neither adb nor scrcpy ships with the app any more, so offer to fetch
+        // whatever is missing instead of leaving a fresh install unable to talk
+        // to a phone with no hint about what to do. The dialog needs the download
+        // URLs, which is what the update check fetches.
+        if (!state.setupPromptDismissed && (!state.adbFound || findScrcpy().empty())) {
+            state.setupOpen = true;
+            checkForUpdates();
+        }
         app::setDropHandler([](const std::vector<std::string>& files) {
             if (state.selectedDevice.empty()) {
                 toast("未选择设备", "请先选择要上传到的设备。");
@@ -5677,6 +5900,7 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composePromptDialog(ui, W, H);
             composeSettingsDialog(ui, W, H);
             composeUpdateDialog(ui, W, H);
+            composeSetupDialog(ui, W, H);
             composeBookmarkManageDialog(ui, W, H);
             composeCommandManageDialog(ui, W, H);
             composeCommandOutputDialog(ui, W, H);
