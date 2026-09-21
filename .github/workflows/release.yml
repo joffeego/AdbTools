@@ -181,17 +181,91 @@ jobs:
           "Signer : $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { throw "$($setup.Name) is not validly signed ($($sig.Status))" }
 
-      - name: Assemble portable package
+      # ---------------------------------------------------------------------
+      # Two packages, on purpose.
+      #
+      # adb.exe, AdbWinApi.dll, scrcpy.exe and the FFmpeg/SDL DLLs are unsigned
+      # third-party binaries. Bundling them inside our archive is what gets the
+      # whole release flagged by antivirus products - and Windows Defender
+      # reports the *archive*, not the offending member, so the detection looks
+      # like it is on this program. They are therefore shipped as a separate
+      # optional package, and the app downloads adb (and scrcpy, for mirroring) on
+      # demand from the official sources, verifying the published checksums.
+      #
+      # The application package also must not gain any other DLL dependency: the
+      # 0.10.0 build silently needed libcurl-4.dll (the MSYS2 cmake package pulls
+      # libcurl into /mingw64, and the framework links it when CMake finds it),
+      # so installing on a machine without MSYS2 failed with a missing-DLL error.
+      # CMakeLists.txt now disables that search and cmake/check_pe_imports.cmake
+      # fails the build above if any non-system DLL creeps in.
+      # ---------------------------------------------------------------------
+      - name: Assemble the portable application package
         shell: pwsh
         run: |
-          $dist = "dist/AdbFileBrowser-windows-x64"
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          Copy-Item "build/adb_browser.exe" $dist/ -Force
-          Copy-Item -Recurse "build/assets"      "$dist/assets" -Force
-          Copy-Item -Recurse "build/scrcpy"      "$dist/scrcpy" -Force
-          Copy-Item "LICENSE"                    $dist/ -Force
-          Copy-Item "THIRD_PARTY_NOTICES.md"     $dist/ -Force
-          Compress-Archive -Path "$dist/*" -DestinationPath "dist/AdbFileBrowser-windows-x64.zip" -Force
+          $app = "dist/AdbFileBrowser-windows-x64"
+          New-Item -ItemType Directory -Force -Path $app | Out-Null
+          Copy-Item "build/adb_browser.exe" $app/ -Force
+          Copy-Item -Recurse "build/assets"  "$app/assets" -Force
+          Copy-Item "LICENSE"                $app/ -Force
+          Copy-Item "THIRD_PARTY_NOTICES.md" $app/ -Force
+          Compress-Archive -Path "$app/*" -DestinationPath "dist/AdbFileBrowser-windows-x64.zip" -Force
+
+      - name: Assemble the optional adb/scrcpy tools package
+        shell: pwsh
+        run: |
+          # Extracts into the application directory as scrcpy\..., which is exactly
+          # where findAdb() and findScrcpy() look.
+          $tools = "dist/tools/AdbTools-tools-windows-x64"
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+          Copy-Item -Recurse "build/scrcpy" "$tools/scrcpy" -Force
+          Copy-Item "THIRD_PARTY_NOTICES.md" $tools/ -Force
+          Compress-Archive -Path "$tools/scrcpy", "$tools/THIRD_PARTY_NOTICES.md" `
+                           -DestinationPath "dist/AdbTools-tools-windows-x64.zip" -Force
+
+      # The split above is the whole point of this release, so assert it rather
+      # than trust the copy list.
+      - name: Assert the application package carries no third-party binaries
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path "dist/AdbFileBrowser-windows-x64.zip"))
+          try {
+            # Normalise separators: Compress-Archive writes '\' on Windows
+            # PowerShell 5.1 and '/' on PowerShell 7.
+            $names = $zip.Entries | ForEach-Object { $_.FullName -replace '\\', '/' }
+            $binaries = $names | Where-Object { $_ -match '\.(exe|dll|sys|jar)$' }
+            Write-Host "Executables in the application package: $($binaries -join ', ')"
+            if ($names -notcontains 'adb_browser.exe') {
+              throw "adb_browser.exe is missing from the application package"
+            }
+            $foreign = $binaries | Where-Object { $_ -ne 'adb_browser.exe' }
+            if ($foreign) {
+              throw "The application package must contain only adb_browser.exe; found: $($foreign -join ', ')"
+            }
+            Write-Host "OK: the application package contains no third-party binaries."
+          } finally {
+            $zip.Dispose()
+          }
+
+      - name: Assert the tools package carries adb and scrcpy
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path "dist/AdbTools-tools-windows-x64.zip"))
+          try {
+            # Normalise separators: Compress-Archive writes '\' on Windows
+            # PowerShell 5.1 and '/' on PowerShell 7, and the assertion should not
+            # depend on which one the runner happens to use.
+            $names = $zip.Entries | ForEach-Object { $_.FullName -replace '\\', '/' }
+            # The paths matter: these are what core::findAdb() and findScrcpy()
+            # resolve relative to the executable directory.
+            foreach ($required in 'scrcpy/adb.exe', 'scrcpy/scrcpy.exe') {
+              if ($names -notcontains $required) { throw "$required is missing from the tools package" }
+            }
+            Write-Host "OK: the tools package contains adb.exe and scrcpy.exe at the expected paths."
+          } finally {
+            $zip.Dispose()
+          }
 
       # Checksums are generated last: attaching a signature changes the bytes of
       # every executable, so anything computed before signing would be stale.
@@ -200,11 +274,17 @@ jobs:
       - name: Generate checksums
         shell: pwsh
         run: |
-          Get-ChildItem "dist/AdbFileBrowser-windows-x64.zip", "dist/AdbTools-Setup-*.exe" | ForEach-Object {
-            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
-            $line = "$hash  $($_.Name)"
-            Set-Content -Path "$($_.FullName).sha256" -Value $line -Encoding ascii -NoNewline
-            Add-Content -Path "$($_.FullName).sha256" -Value "`n" -NoNewline
+          $artifacts = @(
+            "dist/AdbFileBrowser-windows-x64.zip"
+            "dist/AdbTools-tools-windows-x64.zip"
+          )
+          $artifacts += (Get-ChildItem "dist/AdbTools-Setup-*.exe" | ForEach-Object { $_.FullName })
+          foreach ($path in $artifacts) {
+            $item = Get-Item $path
+            $hash = (Get-FileHash -Path $item.FullName -Algorithm SHA256).Hash.ToLower()
+            $line = "$hash  $($item.Name)"
+            Set-Content -Path "$($item.FullName).sha256" -Value $line -Encoding ascii -NoNewline
+            Add-Content -Path "$($item.FullName).sha256" -Value "`n" -NoNewline
             Write-Host "  $line"
           }
 
@@ -214,6 +294,7 @@ jobs:
           name: AdbFileBrowser-windows-x64
           path: |
             dist/AdbFileBrowser-windows-x64.zip
+            dist/AdbTools-tools-windows-x64.zip
             dist/AdbTools-Setup-*.exe
             dist/*.sha256
           if-no-files-found: error
@@ -224,6 +305,21 @@ jobs:
         with:
           files: |
             dist/AdbFileBrowser-windows-x64.zip
+            dist/AdbTools-tools-windows-x64.zip
             dist/AdbTools-Setup-*.exe
             dist/*.sha256
           generate_release_notes: true
+          append_body: true
+          body: |
+            ## 下哪个文件？
+
+            | 文件 | 说明 |
+            | --- | --- |
+            | `AdbTools-Setup-<版本>.exe` | **推荐**。安装包，含中文向导、开始菜单/桌面快捷方式。 |
+            | `AdbFileBrowser-windows-x64.zip` | 免安装版，解压即用。 |
+            | `AdbTools-tools-windows-x64.zip` | **可选**。adb + scrcpy（投屏用）。需要离线自带工具时再下，解压到程序目录即可。 |
+
+            主程序包里**不含** adb / scrcpy：这两个是第三方二进制，一起打包会让杀毒软件
+            把整个压缩包报成病毒。程序在需要时会自己从官方源下载并校验，所以不装这个
+            可选包也能正常用。每个文件旁的 `.sha256` 是它的 SHA-256 校验值。
+

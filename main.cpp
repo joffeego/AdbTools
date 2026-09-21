@@ -376,6 +376,40 @@ struct UpdateInfo {
 
 UpdateInfo g_update;
 
+// The release packages deliberately ship no third-party binaries (bundled
+// adb.exe / scrcpy.exe are what antivirus products flag, taking our exe down
+// with them), so adb and scrcpy are fetched on demand instead. A download can be
+// requested from outside the update dialog - the "no adb installed" empty state
+// and the mirroring button - where the download URL may not be known yet,
+// because it comes from the update check. Remember the request so the check's
+// completion handler starts the download, rather than making the user click
+// twice.
+enum class PendingInstall { none, adb, scrcpy };
+PendingInstall g_pendingInstall = PendingInstall::none;
+
+void toast(const std::string& title, const std::string& message);
+void checkForUpdates();
+void startUpdateAdb();
+void startUpdateScrcpy();
+
+// Starts the download for `what`, fetching the version information first when it
+// is not known yet. Returns true when the caller should start the install now;
+// false when a check was kicked off instead (or nothing could be started), in
+// which case the user has already been told what is happening.
+bool ensureToolsDownloadable(PendingInstall what) {
+    if (state.updateWorking || state.updateChecking) {
+        toast("请稍候", "已有下载或检查正在进行，请等它结束后重试。");
+        return false;
+    }
+    const bool haveUrl = (what == PendingInstall::adb)
+                             ? (!g_update.adbUrl.empty() && !g_update.adbLatest.empty())
+                             : (!g_update.scrcpyUrl.empty() && !g_update.scrcpyLatest.empty());
+    if (haveUrl) return true;
+    g_pendingInstall = what;
+    checkForUpdates();
+    return false;
+}
+
 // Download progress shared with the worker thread via atomics.
 std::atomic<long long> g_dlTotal{0};
 std::atomic<long long> g_dlReceived{0};
@@ -2020,7 +2054,10 @@ std::string findScrcpy() {
     }
     for (const std::string& candidate : candidates) {
         std::error_code ec;
-        if (std::filesystem::exists(candidate, ec) && !ec) return candidate;
+        // is_regular_file, not exists(): the "C:\dir/scrcpy" candidate also
+        // names the scrcpy *directory*, so exists() would happily return that
+        // directory and scrcpy would then fail to launch with a confusing error.
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec) return candidate;
     }
     return "";
 }
@@ -2272,7 +2309,14 @@ void openMirror() {
     }
     const std::string scrcpy = findScrcpy();
     if (scrcpy.empty()) {
-        toast("未找到 scrcpy", "请把 scrcpy 放到程序目录或加入 PATH 后重试。");
+        // scrcpy is not shipped with the app any more (see PendingInstall), so
+        // fetch it instead of telling the user to install it by hand.
+        if (ensureToolsDownloadable(PendingInstall::scrcpy)) {
+            toast("未找到 scrcpy", "正在下载 scrcpy…下载完成后请重新点击投屏。");
+            startUpdateScrcpy();
+        } else {
+            toast("未找到 scrcpy", "正在获取下载地址，拿到后会自动开始下载，请稍后再点投屏。");
+        }
         return;
     }
     const std::string serial = state.selectedDevice;
@@ -2937,6 +2981,24 @@ void checkForUpdates() {
                 return;
             }
             g_update = result.value;
+            // A download requested from the "no adb installed" state or the
+            // mirroring button could not start until this check produced a URL.
+            if (g_pendingInstall != PendingInstall::none) {
+                const PendingInstall pending = g_pendingInstall;
+                g_pendingInstall = PendingInstall::none;
+                const bool haveUrl = (pending == PendingInstall::adb)
+                                         ? (!g_update.adbUrl.empty() && !g_update.adbLatest.empty())
+                                         : (!g_update.scrcpyUrl.empty() && !g_update.scrcpyLatest.empty());
+                if (!haveUrl) {
+                    state.updateStatus = "未能获取下载地址，请检查网络后重试。";
+                    toast("下载失败", state.updateStatus);
+                } else if (pending == PendingInstall::adb) {
+                    startUpdateAdb();
+                } else {
+                    startUpdateScrcpy();
+                }
+                return;
+            }
             if (g_update.adbUpdate || g_update.scrcpyUpdate || g_update.appUpdate) {
                 // Distinguish "newer release exists but has no downloadable ZIP"
                 // from a normal update, so the status line does not promise an
@@ -3583,9 +3645,24 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
         .build();
 
     if (!state.adbFound) {
-        centeredMessage(ui, "list.noadb", x, y, w, h - 44.0f,
-                        "未找到 adb。\n请安装 Android platform-tools 或设置 ANDROID_HOME 后重启。");
-        toolButton(ui, "list.locate", x + w * 0.5f - 90.0f, y + h - 48.0f, 180.0f, 36.0f,
+        centeredMessage(ui, "list.noadb", x, y, w, h - 96.0f,
+                        "未找到 adb。\n可以点下面的按钮自动下载官方 platform-tools，\n"
+                        "也可以手动选择已有的 adb.exe。");
+        // The release packages ship no adb (a bundled adb.exe is one of the
+        // things antivirus products flag), so the app has to be able to fetch it.
+        const float gap = 12.0f;
+        const float bw = 172.0f;
+        const float bx = x + w * 0.5f - bw - gap * 0.5f;
+        toolButton(ui, "list.dladb", bx, y + h - 48.0f, bw, 36.0f,
+                   0xF019, "下载并安装 adb", true, true, [] {
+                       if (ensureToolsDownloadable(PendingInstall::adb)) {
+                           toast("正在下载 adb", "下载完成后会自动放到程序目录并启用。");
+                           startUpdateAdb();
+                       } else {
+                           toast("正在获取下载地址", "拿到地址后会自动开始下载 adb，请稍候。");
+                       }
+                   });
+        toolButton(ui, "list.locate", bx + bw + gap, y + h - 48.0f, bw, 36.0f,
                    0xF002, "手动选择 adb", false, true, [] {
                        std::string exe = eui::platform::chooseFile(eui::platform::FileDialogOptions{});
                        if (!exe.empty()) {

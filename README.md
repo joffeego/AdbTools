@@ -33,18 +33,27 @@
 
 ## 下载与安装
 
-到 [Releases](../../releases) 页面下载，有两种选择：
+到 [Releases](../../releases) 页面下载：
 
-- **安装版**：`AdbTools-Setup-*.exe` —— 双击运行安装向导，自动创建开始菜单快捷方式（可选桌面快捷方式），并附带卸载程序。安装到用户目录（`%LOCALAPPDATA%\Programs\AdbTools`），无需管理员权限。
-- **便携版**：`AdbFileBrowser-windows-x64.zip` —— 解压后双击 `adb_browser.exe` 即可运行，无需安装。
+| 文件 | 说明 |
+| --- | --- |
+| `AdbTools-Setup-*.exe` | **推荐**。安装向导，自动创建开始菜单快捷方式（可选桌面快捷方式），并附带卸载程序。安装到用户目录（`%LOCALAPPDATA%\Programs\AdbTools`），无需管理员权限。 |
+| `AdbFileBrowser-windows-x64.zip` | 便携版，解压后双击 `adb_browser.exe` 即可运行，无需安装。 |
+| `AdbTools-tools-windows-x64.zip` | **可选**。adb + scrcpy（投屏用）。需要离线自带工具时再下，解压到程序目录即可（得到 `scrcpy\` 子目录）。 |
+
+每个文件旁边都有对应的 `.sha256` 校验文件。
+
+> **为什么 adb / scrcpy 不在主包里？**
+> `adb.exe`、`scrcpy.exe` 和它们依赖的 DLL 是第三方二进制，**没有数字签名**。把它们一起打进压缩包，会让杀毒软件（尤其是 Windows Defender）把**整个下载包**报成病毒 —— 而且报的是压缩包本身，看起来就像我们的程序有毒。所以现在主包只装我们自己的程序，第三方工具单独发一个可选包。
+> 程序在需要时会自己从官方源下载 adb / scrcpy，并校验官方公布的校验值，所以**完全不下这个可选包也能正常用**（首次运行点一下「下载并安装 adb」即可）。
 
 便携版解压后的目录结构：
 
 ```
 AdbFileBrowser-windows-x64/
-├── adb_browser.exe        # 主程序
+├── adb_browser.exe        # 主程序（自带 assets，界面字体/图标字体在内）
 ├── assets/                # 界面字体 / 图标字体
-└── scrcpy/                # 内置 scrcpy.exe、adb.exe、scrcpy-server 及依赖 DLL
+└── (scrcpy/)              # 可选：解压 AdbTools-tools 包后才会出现
 ```
 
 运行前提：
@@ -53,7 +62,8 @@ AdbFileBrowser-windows-x64/
 2. 手机开启「开发者选项 → USB 调试」，用数据线连接电脑并授权；
 3. 也可以使用无线调试（`adb connect <IP>:<端口>`）。
 
-> 说明：程序会自动寻找 adb。若你已安装 Android SDK / platform-tools，会优先使用系统中的 adb；否则使用内置在 `scrcpy/` 里的 adb。
+> 说明：程序会自动寻找 adb，顺序是 `ANDROID_SDK_ROOT`/`ANDROID_HOME` → `%LOCALAPPDATA%\Android\Sdk` → `PATH` → 程序目录 → 程序目录下的 `scrcpy\`。
+> 一个都找不到时，界面会显示「未找到 adb」并给两个按钮：**下载并安装 adb**（自动下载官方 platform-tools 到程序目录）和**手动选择 adb**。
 
 ---
 
@@ -99,10 +109,10 @@ cmake --build build --parallel
 ### 运行
 
 ```bash
-# 直接运行（会使用 PATH / SDK 中的 adb；若无则用内置 adb）
+# 直接运行（会使用 PATH / SDK 中的 adb；找不到时界面会提供「下载并安装 adb」）
 ./build/adb_browser.exe
 
-# 若要把内置 scrcpy/adb 放到程序目录（投屏与 adb 探测需要）：
+# 可选：把 adb/scrcpy 放到程序目录（投屏与 adb 探测需要），发布包里也是这么分的
 ./scripts/fetch_scrcpy.ps1 -Version latest -OutDir build/scrcpy
 ```
 
@@ -210,12 +220,37 @@ push/pull/rm/mkdir、安装卸载、截屏、logcat 等；所有临时文件都�
 
 本程序**没有数字签名**，并且会做一些本身合法、但容易被启发式规则误判的行为（调用 `adb.exe` / `scrcpy.exe` 子进程、联网下载更新包、替换自身的 exe 文件）。因此 Windows Defender 或第三方杀软**可能把安装包或主程序报成「木马 / 病毒」**，这是**误报（false positive）**，不是程序真的有毒。
 
-遇到这种情况，可以按下面任一种方式处理：
+### 0.10.1 起：主包里已经没有第三方二进制了
+
+之前 adb 和 scrcpy 是打包在一起发的，这是误报的最大来源：
+
+- `adb.exe`、`scrcpy.exe` 以及 FFmpeg/SDL 那几个 DLL **都没有数字签名**，而 `adb` 本身是双用途工具，很多杀软把它归为 `HackTool` / `RiskWare`；
+- 更麻烦的是 **Defender 报的是压缩包本身，不会告诉你是包里哪个文件**——所以看起来就像我们的主程序有毒。
+
+现在主包只有我们自己的 `adb_browser.exe` + 字体资源，adb/scrcpy 改成可选包（`AdbTools-tools-*.zip`），需要时程序自己去官方源下载并校验。**如果之前是被这个原因误报，换 0.10.1 的主包应该就好了。**
+
+另外，`adb_browser.exe` 本身依赖的 DLL 现在**只有 Windows 系统自带的那几个**（0.10.1 修掉了一个会让它在没装 MSYS2 的电脑上启动失败、报「缺少 DLL」的问题），构建时也会强制检查这一点。
+
+### 如果还被报毒
+
+按下面任一种方式处理：
 
 1. **给文件加白名单**：Windows 安全中心 →「病毒和威胁防护」→「管理设置」→「排除项」→ 添加排除项，选择解压后的程序目录（或 `AdbTools-Setup-*.exe`）。
-2. **提交误报给微软**（最彻底，24–48 小时内会更新特征库）：打开 <https://www.microsoft.com/en-us/wdsi/filesubmission>，选择 “Software developer” → 上传被报毒的文件 → 提交为 **Incorrectly detected / 误报**。
+2. **提交误报给微软**（最彻底，24–48 小时内会更新特征库）：打开 <https://www.microsoft.com/en-us/wdsi/filesubmission>，选择 “Software developer” → 上传被报毒的文件 → 提交为 **Incorrectly detected / 误报**。提交时请说明：这是开源项目 `github.com/joffeego/AdbTools` 的构建产物，源码公开、CI 可复现。
+   > 小技巧：提交时**把 Defender 报的完整检测名和文件名一起写上**（「保护历史记录」里能看到）。如果是整个 zip 被报，zip 不会告诉你具体文件，可以解压后对每个文件单独扫一遍（见下）。
 3. **第三方杀软**（火绒 / 360 / 卡巴斯基等）一般也有「误报反馈」入口，把文件提交过去即可。
-4. **先自己核对文件完整性**：Release 里每个安装包都附带 `.sha256` 校验文件，可用下面的命令核对下载到的文件有没有被篡改或下载不完整：
+4. **自己定位是哪个文件被报**：把 zip 解压到某个目录，然后逐个文件扫描，就能看到具体是哪一个：
+
+   ```powershell
+   # 需要管理员权限；-Scan 是自定义扫描
+   Get-ChildItem -Recurse .\AdbFileBrowser-windows-x64 | ForEach-Object {
+     $r = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File $_.FullName
+     if ($LASTEXITCODE -ne 0) { "flagged: $($_.Name)" }
+   }
+   ```
+
+   把结果反馈到 [Issues](../../issues) 会很有帮助。
+5. **先自己核对文件完整性**：Release 里每个文件都附带 `.sha256` 校验文件，可用下面的命令核对下载到的文件有没有被篡改或下载不完整：
 
    ```powershell
    Get-FileHash .\AdbFileBrowser-windows-x64.zip -Algorithm SHA256

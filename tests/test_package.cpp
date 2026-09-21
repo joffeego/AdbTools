@@ -120,6 +120,76 @@ ADB_TEST(findAppReleaseAsset_rejects_digest_of_the_wrong_asset) {
     ADB_CHECK(sha != "9f40208fe56faafe18176863814a967a64a93a2642f43822793842f865628197");
 }
 
+ADB_TEST(findAppReleaseAsset_prefers_the_application_zip_over_the_tools_zip) {
+    // Releases now carry two archives: the portable application package and the
+    // optional adb/scrcpy tools package. Assets arrive in upload order, so the
+    // updater must not simply take the first .zip - here the tools package comes
+    // first and would otherwise be downloaded and rejected as "no
+    // adb_browser.exe in the update package".
+    const std::string json =
+        "{"
+        "\"assets\":["
+        "{"
+        "\"name\":\"AdbTools-tools-windows-x64.zip\","
+        "\"digest\":\"sha256:" + std::string(64, 'a') + "\","
+        "\"browser_download_url\":\"https://example.com/AdbTools-tools-windows-x64.zip\""
+        "},"
+        "{"
+        "\"name\":\"AdbFileBrowser-windows-x64.zip\","
+        "\"digest\":\"sha256:" + std::string(64, 'b') + "\","
+        "\"browser_download_url\":\"https://example.com/AdbFileBrowser-windows-x64.zip\""
+        "}"
+        "]"
+        "}";
+    std::string url, row, sha;
+    ADB_CHECK(findAppReleaseAsset(json, url, row, sha));
+    ADB_CHECK_EQ(url, std::string("https://example.com/AdbFileBrowser-windows-x64.zip"));
+    ADB_CHECK_EQ(row, std::string("AdbFileBrowser-windows-x64.zip"));
+    // The digest must belong to the package that was selected, not the other one.
+    ADB_CHECK_EQ(sha, std::string(64, 'b'));
+}
+
+ADB_TEST(findAppReleaseAsset_falls_back_to_the_first_zip_when_no_name_matches) {
+    // Releases published before the app archive had its current name (and any
+    // future rename) must keep working: without a name match, the first .zip wins,
+    // as it did originally.
+    const std::string json =
+        "{"
+        "\"assets\":["
+        "{"
+        "\"name\":\"bundle.zip\","
+        "\"digest\":\"sha256:" + std::string(64, 'c') + "\","
+        "\"browser_download_url\":\"https://example.com/bundle.zip\""
+        "},"
+        "{"
+        "\"name\":\"other.zip\","
+        "\"digest\":\"sha256:" + std::string(64, 'd') + "\","
+        "\"browser_download_url\":\"https://example.com/other.zip\""
+        "}"
+        "]"
+        "}";
+    std::string url, row, sha;
+    ADB_CHECK(findAppReleaseAsset(json, url, row, sha));
+    ADB_CHECK_EQ(url, std::string("https://example.com/bundle.zip"));
+    ADB_CHECK_EQ(sha, std::string(64, 'c'));
+}
+
+ADB_TEST(findAppReleaseAsset_ignores_a_tools_zip_without_the_app_zip) {
+    // A release that carries only the optional tools package has no application
+    // package to update from. Reporting that is better than picking the tools zip
+    // and failing later with "no adb_browser.exe in the update package".
+    const std::string json =
+        "{"
+        "\"assets\":[{"
+        "\"name\":\"AdbTools-tools-windows-x64.zip\","
+        "\"browser_download_url\":\"https://example.com/AdbTools-tools-windows-x64.zip\""
+        "}]"
+        "}";
+    std::string url, row, sha;
+    ADB_CHECK(!findAppReleaseAsset(json, url, row, sha));
+    ADB_CHECK_EQ(url, std::string(""));
+}
+
 ADB_TEST(findAppReleaseAsset_survives_escaped_quotes_in_string_values) {
     // A release body or asset label containing an escaped quote must not cut the
     // asset object short: if it did, the parser would read the wrong URL and, in

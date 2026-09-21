@@ -6,7 +6,7 @@
 ;   iscc installer.iss /DMyAppVersion=X.Y.Z   (the CI passes the tag version here)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.10.0"
+  #define MyAppVersion "0.10.1"
 #endif
 
 #define MyAppName "ADB 文件浏览器"
@@ -52,9 +52,14 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
+; No adb / scrcpy here on purpose. They are unsigned third-party binaries, and
+; bundling them is what made antivirus products flag the whole download (Defender
+; names the archive, so it looked like our program was the problem). The app
+; downloads both from the official sources on demand and verifies the published
+; checksums - see 维护与发版指南.md and the release notes for the optional tools
+; package.
 Source: "build\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "build\assets\*";       DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "build\scrcpy\*";       DestDir: "{app}\scrcpy"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "LICENSE";              DestDir: "{app}"; Flags: ignoreversion
 Source: "THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 

@@ -51,6 +51,15 @@ bool findAppReleaseAsset(const std::string& json, std::string& url, std::string&
     const std::size_t assets = json.find(assetsNeedle);
     if (assets == std::string::npos) return false;
 
+    // A release can carry several .zip assets - the portable application
+    // package plus the optional adb/scrcpy tools package - and they arrive in
+    // upload order, so "the first .zip in the array" is not a safe way to find
+    // the application archive: the updater would eventually fetch the tools
+    // package and fail with "no adb_browser.exe in the update package". Prefer
+    // an asset named like the application package, and fall back to the first
+    // .zip so releases published before that name existed keep working.
+    std::string firstUrl, firstRow, firstSha;
+
     std::size_t i = assets + assetsNeedle.size();
     while (i < json.size()) {
         if (json[i] != '{') {
@@ -70,11 +79,37 @@ bool findAppReleaseAsset(const std::string& json, std::string& url, std::string&
         if (!zip) continue;
 
         const std::size_t lastSlash = assetUrl.find_last_of('/');
-        url = assetUrl;
-        row = !name.empty() ? name : (lastSlash == std::string::npos ? assetUrl : assetUrl.substr(lastSlash + 1));
+        const std::string assetRow =
+            !name.empty() ? name : (lastSlash == std::string::npos ? assetUrl : assetUrl.substr(lastSlash + 1));
 
+        std::string assetSha;
         const std::string digest = jsonStringValue(entry, "digest");
-        if (digest.rfind("sha256:", 0) == 0) sha = lower(trim(digest.substr(7)));
+        if (digest.rfind("sha256:", 0) == 0) assetSha = lower(trim(digest.substr(7)));
+
+        const std::string lowered = lower(name);
+        if (lowered.find("adbfilebrowser") != std::string::npos ||
+            lowered.find("adb_browser") != std::string::npos) {
+            url = assetUrl;
+            row = assetRow;
+            sha = assetSha;
+            return true;
+        }
+
+        // Remember the first .zip that is not one of the optional support
+        // packages: a release carrying only tools must report "no downloadable
+        // package for this version" rather than offer an update that then fails
+        // to find adb_browser.exe inside the archive.
+        if (firstUrl.empty() && lowered.find("tools") == std::string::npos) {
+            firstUrl = assetUrl;
+            firstRow = assetRow;
+            firstSha = assetSha;
+        }
+    }
+
+    if (!firstUrl.empty()) {
+        url = firstUrl;
+        row = firstRow;
+        sha = firstSha;
         return true;
     }
     return false;

@@ -15,6 +15,24 @@ set(EUI_BUILD_USER_APPS OFF CACHE BOOL "" FORCE)
 set(EUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 set(EUI_ENABLE_TRAY OFF CACHE BOOL "" FORCE)
 
+# Never let the framework pick up libcurl on Windows.
+#
+# 3rd/EUI-NEO/3rd/dependencies.cmake does `find_package(CURL QUIET)`, and
+# 3rd/EUI-NEO/CMakeLists.txt then links CURL::libcurl PUBLIC (defining
+# EUI_HAS_CURL) whenever it was found. Nothing about this app needs curl - the
+# framework's Windows network path uses urlmon/WinHTTP, and the app's own
+# downloader is WinHTTP - but the detection is opportunistic, so whether the exe
+# depends on libcurl-4.dll is decided by what happens to be installed on the
+# BUILD machine. MSYS2's cmake package pulls mingw-w64-x86_64-curl into /mingw64,
+# so the release build produced an exe that imported libcurl-4.dll, which is not
+# part of Windows and was not shipped: every install on a clean machine failed
+# with a missing-DLL error, while every local build (no libcurl present) was
+# fine. Disabling the search makes the dependency impossible rather than
+# accidental. cmake/check_pe_imports.cmake then asserts the result.
+if(WIN32)
+    set(CMAKE_DISABLE_FIND_PACKAGE_CURL ON)
+endif()
+
 # -----------------------------------------------------------------------------
 # Core: the app's pure logic, with no dependency on the GUI framework.
 #
@@ -120,6 +138,20 @@ if(MINGW)
         -Wl,--nxcompat
         -Wl,--high-entropy-va
     )
+endif()
+
+# Refuse to build an exe that depends on a DLL the user's machine will not have.
+# See cmake/check_pe_imports.cmake for why this is not merely theoretical: the
+# release build once shipped an exe needing libcurl-4.dll, and only the machines
+# without MSYS2 noticed.
+if(WIN32 AND CMAKE_OBJDUMP)
+    add_custom_command(TARGET adb_browser POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                "-DOBJDUMP=${CMAKE_OBJDUMP}"
+                "-DEXE=$<TARGET_FILE:adb_browser>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_pe_imports.cmake"
+        COMMENT "Checking that adb_browser.exe imports only system DLLs"
+        VERBATIM)
 endif()
 
 # -----------------------------------------------------------------------------
