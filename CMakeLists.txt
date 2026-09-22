@@ -172,6 +172,7 @@ if(ADBTOOLS_BUILD_TESTS)
         tests/test_fileio.cpp
         tests/test_package.cpp
         tests/test_paths.cpp
+        tests/test_process.cpp
         tests/test_sha256.cpp
         tests/test_store.cpp
         tests/test_strings.cpp

@@ -1943,6 +1943,7 @@ void streamLogcatWorker(const std::string& adb, const std::string& serial) {
         return;
     }
     CloseHandle(writePipe);
+    core::adoptChildProcess(pi.hProcess);  // die with us, not after us
     CloseHandle(pi.hThread);
     g_logcatProcess = pi.hProcess;
 
@@ -2377,6 +2378,7 @@ void openMirror() {
         return;
     }
     CloseHandle(pi.hThread);
+    core::adoptChildProcess(pi.hProcess);  // the mirror window closes with the app
     g_scrcpyProcess = pi.hProcess;
     state.scrcpyOpen = true;
     // Mirror size is stored in logical units; convert to physical for the

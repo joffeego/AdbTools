@@ -247,7 +247,12 @@ ADB_TEST(replaceFileOver_reports_a_missing_source) {
 // merely open file is NOT equivalent - Windows happily replaces those (POSIX
 // delete semantics), which is why this test starts a real process.
 ADB_TEST(replaceFileOver_replaces_a_running_executable) {
-    TempDir dir("adbtools-test-replace-running");
+    // Per-process directory name: if an earlier run was interrupted it can leave a
+    // victim.exe running and therefore locked, and a fixed name would then make
+    // this test fail on a *copy* error instead of testing what it is about.
+    const std::string dirName =
+        "adbtools-test-replace-running-" + std::to_string(GetCurrentProcessId());
+    TempDir dir(dirName.c_str());
     const std::string victim = dir.file("victim.exe");
     const std::string src = dir.file("new.bin");
 

@@ -44,6 +44,24 @@ std::string toUtf8(const std::wstring& w);
 
 // Quote one argument for a Windows command line (CommandLineToArgvW rules).
 std::wstring quoteWinArg(const std::wstring& arg);
+
+// Put a freshly created child process into this process's job object, so Windows
+// terminates it when this process exits - however it exits, including a crash or
+// being killed from Task Manager.
+//
+// Why this is needed: adb is a client/server program, and a client that finds no
+// server starts one, which then outlives the client. If the app is killed while
+// such a child is starting (or while `adb logcat` runs, or while scrcpy mirrors),
+// those processes are orphaned. They are not merely untidy: a running adb.exe
+// cannot be overwritten, so they keep the adb updater from replacing it, and they
+// hold a device connection open. Measured before this existed: eighteen adb
+// processes were still alive nine hours after the app that started them died.
+//
+// `nativeHandle` is a Win32 process HANDLE (passed as void* so this header stays
+// platform-neutral). Returns false if the child could not be adopted, which is not
+// fatal - the process simply runs to completion on its own as it used to. The
+// usual reason is an ancestor job that forbids nesting (pre-Windows 8).
+bool adoptChildProcess(void* nativeHandle);
 #endif
 
 }  // namespace adb::core

@@ -22,6 +22,44 @@ namespace adb::core {
 
 #ifdef _WIN32
 
+namespace {
+
+// The job object every child process this app starts is placed in.
+//
+// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE means the OS terminates everything still in
+// the job once the last handle to it closes - and the OS closes our handle when
+// this process terminates, however it terminates. That is the whole point: a crash
+// or "End task" cannot leave adb behind.
+//
+// Created once, on first use, and deliberately never closed: closing it would kill
+// the children that are legitimately still running.
+HANDLE childJobObject() {
+    static HANDLE job = []() -> HANDLE {
+        HANDLE created = CreateJobObjectW(nullptr, nullptr);
+        if (created == nullptr) return nullptr;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(created, JobObjectExtendedLimitInformation, &limits,
+                                     sizeof(limits))) {
+            CloseHandle(created);
+            return nullptr;
+        }
+        return created;
+    }();
+    return job;
+}
+
+}  // namespace
+
+bool adoptChildProcess(void* nativeHandle) {
+    if (nativeHandle == nullptr) return false;
+    HANDLE job = childJobObject();
+    if (job == nullptr) return false;
+    // Best effort: an ancestor job that forbids nesting (only possible before
+    // Windows 8) makes this fail, and the child then simply runs as it did before.
+    return AssignProcessToJobObject(job, static_cast<HANDLE>(nativeHandle)) != FALSE;
+}
+
 std::wstring toWide(const std::string& s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
@@ -69,8 +107,7 @@ std::wstring quoteWinArg(const std::wstring& arg) {
 
 ProcessResult runProcessWindows(const std::string& program,
                                 const std::vector<std::string>& args,
-                                int timeoutMs) {
-    std::wstring cmd = quoteWinArg(toWide(program));
+                                int timeoutMs) {    std::wstring cmd = quoteWinArg(toWide(program));
     for (const std::string& a : args) {
         cmd += L" ";
         cmd += quoteWinArg(toWide(a));
@@ -104,6 +141,10 @@ ProcessResult runProcessWindows(const std::string& program,
         CloseHandle(readPipe);
         return {-1, "", "CreateProcessW failed (" + std::to_string(GetLastError()) + ")"};
     }
+    // Put the child in this process's job so it cannot outlive us: adb starts a
+    // server that would otherwise keep running (and keep adb.exe locked, which
+    // blocks the adb updater - see adoptChildProcess).
+    adoptChildProcess(pi.hProcess);
     CloseHandle(pi.hThread);
 
     std::string output;
