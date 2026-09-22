@@ -25,8 +25,8 @@
 #pragma code_page(65001)  /* this file is UTF-8 */
 
 1 VERSIONINFO
-FILEVERSION     0,10,5,0
-PRODUCTVERSION  0,10,5,0
+FILEVERSION     0,10,6,0
+PRODUCTVERSION  0,10,6,0
 FILEFLAGSMASK   0x3f
 FILEFLAGS       0x0
 FILEOS          0x40004
@@ -40,12 +40,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "joffeego"
             VALUE "FileDescription",  "ADB 文件浏览器 (AdbTools) - Android file manager and toolbox"
-            VALUE "FileVersion",      "0.10.5.0"
+            VALUE "FileVersion",      "0.10.6.0"
             VALUE "InternalName",     "adb_browser"
             VALUE "LegalCopyright",   "Copyright (C) 2025 joffeego. Licensed under the Apache License 2.0."
             VALUE "OriginalFilename", "adb_browser.exe"
             VALUE "ProductName",      "ADB 文件浏览器 (AdbTools)"
-            VALUE "ProductVersion",   "0.10.5"
+            VALUE "ProductVersion",   "0.10.6"
             VALUE "Comments",         "Unofficial build? Set CompanyName/ProductName accordingly. https://github.com/joffeego/AdbTools"
         END
     END

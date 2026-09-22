@@ -193,6 +193,31 @@ struct AppSettings {
     int windowH = 520;
 };
 
+// A phone file that was pulled to a local file and opened with the user's default
+// program, watched so that edits are pushed straight back to the phone.
+//
+// The local copy keeps the original file name, so Windows associates it with the
+// right program, and its directory mirrors the phone path, so two files with the
+// same name in different phone folders cannot collide.
+struct ExternalEdit {
+    std::string remote;  // phone path: pulled from here, pushed back here
+    std::string local;   // the local copy
+    std::string name;    // file name, for display
+    std::string serial;  // device it belongs to (the selected device may change)
+
+    // Change detection: the local file's write time and size, as last observed.
+    std::int64_t writeTicks = 0;
+    std::uintmax_t size = 0;
+    // Wall-clock gate (steady_clock ms) before the next push may start. A change
+    // sets it a little ahead so a file still being written is not sent half-way;
+    // a failure sets it further ahead so a broken push does not retry every frame.
+    std::int64_t nextAttemptMs = 0;
+    bool pendingPush = false;  // the file was edited; a push is owed
+    bool syncing = false;      // a push is in flight
+    bool stopAfterPush = false;  // "stop" pressed while a push was owed/in flight
+    std::string status;        // human-readable state, shown in the manager dialog
+};
+
 struct AppState {
     bool initialized = false;
 
@@ -352,6 +377,11 @@ struct AppState {
     bool setupDontAsk = false;         // the checkbox, as currently ticked
     bool setupPromptDismissed = false; // persisted: never show the dialog again
 
+    // Files currently open in an external editor, with their sync state.
+    std::vector<ExternalEdit> externalEdits;
+    bool externalEditListOpen = false;
+    std::chrono::steady_clock::time_point lastExternalEditPoll;
+
     // Generic confirm dialog (title/message + primary action).
     std::string confirmPrimaryText = "删除";
     std::function<void()> confirmAction;
@@ -405,6 +435,24 @@ void toast(const std::string& title, const std::string& message);
 void checkForUpdates();
 void startUpdateAdb();
 void startUpdateScrcpy();
+
+// The framework's async layer treats a task key as one-shot: beginTask() refuses
+// a key whose status is no longer Idle, and finishTask() never returns it to Idle.
+// A second app::async::runOnce() with the same key is therefore dropped silently -
+// no work, no completion callback, no error - and any "busy" flag the caller set
+// before the call stays set forever. In practice that made every repeatable action
+// work exactly once per run: the second refresh of the device list, the second
+// "check for updates", the second upload, screenshot, install, save...
+//
+// So: use app::async::restart() where a newer request should supersede an older
+// one (list refreshes, previews, saves, checks), and uniqueAsyncKey() where every
+// request has to run to completion (uploads, installs, screenshots), because
+// cancelling one mid-flight would leave its result unreported and its busy flag
+// stuck.
+std::string uniqueAsyncKey(const char* name) {
+    static std::atomic<unsigned long long> counter{0};
+    return std::string(name) + "." + std::to_string(counter.fetch_add(1) + 1);
+}
 
 // Starts the next queued install whose download URL is known. Returns true when
 // one was started.
@@ -1031,7 +1079,7 @@ void runCommandEntry(const CommandEntry& cmd) {
     const std::string adb = state.adbPath;
     const std::string serial = state.selectedDevice;
     app::async::runOnce(
-        "run.command",
+        uniqueAsyncKey("run.command"),
         [adb, serial, cmd]() -> app::async::Result<std::string> {
             ProcessResult r;
             if (cmd.shell) {
@@ -1133,7 +1181,7 @@ void restartAdbServer() {
     if (!state.adbFound) return;
     const std::string adb = state.adbPath;
     state.deviceLoading = true;
-    app::async::runOnce(
+    app::async::restart(
         "adb.restart",
         [adb]() -> app::async::Result<std::vector<Device>> {
             runProcess(adb, core::killServerArgs(), 15000);
@@ -1228,7 +1276,7 @@ void refreshDevices() {
     const std::string adb = state.adbPath;
     state.deviceLoading = true;
     schedulePollDevices();
-    app::async::runOnce(
+    app::async::restart(
         "adb.devices",
         [adb]() -> app::async::Result<std::vector<Device>> {
             ProcessResult r = runProcess(adb, core::devicesArgs(), 15000);
@@ -1476,7 +1524,7 @@ void doPush() {
     state.progress = -1.0f;
     state.progressLabel = "上传中…";
     app::async::runOnce(
-        "adb.push",
+        uniqueAsyncKey("adb.push"),
         [adb, serial, local, remoteDir]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, core::pushArgs(serial, local, remoteDir), 600000);
             if (r.exitCode != 0) {
@@ -1627,7 +1675,7 @@ void confirmPrompt() {
         const std::string adb = state.adbPath;
         state.busy = true;
         app::async::runOnce(
-            "adb.connect",
+            uniqueAsyncKey("adb.connect"),
             [adb, value]() -> app::async::Result<std::string> {
                 ProcessResult r = runProcess(adb, core::connectArgs(value), 20000);
                 if (r.exitCode != 0) {
@@ -1666,7 +1714,7 @@ void confirmPrompt() {
     }
     state.busy = true;
     app::async::runOnce(
-        "adb.mkdir.mv",
+        uniqueAsyncKey("adb.mkdir.mv"),
         [adb, args = std::move(args), summary]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, args, 60000);
             if (r.exitCode != 0) {
@@ -1725,7 +1773,7 @@ void doPaste() {
     const bool cut = state.clipboardCut;
     state.busy = true;
     app::async::runOnce(
-        "adb.paste",
+        uniqueAsyncKey("adb.paste"),
         [adb, serial, src, dest, cut]() -> app::async::Result<std::string> {
             std::vector<std::string> args = {"-s", serial, "shell", cut ? "mv" : "cp", "-r",
                                              core::shellQuote(src), core::shellQuote(dest)};
@@ -1758,7 +1806,7 @@ void doScreenshot() {
     state.progress = -1.0f;
     state.progressLabel = "截图中…";
     app::async::runOnce(
-        "adb.screenshot",
+        uniqueAsyncKey("adb.screenshot"),
         [adb, serial, dir]() -> app::async::Result<std::string> {
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
@@ -1795,7 +1843,7 @@ void doInstallApk() {
     state.progress = -1.0f;
     state.progressLabel = "安装中…";
     app::async::runOnce(
-        "adb.install",
+        uniqueAsyncKey("adb.install"),
         [adb, serial, apk]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, core::installApkArgs(serial, apk), 300000);
             if (r.exitCode != 0) {
@@ -1816,7 +1864,7 @@ void doInstallApk() {
 void fetchAdbVersion() {
     if (state.adbPath.empty()) return;
     const std::string adb = state.adbPath;
-    app::async::runOnce(
+    app::async::restart(
         "adb.version",
         [adb]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, {"version"}, 15000);
@@ -2934,7 +2982,7 @@ void checkForUpdates() {
     state.updateStatus = "正在检查更新…";
     const std::string adb = state.adbPath;
     const std::string scrcpy = findScrcpy();
-    app::async::runOnce(
+    app::async::restart(
         "update.check",
         [adb, scrcpy]() -> app::async::Result<UpdateInfo> {
             UpdateInfo info;
@@ -3207,7 +3255,7 @@ void saveTextPreview() {
     const std::string remote = state.textPreviewRemote;
     const std::string content = state.textPreviewContent;
     state.busy = true;
-    app::async::runOnce(
+    app::async::restart(
         "adb.text.save",
         [adb, serial, remote, content]() -> app::async::Result<std::string> {
             const std::string tmp = "adb_browser_edit_tmp.txt";
@@ -3232,9 +3280,349 @@ void saveTextPreview() {
         });
 }
 
+// -----------------------------------------------------------------------------
+// External editing: pull a phone file, open it with the user's own program, and
+// push every change straight back to the file it came from.
+//
+// Why not just the built-in editor: the phone is full of file types the app
+// cannot render (Office documents, PDFs, source code with a real editor, images
+// that want a real image viewer). Doing the round trip through the default
+// program means the app does not have to grow an editor for each of them, and
+// "edit on the phone" stops being a second-class operation.
+//
+// Sync model, deliberately simple:
+//   * the local copy is polled (about twice a second) for a change in write time
+//     or size; polling a path rather than watching a handle also covers editors
+//     that save by writing a temporary file and renaming it over the original,
+//     which a handle-based watcher would miss;
+//   * a change must survive two polls unchanged before it is pushed, so a partial
+//     write is never sent;
+//   * the push goes to the exact remote path it was pulled from, overwriting it.
+//     No conflict detection: the local file is what the user just edited, and
+//     asking on every save would defeat "changes go back immediately".
+// -----------------------------------------------------------------------------
+
+// Where the pulled copies live: one tree per app instance would be tidier, but a
+// stable location means an editor that keeps the file open across app restarts
+// still points at something real.
+std::string externalEditRootDir() {
+    return core::executableDir() + "\\edit-cache";
+}
+
+// Turns a phone path into a local one under the cache root. Every component is
+// sanitised because Windows forbids <>:"|?* in names, and the phone path is
+// otherwise used verbatim so the local file name keeps its extension.
+std::string localPathForRemote(const std::string& serial, const std::string& remote) {
+    auto sanitize = [](const std::string& part) {
+        std::string out;
+        for (char c : part) {
+            const bool illegal = c == '<' || c == '>' || c == ':' || c == '"' || c == '|' ||
+                                 c == '?' || c == '*' || c == '\\' ||
+                                 static_cast<unsigned char>(c) < 0x20;
+            out += illegal ? '_' : c;
+        }
+        return out;
+    };
+
+    std::string path = externalEditRootDir() + "\\" + sanitize(serial);
+    std::size_t start = 0;
+    while (start < remote.size()) {
+        std::size_t end = remote.find('/', start);
+        if (end == std::string::npos) end = remote.size();
+        const std::string part = remote.substr(start, end - start);
+        if (!part.empty()) path += "\\" + sanitize(part);
+        start = end + 1;
+    }
+    return path;
+}
+
+// Hands the file to whatever the user has associated with it. Returns false when
+// Windows has no program for that type, so the caller can say so instead of
+// silently doing nothing.
+bool openWithDefaultProgram(const std::string& localPath, std::string& err) {
+#ifdef _WIN32
+    const std::wstring wide = core::toWide(localPath);
+    const HINSTANCE result =
+        ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    // ShellExecuteW reports anything <= 32 as an error code, not a handle.
+    if (reinterpret_cast<INT_PTR>(result) <= 32) {
+        err = "系统没有为该文件类型关联程序";
+        return false;
+    }
+    return true;
+#else
+    (void)localPath;
+    err = "仅支持 Windows";
+    return false;
+#endif
+}
+
+// Refreshes directory entries after a file's size or content changed under us.
+void refreshAfterExternalEdit(const std::string& serial, const std::string& remote) {
+    if (serial != state.selectedDevice) return;
+    const std::size_t slash = remote.find_last_of('/');
+    const std::string dir = slash == std::string::npos ? std::string("/") : remote.substr(0, slash);
+    if (dir == state.currentPath) refreshListing(true);
+}
+
+// Finds the session for a phone path. Looked up by path rather than remembered by
+// index, because a push completes asynchronously and the list can change while it
+// is in flight.
+std::size_t findExternalEdit(const std::string& serial, const std::string& remote) {
+    for (std::size_t i = 0; i < state.externalEdits.size(); ++i) {
+        if (state.externalEdits[i].serial == serial && state.externalEdits[i].remote == remote) {
+            return i;
+        }
+    }
+    return static_cast<std::size_t>(-1);
+}
+
+// Removes a session. `deleteLocalFile` is false when a push just failed, so the
+// edited copy stays on disk rather than being thrown away with the session.
+void dropExternalEdit(std::size_t index, bool deleteLocalFile) {
+    if (index >= state.externalEdits.size()) return;
+    if (deleteLocalFile) {
+        std::error_code ec;
+        std::filesystem::remove(state.externalEdits[index].local, ec);
+    }
+    state.externalEdits.erase(state.externalEdits.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+// Starts a push of one session's local file back to the phone.
+void pushExternalEdit(std::size_t index) {
+    if (index >= state.externalEdits.size()) return;
+    ExternalEdit& edit = state.externalEdits[index];
+    if (edit.syncing) return;
+    if (state.adbPath.empty()) {
+        edit.status = "失败：未找到 adb";
+        return;
+    }
+
+    const std::string adb = state.adbPath;
+    const std::string serial = edit.serial;
+    const std::string local = edit.local;
+    const std::string remote = edit.remote;
+    const std::string name = edit.name;
+    const std::int64_t pushedTicks = edit.writeTicks;
+    edit.syncing = true;
+    edit.status = "同步中…";
+
+    app::async::restart(
+        "external.edit.push." + remote,
+        [adb, serial, local, remote]() -> app::async::Result<std::string> {
+            ProcessResult r = runProcess(adb, core::pushArgs(serial, local, remote), 120000);
+            if (r.exitCode != 0) {
+                std::string message = core::trim(r.out);
+                if (message.empty()) message = core::trim(r.err);
+                return app::async::failure<std::string>(
+                    message.empty() ? "同步失败（退出码 " + std::to_string(r.exitCode) + "）" : message);
+            }
+            return app::async::success<std::string>("已同步");
+        },
+        [serial, remote, name, pushedTicks](const app::async::Result<std::string>& result) {
+            const std::size_t index = findExternalEdit(serial, remote);
+            if (index == static_cast<std::size_t>(-1)) return;  // stopped meanwhile
+            ExternalEdit& edit = state.externalEdits[index];
+            edit.syncing = false;
+
+            if (result.ok) {
+                // Only clear the debt if nothing changed while the push was in
+                // flight; otherwise a later poll pushes the newer content.
+                if (edit.writeTicks == pushedTicks) {
+                    edit.pendingPush = false;
+                    edit.status = "已同步";
+                } else {
+                    edit.status = "已同步（又有新改动，稍后再次同步）";
+                }
+                toast("已同步到手机", name + " → " + remote);
+                refreshAfterExternalEdit(serial, remote);
+            } else {
+                edit.status = "失败：" + result.error;
+                edit.pendingPush = true;  // keep owing it, so a later poll retries
+                // Do not hammer a failing push once per frame.
+                edit.nextAttemptMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count() + 4000;
+                toast("同步失败", name + "：" + result.error);
+                if (edit.stopAfterPush) {
+                    // Stopping was requested, but do not throw the edit away.
+                    edit.stopAfterPush = false;
+                    toast("已停止同步但未同步成功", "文件保留在：" + edit.local);
+                }
+                return;
+            }
+
+            if (edit.stopAfterPush) {
+                dropExternalEdit(index, true);
+            }
+        });
+}
+
+// Stops watching one session. Anything still owed is pushed first, so the phone is
+// never left holding an older version than the editor owns.
+void stopExternalEdit(std::size_t index) {
+    if (index >= state.externalEdits.size()) return;
+    ExternalEdit& edit = state.externalEdits[index];
+    if (edit.pendingPush && !edit.syncing) {
+        edit.stopAfterPush = true;
+        pushExternalEdit(index);
+        return;
+    }
+    if (edit.syncing) {
+        edit.stopAfterPush = true;  // dropped by the push's completion handler
+        return;
+    }
+    dropExternalEdit(index, true);
+}
+
+// Best-effort final flush when the process is going away: an edit made moments
+// before closing must not be lost to the debounce window. Registered lazily, the
+// first time a file is opened in an external editor.
+void flushExternalEditsOnExit() {
+    if (state.externalEdits.empty()) return;
+    std::vector<std::size_t> owed;
+    for (std::size_t i = 0; i < state.externalEdits.size(); ++i) {
+        if (state.externalEdits[i].pendingPush) owed.push_back(i);
+    }
+    if (owed.empty() || state.adbPath.empty()) return;
+    for (std::size_t i : owed) {
+        const ExternalEdit& edit = state.externalEdits[i];
+        runProcess(state.adbPath, core::pushArgs(edit.serial, edit.local, edit.remote), 15000);
+    }
+}
+
+// Pulls the file, opens it and starts watching.
+void openExternalEditor(const std::string& name) {
+    if (state.selectedDevice.empty()) {
+        toast("未选择设备", "请先选择设备。");
+        return;
+    }
+    if (state.adbPath.empty()) {
+        toast("未找到 adb", "无法下载文件。");
+        return;
+    }
+    const std::string remote = core::joinPath(state.currentPath, name);
+    const std::string serial = state.selectedDevice;
+    const std::string local = localPathForRemote(serial, remote);
+
+    // Already open? Just bring it back up instead of pulling over live edits.
+    for (std::size_t i = 0; i < state.externalEdits.size(); ++i) {
+        const ExternalEdit& edit = state.externalEdits[i];
+        if (edit.remote == remote && edit.serial == serial) {
+            std::string err;
+            if (openWithDefaultProgram(edit.local, err)) {
+                toast("已打开", name);
+            } else {
+                toast("打开失败", err);
+            }
+            state.externalEditListOpen = true;
+            return;
+        }
+    }
+
+    const std::string adb = state.adbPath;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(local).parent_path(), ec);
+
+    state.busy = true;
+    app::async::restart(
+        "external.edit.pull." + remote,
+        [adb, serial, remote, local]() -> app::async::Result<std::string> {
+            const std::string dir = std::filesystem::path(local).parent_path().string();
+            ProcessResult r = runProcess(adb, core::pullArgs(serial, remote, dir), 300000);
+            if (r.exitCode != 0) {
+                std::string message = core::trim(r.out);
+                if (message.empty()) message = core::trim(r.err);
+                return app::async::failure<std::string>(
+                    message.empty() ? "下载失败（退出码 " + std::to_string(r.exitCode) + "）" : message);
+            }
+            return app::async::success<std::string>(std::string(local));
+        },
+        [remote, serial, local, name](const app::async::Result<std::string>& result) {
+            state.busy = false;
+            if (!result.ok) {
+                toast("打开失败", result.error);
+                return;
+            }
+            ExternalEdit edit;
+            edit.remote = remote;
+            edit.local = local;
+            edit.name = name;
+            edit.serial = serial;
+            edit.status = "已打开";
+            std::error_code ec;
+            if (std::filesystem::exists(local, ec)) {
+                std::error_code timeEc;
+                const auto stamp = std::filesystem::last_write_time(local, timeEc);
+                if (!timeEc) edit.writeTicks = stamp.time_since_epoch().count();
+                std::error_code sizeEc;
+                edit.size = std::filesystem::file_size(local, sizeEc);
+            }
+            state.externalEdits.push_back(edit);
+
+            static bool exitHookInstalled = false;
+            if (!exitHookInstalled) {
+                exitHookInstalled = true;
+                std::atexit(flushExternalEditsOnExit);
+            }
+
+            std::string err;
+            if (openWithDefaultProgram(local, err)) {
+                toast("已用电脑程序打开", name + "\n改动会自动同步回手机原目录。");
+            } else {
+                // Keep watching anyway: the user can open it by hand, and the
+                // manager dialog still shows where the file is.
+                toast("无法自动打开", err + "\n文件已下载到：" + local);
+                state.externalEditListOpen = true;
+            }
+        });
+}
+
+// Called from the frame loop: notices local edits and pushes them.
+//
+// The debounce is measured in wall-clock time rather than in frames on purpose.
+// The user is editing in another program, so this app is in the background and its
+// frame loop is slow; counting frames there stretched the "push immediately"
+// promise to about six seconds. Time-based, the push happens on the first frame
+// after the file has been quiet for the settle interval.
+void pollExternalEdits() {
+    if (state.externalEdits.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state.lastExternalEditPoll < std::chrono::milliseconds(300)) return;
+    state.lastExternalEditPoll = now;
+    const std::int64_t nowMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    // How long a file must stop changing before its content is pushed.
+    constexpr std::int64_t kSettleMs = 700;
+
+    for (std::size_t i = 0; i < state.externalEdits.size(); ++i) {
+        ExternalEdit& edit = state.externalEdits[i];
+        std::error_code timeEc;
+        const auto stamp = std::filesystem::last_write_time(edit.local, timeEc);
+        if (timeEc) {
+            // The user deleted or replaced the file; nothing to sync.
+            continue;
+        }
+        std::error_code sizeEc;
+        const std::uintmax_t size = std::filesystem::file_size(edit.local, sizeEc);
+        const std::int64_t ticks = stamp.time_since_epoch().count();
+
+        if (ticks != edit.writeTicks || (!sizeEc && size != edit.size)) {
+            edit.writeTicks = ticks;
+            if (!sizeEc) edit.size = size;
+            edit.pendingPush = true;
+            edit.nextAttemptMs = nowMs + kSettleMs;  // wait for the writer to settle
+            if (!edit.syncing) edit.status = "检测到改动…";
+            continue;
+        }
+        if (!edit.pendingPush || edit.syncing) continue;
+        if (nowMs < edit.nextAttemptMs) continue;
+        pushExternalEdit(i);
+    }
+}
+
 // --- Copy path / filename ---
-void copyPathToClipboard() {
-    if (state.selectedEntry.empty()) return;
+void copyPathToClipboard() {    if (state.selectedEntry.empty()) return;
     const std::string path = core::joinPath(state.currentPath, state.selectedEntry);
     // ::core is the framework's namespace; the unqualified "core" inside
     // namespace app is the alias for adb::core declared above.
@@ -3315,7 +3703,7 @@ void uninstallSelectedApp() {
     const std::string pkg = state.appSelectedPackage;
     state.busy = true;
     app::async::runOnce(
-        "adb.uninstall",
+        uniqueAsyncKey("adb.uninstall"),
         [adb, serial, pkg]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, core::uninstallArgs(serial, pkg), 120000);
             if (r.exitCode != 0) {
@@ -3338,7 +3726,7 @@ void clearSelectedAppData() {
     const std::string pkg = state.appSelectedPackage;
     state.busy = true;
     app::async::runOnce(
-        "adb.app.clear",
+        uniqueAsyncKey("adb.app.clear"),
         [adb, serial, pkg]() -> app::async::Result<std::string> {
             ProcessResult r = runProcess(adb, core::clearAppDataArgs(serial, pkg), 120000);
             if (r.exitCode != 0) {
@@ -4027,6 +4415,21 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
                [] { openMirror(); });
     composeHoverTip(ui, "topbar.mirror.tip", "topbar.mirror.bg", "投屏", mirrorX + h * 0.5f, y + h + 4.0f);
 
+    // Files opened in an external editor; highlighted while something is unsynced.
+    const float extX = mirrorX + h + 6.0f;
+    std::size_t extPending = 0;
+    for (const ExternalEdit& edit : state.externalEdits) {
+        if (edit.pendingPush) ++extPending;
+    }
+    const std::string extTip =
+        state.externalEdits.empty()
+            ? "外部编辑（用电脑的程序打开文件）"
+            : ("外部编辑：" + std::to_string(state.externalEdits.size()) + " 个文件" +
+               (extPending > 0 ? "，" + std::to_string(extPending) + " 个待同步" : ""));
+    toolButton(ui, "topbar.extedit", extX, y, h, h, 0xF044, "", extPending > 0, true,
+               [] { state.externalEditListOpen = true; });
+    composeHoverTip(ui, "topbar.extedit.tip", "topbar.extedit.bg", extTip, extX + h * 0.5f, y + h + 4.0f);
+
     // Right-aligned file actions (always icon-only, described by tooltips).
     const bool canAct = !state.selectedEntry.empty();
     float rightX = x + w;
@@ -4447,6 +4850,7 @@ void composeRowMenu(eui::Ui& ui, float w, float h) {
     }
     if (!isDir) {
         items.push_back("查看/编辑"); actions.push_back([] { openTextPreview(state.selectedEntry); });
+        items.push_back("用电脑程序打开"); actions.push_back([] { openExternalEditor(state.selectedEntry); });
         items.push_back("预览图片"); actions.push_back([] { openImagePreview(state.selectedEntry); });
     }
     items.push_back("复制路径"); actions.push_back([] { copyPathToClipboard(); });
@@ -5377,8 +5781,89 @@ void composeSetupDialog(eui::Ui& ui, float w, float h) {
         .build();
 }
 
-void composeConfirmDialog(eui::Ui& ui, float w, float h) {
-    components::dialog(ui, "confirm.dialog")
+// -----------------------------------------------------------------------------
+// Manager for the files currently open in an external editor.
+// -----------------------------------------------------------------------------
+void composeExternalEditDialog(eui::Ui& ui, float w, float h) {
+    const float pw = std::min(620.0f, std::max(400.0f, w - 48.0f));
+    const float rowH = 46.0f;
+    const std::size_t count = state.externalEdits.size();
+    const float ph = std::min(460.0f, 132.0f + rowH * static_cast<float>(count ? count : 1));
+
+    std::size_t pending = 0;
+    for (const ExternalEdit& edit : state.externalEdits) {
+        if (edit.pendingPush) ++pending;
+    }
+
+    components::dialog(ui, "extedit.dialog")
+        .screen(w, h)
+        .open(state.externalEditListOpen)
+        .theme(themeTokens())
+        .size(pw, ph)
+        .zIndex(1350)
+        .content([&] {
+            ui.text("extedit.title")
+                .x(24.0f).y(16.0f).size(pw - 48.0f, 30.0f)
+                .text("外部编辑（用电脑的程序打开，改动自动同步回手机）")
+                .fontSize(17.0f).lineHeight(17.0f)
+                .color(kInk)
+                .build();
+            ui.text("extedit.hint")
+                .x(24.0f).y(46.0f).size(pw - 48.0f, 20.0f)
+                .text(count == 0
+                          ? "没有正在外部编辑的文件。在文件上右键选「用电脑程序打开」。"
+                          : ("正在监听 " + std::to_string(count) + " 个文件" +
+                             (pending > 0 ? "，其中 " + std::to_string(pending) + " 个待同步"
+                                          : "，都已同步")))
+                .fontSize(12.0f).lineHeight(12.0f)
+                .color(kMuted)
+                .build();
+
+            for (std::size_t i = 0; i < count; ++i) {
+                const ExternalEdit& edit = state.externalEdits[i];
+                const float rowY = 78.0f + rowH * static_cast<float>(i);
+                ui.rect("extedit.row.bg." + std::to_string(i))
+                    .x(24.0f).y(rowY - 4.0f).size(pw - 48.0f, rowH - 6.0f)
+                    .color(kSurface)
+                    .radius(8.0f)
+                    .border(1.0f, kBorder)
+                    .build();
+                ui.text("extedit.row.name." + std::to_string(i))
+                    .x(36.0f).y(rowY).size(pw - 48.0f - 200.0f, 20.0f)
+                    .text(edit.name)
+                    .fontSize(13.5f).lineHeight(13.5f)
+                    .color(kInk)
+                    .build();
+                ui.text("extedit.row.status." + std::to_string(i))
+                    .x(36.0f).y(rowY + 19.0f).size(pw - 48.0f - 200.0f, 18.0f)
+                    .text(edit.status + "   " + edit.remote)
+                    .fontSize(11.0f).lineHeight(11.0f)
+                    .color(edit.pendingPush ? kAccent : kMuted)
+                    .build();
+
+                const std::size_t index = i;
+                toolButton(ui, "extedit.row.sync." + std::to_string(i),
+                           pw - 24.0f - 176.0f, rowY, 84.0f, 30.0f, 0xF021, "立即同步", false,
+                           !edit.syncing, [index] { pushExternalEdit(index); });
+                toolButton(ui, "extedit.row.stop." + std::to_string(i),
+                           pw - 24.0f - 84.0f, rowY, 84.0f, 30.0f, 0xF00D, "停止", false, true,
+                           [index] { stopExternalEdit(index); });
+            }
+
+            toolButton(ui, "extedit.close", 24.0f, ph - 48.0f, 110.0f, 34.0f,
+                       0xF00D, "关闭", false, true, [] { state.externalEditListOpen = false; });
+            toolButton(ui, "extedit.syncall", 142.0f, ph - 48.0f, 110.0f, 34.0f,
+                       0xF021, "全部同步", false, pending > 0, [] {
+                           for (std::size_t i = 0; i < state.externalEdits.size(); ++i) {
+                               if (state.externalEdits[i].pendingPush) pushExternalEdit(i);
+                           }
+                       });
+        })
+        .onOpenChange([](bool v) { state.externalEditListOpen = v; })
+        .build();
+}
+
+void composeConfirmDialog(eui::Ui& ui, float w, float h) {    components::dialog(ui, "confirm.dialog")
         .screen(w, h)
         .open(state.confirmDialogOpen)
         .theme(themeTokens())
@@ -5868,6 +6353,8 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
     const float H = screen.height;
     state.logicalW = W;
     state.logicalH = H;
+    // Watches the local copies of files being edited in external programs.
+    pollExternalEdits();
     const float margin = 14.0f;
     const float contentW = std::max(0.0f, W - margin * 2.0f);
     const float x = margin;
@@ -5909,6 +6396,7 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeSettingsDialog(ui, W, H);
             composeUpdateDialog(ui, W, H);
             composeSetupDialog(ui, W, H);
+            composeExternalEditDialog(ui, W, H);
             composeBookmarkManageDialog(ui, W, H);
             composeCommandManageDialog(ui, W, H);
             composeCommandOutputDialog(ui, W, H);
