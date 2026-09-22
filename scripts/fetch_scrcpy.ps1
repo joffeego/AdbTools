@@ -18,7 +18,17 @@ $ErrorActionPreference = "Stop"
 # Resolve "latest" to the current release tag.
 if ($Version -eq "latest") {
     Write-Host "Querying latest scrcpy version from GitHub..."
+    # Authenticate when a token is available. Unauthenticated GitHub API requests
+    # are limited to 60/hour *per IP*, and GitHub-hosted runners share IPs, so the
+    # release build failed with "API rate limit exceeded" until the workflow
+    # started passing GITHUB_TOKEN through. The token needs no scopes for a public
+    # repository.
     $headers = @{ "User-Agent" = "AdbTools-build" }
+    if ($env:GITHUB_TOKEN) {
+        $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN"
+    } else {
+        Write-Host "  (no GITHUB_TOKEN set - the API call is unauthenticated and may be rate limited)"
+    }
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/Genymobile/scrcpy/releases/latest" -Headers $headers
     $Version = ($release.tag_name).TrimStart('v')
     if (-not $Version) { throw "Failed to resolve the latest scrcpy version." }

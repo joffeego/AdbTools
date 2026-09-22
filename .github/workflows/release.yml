@@ -79,6 +79,11 @@ jobs:
 
       - name: Fetch scrcpy + adb
         shell: pwsh
+        env:
+          # The script queries api.github.com to resolve "latest". Unauthenticated
+          # requests are rate limited per IP and hosted runners share IPs, which
+          # made this step fail with "API rate limit exceeded".
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/fetch_scrcpy.ps1 -Version latest -OutDir build/scrcpy
 
       - name: Set version
