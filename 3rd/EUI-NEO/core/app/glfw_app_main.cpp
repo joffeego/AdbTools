@@ -99,7 +99,6 @@ void setWindowSize(int width, int height) {
     glfwSetWindowSize(g_mainWindow, width, height);
 }
 
-
 void setMinWindowSize(int width, int height) {
     if (g_mainWindow == nullptr) {
         return;
