@@ -396,6 +396,12 @@ struct AppState {
     std::string fontFilter;
     bool fontOnlyChinese = true;
 
+    // Window size persistence: the last size observed, and when it last changed
+    // (see pollWindowSizeForSave).
+    int pendingWindowW = 0;
+    int pendingWindowH = 0;
+    std::chrono::steady_clock::time_point windowSizeSaveAt;
+
     // Generic confirm dialog (title/message + primary action).
     std::string confirmPrimaryText = "删除";
     std::function<void()> confirmAction;
@@ -887,13 +893,60 @@ void saveWindowState() {
 #ifdef _WIN32
     HWND hwnd = static_cast<HWND>(app::mainWindowHwnd());
     if (hwnd == nullptr || app::isWindowMaximized()) return;
+    // The window rect, matching what restoreWindowState() sets (see the note there:
+    // GLFW's own size pair is not symmetric for this window). Stored in logical
+    // units so a different monitor or DPI than the one it was saved on still
+    // restores sensibly.
     RECT rc{};
-    GetWindowRect(hwnd, &rc);
-    // Persist a logical (DPI-independent) size so it restores correctly on a
-    // different monitor/DPI than the one it was saved on.
+    if (!GetWindowRect(hwnd, &rc)) return;
+    const int width = rc.right - rc.left;
+    const int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) return;
     const float scale = windowDpiScale();
-    settings.windowW = static_cast<int>((rc.right - rc.left) / scale);
-    settings.windowH = static_cast<int>((rc.bottom - rc.top) / scale);
+    settings.windowW = static_cast<int>(width / scale + 0.5f);
+    settings.windowH = static_cast<int>(height / scale + 0.5f);
+    saveSettings();
+#endif
+}
+
+// Persists the window size as it changes, instead of only when the in-app close
+// button is pressed. Closing from the taskbar, Alt+F4 or a crash otherwise loses
+// whatever size the user just chose - and the size is the one window property that
+// is meant to be remembered.
+//
+// Debounced: dragging a resize handle changes the size on every frame, and one
+// settings write per drag is enough.
+void pollWindowSizeForSave() {
+#ifdef _WIN32
+    if (state.windowSizeSaveAt.time_since_epoch().count() == 0) {
+        state.windowSizeSaveAt = std::chrono::steady_clock::now();
+    }
+    if (app::isWindowMaximized()) return;
+    HWND hwnd = static_cast<HWND>(app::mainWindowHwnd());
+    if (hwnd == nullptr) return;
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc)) return;  // same measurement saveWindowState uses
+    const int rawW = rc.right - rc.left;
+    const int rawH = rc.bottom - rc.top;
+    if (rawW <= 0 || rawH <= 0) return;
+    const float scale = windowDpiScale();
+    const int w = static_cast<int>(rawW / scale + 0.5f);
+    const int h = static_cast<int>(rawH / scale + 0.5f);
+    if (w < 400 || h < 300) return;  // ignore nonsense sizes mid-transition
+
+    if (w != state.pendingWindowW || h != state.pendingWindowH) {
+        state.pendingWindowW = w;
+        state.pendingWindowH = h;
+        state.windowSizeSaveAt = std::chrono::steady_clock::now();
+        return;
+    }
+    if (w == settings.windowW && h == settings.windowH) return;
+    if (std::chrono::steady_clock::now() - state.windowSizeSaveAt <
+        std::chrono::milliseconds(800)) {
+        return;
+    }
+    settings.windowW = w;
+    settings.windowH = h;
     saveSettings();
 #endif
 }
@@ -920,8 +973,66 @@ void restoreWindowState() {
         int w = static_cast<int>(settings.windowW * scale);
         int h = static_cast<int>(settings.windowH * scale);
         clampToWorkArea(w, h);
-        app::setWindowSize(w, h);
+        // Set the window rect directly instead of going through app::setWindowSize().
+        // For this window (undecorated, custom title bar) GLFW adds the frame of its
+        // resize style to the requested size when setting - measured 15x37 px - and
+        // does not subtract it again when reading the size back, so restoring what
+        // had been saved grew the window a little on every launch. Win32 set and get
+        // on the window rect are symmetric, which is what the saved value needs.
+        HWND hwnd = static_cast<HWND>(app::mainWindowHwnd());
+        if (hwnd == nullptr) {
+            app::setWindowSize(w, h);
+            return;
+        }
+        RECT rc{};
+        if (!GetWindowRect(hwnd, &rc)) {
+            app::setWindowSize(w, h);
+            return;
+        }
+        SetWindowPos(hwnd, nullptr, rc.left, rc.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
+}
+
+// Put the window in the middle of the work area every time the app starts.
+//
+// The SIZE is deliberately remembered between runs - resizing is a choice the user
+// made - but the POSITION is not remembered at all, in either direction: nothing is
+// saved about it and nothing is restored. A remembered position goes stale as soon
+// as the size changes, the resolution changes or a monitor is unplugged, and what
+// the window manager picks on its own (cascade, previous position of a same-titled
+// window) is just as arbitrary. Centring on the work area - which excludes the
+// taskbar - is the "open it somewhere sensible" default the user asked for.
+//
+// Uses the monitor the window is nearest to, so on a multi-monitor desktop it lands
+// in the middle of the monitor it already came up on rather than being yanked to
+// the primary one.
+void centerWindowOnWorkArea() {
+#ifdef _WIN32
+    HWND hwnd = static_cast<HWND>(app::mainWindowHwnd());
+    if (hwnd == nullptr) return;
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (monitor == nullptr || !GetMonitorInfoW(monitor, &info)) return;
+
+    // Centre the *outer* window, so the title bar and borders are inside the
+    // margin too rather than the client area alone.
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc)) return;
+    const int width = rc.right - rc.left;
+    const int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) return;
+
+    const RECT work = info.rcWork;
+    const int workWidth = work.right - work.left;
+    const int workHeight = work.bottom - work.top;
+    // When the window is bigger than the work area there is nothing to centre:
+    // align to the top-left so the title bar stays on screen and reachable.
+    const int x = work.left + (workWidth > width ? (workWidth - width) / 2 : 0);
+    const int y = work.top + (workHeight > height ? (workHeight - height) / 2 : 0);
+    SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+#endif
 }
 
 // Set the minimum window size so the fixed toolbar layout can't be shrunk into
@@ -6495,6 +6606,8 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
         app::setUiScale(settings.uiScale);
         restoreWindowState();
         applyMinWindowSize();
+        // Position is computed fresh every launch; only the size is remembered.
+        centerWindowOnWorkArea();
         fetchAdbVersion();
         refreshDevices();
         // Neither adb nor scrcpy ships with the app any more, so offer to fetch
@@ -6519,6 +6632,8 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
     state.logicalH = H;
     // Watches the local copies of files being edited in external programs.
     pollExternalEdits();
+    // Keeps the remembered window size current, whatever way the app is closed.
+    pollWindowSizeForSave();
     const float margin = 14.0f;
     const float contentW = std::max(0.0f, W - margin * 2.0f);
     const float x = margin;
