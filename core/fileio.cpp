@@ -60,8 +60,54 @@ bool isRegularFileNoThrow(const std::string& path) {
 #endif
 }
 
-bool writeFileAtomic(const std::string& path, const std::string& contents) {
+bool replaceFileOver(const std::string& src, const std::string& dst, std::string& err) {
     try {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+        if (!ec) return true;
+
+        const std::string originalError = ec.message();
+        const fs::path target(dst);
+        const fs::path aside =
+            target.parent_path() / (target.filename().string() + ".old");
+
+        // Overwriting a running executable is refused, but renaming one is
+        // allowed - so move the old file out of the way and create the new one
+        // under the original name.
+        std::error_code ecAside;
+        fs::remove(aside, ecAside);  // a leftover from an earlier update
+        ecAside.clear();
+        fs::rename(target, aside, ecAside);
+        if (ecAside) {
+            err = "替换 " + target.filename().string() + " 失败：" + originalError;
+            return false;
+        }
+
+        std::error_code ecCopy;
+        fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ecCopy);
+        if (ecCopy) {
+            // Put the original back: leaving the directory without a working
+            // adb.exe would be worse than the update not happening.
+            std::error_code ecRestore;
+            fs::rename(aside, target, ecRestore);
+            err = "替换 " + target.filename().string() + " 失败：" + ecCopy.message();
+            return false;
+        }
+
+        // Best effort. While the process that was using the old file is still
+        // running this fails, which is fine - the file simply stays as
+        // "<name>.old" until a later update tries again.
+        std::error_code ecCleanup;
+        fs::remove(aside, ecCleanup);
+        return true;
+    } catch (...) {
+        err = "替换文件失败";
+        return false;
+    }
+}
+
+bool writeFileAtomic(const std::string& path, const std::string& contents) {    try {
         namespace fs = std::filesystem;
         std::error_code ec;
         const fs::path target(path);

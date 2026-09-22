@@ -13,7 +13,7 @@
 namespace adb::core {
 
 // Keep in sync with the files listed above.
-inline constexpr const char* kAppVersion = "0.10.3";
+inline constexpr const char* kAppVersion = "0.10.4";
 
 // GitHub repository used by the in-app update check ("owner/name").
 inline constexpr const char* kAppUpdateRepo = "joffeego/AdbTools";

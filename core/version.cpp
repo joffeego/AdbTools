@@ -37,25 +37,56 @@ int compareVersions(const std::string& a, const std::string& b) {
 }
 
 std::string adbShortVersion(const std::string& out) {
-    // Match "version " case-insensitively: real adb output contains both
-    // "Android Debug Bridge version 1.0.41" (lowercase) and
-    // "Version 37.0.0-14910828" (capitalized), and which one carries the
-    // platform-tools revision differs between adb releases.
-    static const std::string kNeedle = "version ";
-    const std::string haystack = lower(out);
-    std::size_t pos = 0;
-    while ((pos = haystack.find(kNeedle, pos)) != std::string::npos) {
-        const std::size_t start = pos + kNeedle.size();
+    // adb's version output carries two different numbers:
+    //
+    //     Android Debug Bridge version 1.0.41      <- adb *protocol* version
+    //     Version 37.0.1-15733141                  <- platform-tools *revision*
+    //
+    // The updater compares this value against the revision published in Google's
+    // repository2-1.xml, so the revision line is the one that matters. Returning
+    // the protocol version (as this did) compared 1.0.41 against 37.0.1, which is
+    // always "older" - so the app offered an adb update on every single check,
+    // even when platform-tools was already current, and following through meant
+    // re-downloading 8 MB and replacing a perfectly good adb (which then failed,
+    // because a running adb.exe cannot be overwritten - see copyFileOver).
+    //
+    // Prefer a line that *begins* with "Version " (the revision), and fall back to
+    // the first "version <x.y.z>" anywhere in the text so older adb builds, which
+    // only print the protocol line, still report something usable.
+    auto leadingNumber = [](const std::string& s) {
         std::string v;
-        for (std::size_t i = start; i < out.size(); ++i) {
-            const char c = out[i];
-            if ((c >= '0' && c <= '9') || c == '.') v += c;
-            else break;
+        for (char c : s) {
+            if ((c >= '0' && c <= '9') || c == '.') {
+                v += c;
+            } else {
+                break;
+            }
         }
-        if (!v.empty()) return v;
-        pos = start;
+        return v;
+    };
+
+    std::string fallback;
+    std::size_t lineStart = 0;
+    while (lineStart <= out.size()) {
+        std::size_t lineEnd = out.find('\n', lineStart);
+        if (lineEnd == std::string::npos) lineEnd = out.size();
+        const std::string line = lower(trim(out.substr(lineStart, lineEnd - lineStart)));
+
+        static const std::string kVersionPrefix = "version ";
+        if (line.rfind(kVersionPrefix, 0) == 0) {
+            const std::string v = leadingNumber(line.substr(kVersionPrefix.size()));
+            if (!v.empty()) return v;
+        } else if (fallback.empty()) {
+            const std::size_t p = line.find(kVersionPrefix);
+            if (p != std::string::npos) {
+                fallback = leadingNumber(line.substr(p + kVersionPrefix.size()));
+            }
+        }
+
+        if (lineEnd == out.size()) break;
+        lineStart = lineEnd + 1;
     }
-    return "";
+    return fallback;
 }
 
 std::string scrcpyShortVersion(const std::string& out) {

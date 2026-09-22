@@ -54,14 +54,28 @@ ADB_TEST(compareVersions_garbage_is_treated_as_zero) {
     ADB_CHECK_EQ(compareVersions("", ""), 0);
 }
 
-ADB_TEST(adbShortVersion_reads_version_from_output) {
+ADB_TEST(adbShortVersion_prefers_the_platform_tools_revision) {
     const std::string out =
         "Android Debug Bridge version 1.0.41\n"
         "Version 37.0.0-14910828\n"
         "Installed as C:\\tools\\adb.exe\n";
-    // The first version-looking number wins, and the word "version" is matched
-    // case-insensitively so the lowercase line above is found as well.
-    ADB_CHECK_EQ(adbShortVersion(out), std::string("1.0.41"));
+    // The revision line, not the protocol line: this value is compared against
+    // the revision published in repository2-1.xml. Returning "1.0.41" here made
+    // the app offer an adb update forever (1.0.41 < 37.0.1) and then fail to
+    // replace the already-current adb.
+    ADB_CHECK_EQ(adbShortVersion(out), std::string("37.0.0"));
+}
+
+ADB_TEST(adbShortVersion_real_adb_output) {
+    // Verbatim output of platform-tools r37.0.1 on Windows.
+    const std::string out =
+        "Android Debug Bridge version 1.0.41\n"
+        "Version 37.0.1-15733141\n"
+        "Installed as C:\\Users\\x\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe\n"
+        "Running on Windows 10.0.26200\n";
+    ADB_CHECK_EQ(adbShortVersion(out), std::string("37.0.1"));
+    // And the comparison the updater makes must then agree that it is current.
+    ADB_CHECK_EQ(compareVersions(adbShortVersion(out), "37.0.1"), 0);
 }
 
 ADB_TEST(adbShortVersion_reads_capitalised_version_line) {
@@ -78,7 +92,9 @@ ADB_TEST(adbShortVersion_without_version_returns_empty) {
 }
 
 ADB_TEST(adbShortVersion_handles_installed_as_line) {
-    // Real adb output puts the interesting number on the second line.
+    // "Installed as ..." must not be mistaken for the version line.
+    ADB_CHECK_EQ(adbShortVersion("Installed as C:\\tools\\adb.exe\nVersion 36.0.2-1\n"),
+                 std::string("36.0.2"));
     ADB_CHECK_EQ(adbShortVersion("Android Debug Bridge version 1.0.41\n"), std::string("1.0.41"));
 }
 

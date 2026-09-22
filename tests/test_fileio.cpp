@@ -10,6 +10,13 @@
 #include <fstream>
 #include <string>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include "tests/test_main.h"
 
 using namespace adb::core;
@@ -188,3 +195,107 @@ ADB_TEST(writeFileAtomic_survives_a_non_utf8_path) {
     ADB_CHECK(!threw);
     ADB_CHECK(!ok);  // the directory does not exist, so this must fail cleanly
 }
+
+// -----------------------------------------------------------------------------
+// replaceFileOver
+//
+// The adb updater replaces adb.exe while the adb server is running it, and Linux
+// and Windows both refuse to overwrite a running executable - but Windows allows
+// renaming one, so the update moves the old file aside and copies the new one in.
+// These cases cover the plain path and both failure paths.
+// -----------------------------------------------------------------------------
+
+ADB_TEST(replaceFileOver_replaces_an_existing_file) {
+    TempDir dir("adbtools-test-replace-basic");
+    const std::string src = dir.file("new.exe");
+    const std::string dst = dir.file("adb.exe");
+    ADB_CHECK(writeFileAtomic(src, "new binary"));
+    ADB_CHECK(writeFileAtomic(dst, "old binary"));
+    std::string err;
+    ADB_CHECK(replaceFileOver(src, dst, err));
+    ADB_CHECK_EQ(err, std::string(""));
+    ADB_CHECK_EQ(readAll(dst), std::string("new binary"));
+    // No .old left behind when the old file was not in use.
+    ADB_CHECK(!fs::exists(dst + ".old"));
+}
+
+ADB_TEST(replaceFileOver_creates_a_missing_target) {
+    TempDir dir("adbtools-test-replace-create");
+    const std::string src = dir.file("new.exe");
+    const std::string dst = dir.file("adb.exe");
+    ADB_CHECK(writeFileAtomic(src, "fresh"));
+    std::string err;
+    ADB_CHECK(replaceFileOver(src, dst, err));
+    ADB_CHECK_EQ(readAll(dst), std::string("fresh"));
+}
+
+ADB_TEST(replaceFileOver_reports_a_missing_source) {
+    TempDir dir("adbtools-test-replace-nosrc");
+    const std::string dst = dir.file("adb.exe");
+    ADB_CHECK(writeFileAtomic(dst, "original"));
+    std::string err;
+    ADB_CHECK(!replaceFileOver(dir.file("no-such-file"), dst, err));
+    ADB_CHECK(!err.empty());
+    // The target must survive a failed replace untouched.
+    ADB_CHECK_EQ(readAll(dst), std::string("original"));
+}
+
+#ifdef _WIN32
+// A running image is the one thing Windows will not let you overwrite, and that
+// is precisely the adb updater's problem: it replaces adb.exe while the adb
+// server is executing it, so the update used to fail with "file is in use". A
+// merely open file is NOT equivalent - Windows happily replaces those (POSIX
+// delete semantics), which is why this test starts a real process.
+ADB_TEST(replaceFileOver_replaces_a_running_executable) {
+    TempDir dir("adbtools-test-replace-running");
+    const std::string victim = dir.file("victim.exe");
+    const std::string src = dir.file("new.bin");
+
+    // The test binary we are running right now makes a convenient victim: with
+    // --sleep it stays alive until we kill it.
+    wchar_t self[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, self, MAX_PATH);
+    ADB_CHECK(n > 0 && n < MAX_PATH);
+    std::error_code ec;
+    fs::copy_file(fs::path(std::wstring(self, n)), fs::path(victim),
+                  fs::copy_options::overwrite_existing, ec);
+    ADB_CHECK(!ec);
+    ADB_CHECK(writeFileAtomic(src, "new binary"));
+
+    std::string cmd = "\"" + victim + "\" --sleep";
+    std::string mutableCmd = cmd;
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL launched = CreateProcessA(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    ADB_CHECK(launched);
+    if (!launched) return;
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, 100);  // let it map its image
+
+    // The plain overwrite really does fail while it runs - so the test is testing
+    // what it claims to.
+    std::error_code plainEc;
+    fs::copy_file(src, victim, fs::copy_options::overwrite_existing, plainEc);
+    const bool plainCopyFailed = static_cast<bool>(plainEc);
+
+    std::string err;
+    const bool replaced = replaceFileOver(src, victim, err);
+
+    TerminateProcess(pi.hProcess, 0);
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hProcess);
+
+    ADB_CHECK(plainCopyFailed);
+    ADB_CHECK(replaced);
+    ADB_CHECK_EQ(err, std::string(""));
+    ADB_CHECK_EQ(readAll(victim), std::string("new binary"));
+
+    // The moved-aside copy may still have been locked when cleanup ran, in which
+    // case it is left as victim.exe.old on purpose; remove it now that the
+    // process is gone.
+    std::error_code cleanupEc;
+    fs::remove(victim + ".old", cleanupEc);
+}
+#endif

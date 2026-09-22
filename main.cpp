@@ -2462,10 +2462,10 @@ std::string findDirContaining(const std::filesystem::path& root, const std::stri
 }
 
 bool copyFileOver(const std::filesystem::path& src, const std::filesystem::path& dst, std::string& err) {
-    std::error_code ec;
-    std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
-    if (ec) { err = "复制 " + src.filename().string() + " 失败：" + ec.message(); return false; }
-    return true;
+    // core::replaceFileOver rather than std::filesystem::copy_file directly: the
+    // adb updater replaces adb.exe while it is still running, and Windows refuses
+    // to overwrite a running image (it only allows renaming it). See core/fileio.h.
+    return core::replaceFileOver(src.string(), dst.string(), err);
 }
 
 void cleanupDir(const std::string& dir) {

@@ -43,4 +43,22 @@ bool writeFileAtomic(const std::string& path, const std::string& contents);
 // mismatched entry simply reports "not found" rather than killing the process.
 bool isRegularFileNoThrow(const std::string& path);
 
+// Copy `src` over `dst`, replacing `dst` if it exists. Never throws.
+//
+// The obvious std::filesystem::copy_file(..., overwrite_existing) fails when the
+// destination is a *running executable*, and that is not a corner case here: the
+// adb updater replaces adb.exe while the adb server (and any adb client that has
+// not exited yet) is running it. Windows refuses to overwrite a running image,
+// but it does allow renaming one, so on a sharing violation the existing file is
+// moved aside to "<name>.old" and the copy is retried. That is the same trick the
+// app's self-updater uses for adb_browser.exe.
+//
+// The moved-aside file is removed afterwards, best effort: while the process that
+// held it is still alive the delete fails, which is harmless and must not fail
+// the update.
+//
+// On failure `err` describes what went wrong, and the original file is put back if
+// it had to be moved aside.
+bool replaceFileOver(const std::string& src, const std::string& dst, std::string& err);
+
 }  // namespace adb::core
