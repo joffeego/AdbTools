@@ -218,6 +218,13 @@ struct ExternalEdit {
     std::string status;        // human-readable state, shown in the manager dialog
 };
 
+// Installed font families plus whether each one can render the interface's own
+// text (see fontFamilySupportsChinese).
+struct FontListResult {
+    std::vector<std::string> names;
+    std::vector<char> hasChinese;
+};
+
 struct AppState {
     bool initialized = false;
 
@@ -381,6 +388,13 @@ struct AppState {
     std::vector<ExternalEdit> externalEdits;
     bool externalEditListOpen = false;
     std::chrono::steady_clock::time_point lastExternalEditPoll;
+
+    // Font picker: whether the installed family can render the interface's own
+    // Chinese labels, and the filter the user is typing. (The family list itself
+    // is declared with the rest of the settings state.)
+    std::vector<char> fontListHasChinese;  // parallel to fontList
+    std::string fontFilter;
+    bool fontOnlyChinese = true;
 
     // Generic confirm dialog (title/message + primary action).
     std::string confirmPrimaryText = "删除";
@@ -678,7 +692,51 @@ int CALLBACK enumFontFamiliesProc(const LOGFONTW* logFont, const TEXTMETRICW*, D
     return 1;
 }
 
-std::vector<std::string> listSystemFonts() {
+// Does this family actually have the glyphs the interface needs?
+//
+// A Chinese Windows reports several hundred families and most of them are Latin
+// only, so picking one from the list turns every Chinese label into empty boxes.
+// Asking the font itself (rather than trusting the charset reported by the
+// enumeration, which is DEFAULT_CHARSET for most modern fonts) is the only
+// reliable answer: GGI_MARK_NONEXISTING_GLYPHS returns 0xFFFF for a character the
+// face has no glyph for.
+bool fontFamilySupportsChinese(const std::string& family) {
+    HDC dc = GetDC(nullptr);
+    if (dc == nullptr) return true;  // do not hide fonts if the check cannot run
+
+    LOGFONTW lf{};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    const std::wstring wide = core::toWide(family);
+    if (wide.size() < LF_FACESIZE) {
+        std::copy(wide.begin(), wide.end(), lf.lfFaceName);
+    }
+    HFONT font = CreateFontIndirectW(&lf);
+    HGDIOBJ previous = font != nullptr ? SelectObject(dc, font) : nullptr;
+
+    // A few characters that appear in the app's own labels plus a common one.
+    const wchar_t probe[] = {L'\u4E2D', L'\u6587', L'\u8BBE', L'\u7F6E'};
+    WORD glyphs[4] = {};
+    const DWORD count = GetGlyphIndicesW(dc, probe, 4, glyphs, GGI_MARK_NONEXISTING_GLYPHS);
+
+    bool supported = true;
+    if (count == GDI_ERROR) {
+        supported = true;  // inconclusive: keep the font visible
+    } else {
+        for (DWORD i = 0; i < count; ++i) {
+            if (glyphs[i] == 0xFFFF) {
+                supported = false;
+                break;
+            }
+        }
+    }
+
+    if (previous != nullptr) SelectObject(dc, previous);
+    if (font != nullptr) DeleteObject(font);
+    ReleaseDC(nullptr, dc);
+    return supported;
+}
+
+std::vector<std::string> listSystemFonts(std::vector<char>& hasChinese) {
     g_fontNames.clear();
     HDC dc = GetDC(nullptr);
     LOGFONTW lf{};
@@ -687,6 +745,12 @@ std::vector<std::string> listSystemFonts() {
     ReleaseDC(nullptr, dc);
     std::vector<std::string> names = g_fontNames;
     std::sort(names.begin(), names.end());
+
+    hasChinese.clear();
+    hasChinese.reserve(names.size());
+    for (const std::string& name : names) {
+        hasChinese.push_back(fontFamilySupportsChinese(name) ? 1 : 0);
+    }
     return names;
 }
 
@@ -756,6 +820,12 @@ std::string resolveFontFileForFamily(const std::string& family, int weight) {
                           (file.size() >= 2 && file[0] == '\\' && file[1] == '\\') ||
                           (file.size() >= 1 && file[0] == '/');
     return absolute ? file : "C:/Windows/Fonts/" + file;
+}
+#else
+// No system font enumeration off Windows; the picker shows a short fixed list.
+std::vector<std::string> listSystemFonts(std::vector<char>& hasChinese) {
+    hasChinese.assign(3, 1);
+    return {"Sans", "Serif", "Monospace"};
 }
 #endif
 
@@ -944,17 +1014,16 @@ void openSettingsDialog() {
         state.fontsLoaded = true;
         app::async::runOnce(
             "fonts.enum",
-#ifdef _WIN32
-            []() -> app::async::Result<std::vector<std::string>> {
-                return app::async::success(listSystemFonts());
+            []() -> app::async::Result<FontListResult> {
+                FontListResult fonts;
+                fonts.names = listSystemFonts(fonts.hasChinese);
+                return app::async::success(std::move(fonts));
             },
-#else
-            []() -> app::async::Result<std::vector<std::string>> {
-                return app::async::success(std::vector<std::string>{"Sans", "Serif", "Monospace"});
-            },
-#endif
-            [](const app::async::Result<std::vector<std::string>>& result) {
-                if (result.ok) state.fontList = result.value;
+            [](const app::async::Result<FontListResult>& result) {
+                if (result.ok) {
+                    state.fontList = result.value.names;
+                    state.fontListHasChinese = result.value.hasChinese;
+                }
             });
     }
 }
@@ -5300,10 +5369,87 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
 
-            const float fontListH = std::max(60.0f, ph - 188.0f - 16.0f);
+            // Which families to show. A Chinese Windows reports several hundred
+            // families, most of them Latin only, and the flat alphabetical list was
+            // unusable: hence a search box and a filter that hides fonts which
+            // cannot render the app's own labels (picking one turns every Chinese
+            // character into an empty box).
+            std::vector<std::size_t> visibleFonts;
+            visibleFonts.reserve(state.fontList.size());
+            const std::string needle = core::lower(core::trim(state.fontFilter));
+            // Family names that differ only by a weight suffix ("Noto Sans SC
+            // Light") are redundant here - the app has its own weight control - and
+            // they make the list several times longer than it needs to be. They are
+            // hidden unless the user is searching, in which case an explicit query
+            // should match everything.
+            const bool collapseWeights = needle.empty();
+            auto baseFamily = [](const std::string& name) -> std::string {
+                static const char* kWeightSuffixes[] = {
+                    " thin",     " extralight", " ultralight", " light",     " regular",
+                    " book",     " medium",     " demilight",  " semilight", " semibold",
+                    " demibold", " bold",       " extrabold", " black",     " heavy",
+                    " italic",   " oblique",    " condensed",  " narrow"};
+                const std::string lowered = core::lower(name);
+                for (const char* suffix : kWeightSuffixes) {
+                    const std::string s(suffix);
+                    if (lowered.size() > s.size() &&
+                        lowered.compare(lowered.size() - s.size(), s.size(), s) == 0) {
+                        return name.substr(0, name.size() - s.size());
+                    }
+                }
+                return name;
+            };
+            for (std::size_t i = 0; i < state.fontList.size(); ++i) {
+                const bool chinese = i < state.fontListHasChinese.size() &&
+                                     state.fontListHasChinese[i] != 0;
+                if (state.fontOnlyChinese && !chinese && state.fontList[i] != settings.fontFamily) {
+                    continue;
+                }
+                if (!needle.empty() && core::lower(state.fontList[i]).find(needle) == std::string::npos) {
+                    continue;
+                }
+                if (collapseWeights) {
+                    const std::string base = baseFamily(state.fontList[i]);
+                    if (base != state.fontList[i] &&
+                        std::find(state.fontList.begin(), state.fontList.end(), base) !=
+                            state.fontList.end()) {
+                        continue;  // a weight variant of a family that is listed anyway
+                    }
+                }
+                visibleFonts.push_back(i);
+            }
+
+            ui.stack("settings.font.search.wrap")
+                .x(pw - 24.0f - 190.0f).y(152.0f).size(190.0f, 34.0f)
+                .content([&] {
+                    components::input(ui, "settings.font.search")
+                        .theme(themeTokens())
+                        .size(190.0f, 34.0f)
+                        .fontSize(13.0f)
+                        .placeholder("搜索字体…")
+                        .value(state.fontFilter)
+                        .onChange([](const std::string& v) { state.fontFilter = v; })
+                        .build();
+                })
+                .build();
+            ui.stack("settings.font.cjk.wrap")
+                .x(24.0f).y(152.0f).size(200.0f, 34.0f)
+                .content([&] {
+                    components::checkbox(ui, "settings.font.cjk")
+                        .size(200.0f, 34.0f)
+                        .text("只显示支持中文的字体")
+                        .fontSize(12.5f)
+                        .theme(themeTokens())
+                        .checked(state.fontOnlyChinese)
+                        .onChange([](bool v) { state.fontOnlyChinese = v; })
+                        .build();
+                })
+                .build();
+
+            const float fontListH = std::max(60.0f, ph - 260.0f - 16.0f);
             if (state.fontList.empty()) {
                 ui.text("settings.font.loading")
-                    .x(24.0f).y(188.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(196.0f).size(pw - 48.0f, fontListH)
                     .text("正在加载字体…")
                     .fontSize(14.0f).lineHeight(14.0f)
                     .color(kMuted)
@@ -5311,8 +5457,17 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .verticalAlign(eui::VerticalAlign::Center)
                     .build();
             } else {
+                ui.text("settings.font.count")
+                    .x(24.0f).y(188.0f).size(pw - 48.0f, 18.0f)
+                    .text(visibleFonts.size() == state.fontList.size()
+                              ? ("共 " + std::to_string(state.fontList.size()) + " 个字体")
+                              : ("匹配 " + std::to_string(visibleFonts.size()) + " / " +
+                                 std::to_string(state.fontList.size()) + " 个字体"))
+                    .fontSize(11.5f).lineHeight(11.5f)
+                    .color(kMuted)
+                    .build();
                 ui.stack("settings.font.wrap")
-                    .x(24.0f).y(188.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(210.0f).size(pw - 48.0f, fontListH)
                     .content([&] {
                         ui.rect("settings.font.wrap.bg")
                             .size(pw - 48.0f, fontListH)
@@ -5325,14 +5480,19 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                             .theme(themeTokens())
                             .scrollbarWidth(8.0f)
                             .scrollbarGap(2.0f)
-                            .contentKey("settings.fonts." + std::to_string(state.fontList.size()))
+                            // The key includes the filter and the visible count so the
+                            // scroll view rebuilds when the list changes.
+                            .contentKey("settings.fonts." + std::to_string(visibleFonts.size()) +
+                                        "." + state.fontFilter +
+                                        (state.fontOnlyChinese ? ".cjk" : ".all"))
                             .content([&](eui::Ui& body, float cw, float) {
                                 const float rowH = 30.0f;
-                                for (std::size_t i = 0; i < state.fontList.size(); ++i) {
-                                    const std::string& name = state.fontList[i];
+                                for (std::size_t r = 0; r < visibleFonts.size(); ++r) {
+                                    const std::size_t index = visibleFonts[r];
+                                    const std::string& name = state.fontList[index];
                                     const bool selected = (name == settings.fontFamily);
-                                    const std::string id = "settings.font.row." + std::to_string(i);
-                                    const float y = static_cast<float>(i) * rowH;
+                                    const std::string id = "settings.font.row." + std::to_string(index);
+                                    const float y = static_cast<float>(r) * rowH;
                                     body.stack(id)
                                         .y(y).size(cw, rowH)
                                         .content([&] {
@@ -6340,8 +6500,7 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             state.setupOpen = true;
             checkForUpdates();
         }
-        app::setDropHandler([](const std::vector<std::string>& files) {
-            if (state.selectedDevice.empty()) {
+        app::setDropHandler([](const std::vector<std::string>& files) {            if (state.selectedDevice.empty()) {
                 toast("未选择设备", "请先选择要上传到的设备。");
                 return;
             }

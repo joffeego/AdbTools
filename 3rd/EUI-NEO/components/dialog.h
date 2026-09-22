@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace components {
@@ -72,6 +73,11 @@ public:
     }
     DialogBuilder& transition(const core::Transition& value) { transition_ = value; return *this; }
     DialogBuilder& zIndex(int value) { zIndex_ = value; return *this; }
+    // Lets the user move the panel by dragging its header strip. On by default: a
+    // dialog that covers the thing you are looking at and cannot be pushed aside
+    // is worse than one that can be nudged away, and the offset is remembered per
+    // dialog id so it stays where it was put.
+    DialogBuilder& draggable(bool value = true) { draggable_ = value; return *this; }
     DialogBuilder& content(std::function<void()> callback) { content_ = std::move(callback); return *this; }
     DialogBuilder& onPrimary(std::function<void()> callback) { onPrimary_ = std::move(callback); return *this; }
     DialogBuilder& onSecondary(std::function<void()> callback) { onSecondary_ = std::move(callback); return *this; }
@@ -82,6 +88,20 @@ public:
         const float height = std::min(height_, std::max(0.0f, screenHeight_ - metrics_.spacing.overlay));
         const float x = std::max(metrics_.spacing.panel, (screenWidth_ - width) * 0.5f);
         const float y = std::max(metrics_.spacing.panel, (screenHeight_ - height) * 0.5f);
+
+        // Dragging: the offset is kept per dialog id, so a dialog reappears where
+        // the user left it, and clamped so a strip of the panel always stays on
+        // screen (an off-screen dialog could never be dragged back).
+        float panelX = x;
+        float panelY = y;
+        if (draggable_) {
+            core::Vec2& offset = dragOffset(id_);
+            const float minVisible = 90.0f;
+            panelX = std::min(std::max(x + offset.x, minVisible - width), screenWidth_ - minVisible);
+            panelY = std::min(std::max(y + offset.y, 0.0f), screenHeight_ - minVisible);
+            offset.x = panelX - x;
+            offset.y = panelY - y;
+        }
         const float contentWidth = std::max(0.0f, width - metrics_.spacing.overlay);
         const float buttonGap = metrics_.spacing.content;
         const float buttonWidth = std::max(96.0f, std::min(150.0f, (contentWidth - buttonGap) * 0.5f));
@@ -109,8 +129,8 @@ public:
                     .build();
 
                 ui_.stack(id_ + ".panel")
-                    .x(x)
-                    .y(y)
+                    .x(panelX)
+                    .y(panelY)
                     .size(width, height)
                     .opacity(visible)
                     .translateY(panelOffsetY)
@@ -135,6 +155,26 @@ public:
                                     theme::color(0.0f, 0.0f, 0.0f, 0.0f))
                             .blockPointer()
                             .build();
+
+                        // Drag strip: built before the content, so a title or a
+                        // close button that overlaps it still gets the click - the
+                        // content is drawn on top and wins where they overlap.
+                        if (draggable_) {
+                            const float strip = std::min(52.0f, height * 0.5f);
+                            const std::string dragId = id_;
+                            ui_.rect(id_ + ".drag")
+                                .size(width, strip)
+                                .states(theme::color(0.0f, 0.0f, 0.0f, 0.0f),
+                                        theme::color(0.0f, 0.0f, 0.0f, 0.0f),
+                                        theme::color(0.0f, 0.0f, 0.0f, 0.0f))
+                                .blockPointer()
+                                .onDrag([dragId](const core::dsl::DragEvent& event) {
+                                    core::Vec2& offset = dragOffset(dragId);
+                                    offset.x += static_cast<float>(event.deltaX);
+                                    offset.y += static_cast<float>(event.deltaY);
+                                })
+                                .build();
+                        }
 
                         if (content_) {
                             content_();
@@ -208,6 +248,14 @@ public:
     }
 
 private:
+    // Where each dialog has been dragged to. Looked up by id on every access
+    // rather than handing out a reference, because inserting another dialog's
+    // entry can rehash the map and invalidate one held across frames.
+    static core::Vec2& dragOffset(const std::string& id) {
+        static std::unordered_map<std::string, core::Vec2> offsets;
+        return offsets[id];
+    }
+
     std::function<void()> closeCallback() const {
         const std::function<void(bool)> onOpenChange = onOpenChange_;
         return [onOpenChange] {
@@ -232,6 +280,7 @@ private:
     std::string primaryText_ = "Confirm";
     std::string secondaryText_ = "Cancel";
     bool open_ = false;
+    bool draggable_ = true;
     float screenWidth_ = 800.0f;
     float screenHeight_ = 600.0f;
     float width_ = 420.0f;
