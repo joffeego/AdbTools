@@ -5361,8 +5361,13 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
 
             // Font label + scrollable font list (composed first so the dropdown
             // popups below render on top of it).
+            //
+            // One row, three non-overlapping slots: the label, the capability
+            // filter, and the search box on the right. (They used to be placed
+            // independently, and the label ended up drawn underneath the filter
+            // checkbox - same x range, overlapping y.)
             ui.text("settings.font.label")
-                .x(24.0f).y(160.0f).size(200.0f, 24.0f)
+                .x(24.0f).y(152.0f).size(46.0f, 34.0f)
                 .text("字体")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
@@ -5433,10 +5438,10 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
             ui.stack("settings.font.cjk.wrap")
-                .x(24.0f).y(152.0f).size(200.0f, 34.0f)
+                .x(76.0f).y(152.0f).size(210.0f, 34.0f)
                 .content([&] {
                     components::checkbox(ui, "settings.font.cjk")
-                        .size(200.0f, 34.0f)
+                        .size(210.0f, 34.0f)
                         .text("只显示支持中文的字体")
                         .fontSize(12.5f)
                         .theme(themeTokens())
@@ -5446,7 +5451,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
 
-            const float fontListH = std::max(60.0f, ph - 260.0f - 16.0f);
+            const float fontListH = std::max(60.0f, ph - 228.0f);
             if (state.fontList.empty()) {
                 ui.text("settings.font.loading")
                     .x(24.0f).y(196.0f).size(pw - 48.0f, fontListH)
