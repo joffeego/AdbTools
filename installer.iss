@@ -6,8 +6,11 @@
 ;   iscc installer.iss /DMyAppVersion=X.Y.Z   (the CI passes the tag version here)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.10.11"
+  #define MyAppVersion "0.10.12"
 #endif
+
+; VERSIONINFO wants four components; the release tag only has three.
+#define MyAppVersionQuad MyAppVersion + ".0"
 
 #define MyAppName "ADB 文件浏览器"
 #define MyAppPublisher "joffeego"
@@ -43,6 +46,25 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 ; signature, so it is disabled explicitly. Consequence: unins000.exe stays
 ; unsigned and shows "unknown publisher" when a user runs the uninstaller.
 SignedUninstaller=no
+
+; The setup exe is unsigned, so its version resource is the only identity Windows
+; (and a heuristic AV engine's "who wrote this?" pass) can read off the file: with
+; no resource at all, Explorer shows an empty "File version" and the sample looks
+; like a hand-rolled dropper. Inno writes the block below into the setup exe, and
+; release.yml asserts the result, because nothing else can be verified about an
+; unsigned installer.
+VersionInfoVersion={#MyAppVersionQuad}
+VersionInfoProductVersion={#MyAppVersionQuad}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoProductName={#MyAppName}
+VersionInfoDescription={#MyAppName} 安装程序
+VersionInfoCopyright=Copyright (C) 2025 joffeego. Licensed under the Apache License 2.0.
+
+; Windows 10 or newer (see README): the program is built against the UCRT and needs
+; OpenGL 3.3, so on Windows 7/8 the install would succeed and the program would then
+; not start at all - one of the "it just won't open on that computer" reports.
+; Refusing up front, with Inno's own message, is the clearer answer.
+MinVersion=10.0
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"

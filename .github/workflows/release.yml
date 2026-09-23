@@ -145,6 +145,29 @@ jobs:
           set "PATH=%PATH%;C:\Program Files (x86)\Inno Setup 6"
           iscc installer.iss /DMyAppVersion=%APP_VERSION%
 
+      # The version resource is the only thing that can be verified about these
+      # binaries - they are unsigned, and the installer only gained a VERSIONINFO
+      # block in 0.10.12. Assert it from the tag: a stale adb_browser.rc or a
+      # missing VersionInfo* directive in installer.iss used to ship silently
+      # (0.9.x), which makes the build lie about itself and is also the shape
+      # heuristic AV engines dislike.
+      - name: Assert the binaries carry the tag version
+        shell: pwsh
+        run: |
+          $expected = "$env:APP_VERSION.0"
+          $app = (Get-Item "build/adb_browser.exe").VersionInfo
+          "adb_browser.exe  FileVersion=$($app.FileVersion)  ProductVersion=$($app.ProductVersion)"
+          if ($app.FileVersion -ne $expected) {
+            throw "adb_browser.exe FileVersion is '$($app.FileVersion)', expected '$expected' - check adb_browser.rc / core/appinfo.h"
+          }
+          foreach ($setup in Get-ChildItem "dist/AdbTools-Setup-*.exe") {
+            $vi = $setup.VersionInfo
+            "  $($setup.Name)  FileVersion=$($vi.FileVersion)  ProductName=$($vi.ProductName)"
+            if ($vi.FileVersion -ne $expected) {
+              throw "$($setup.Name) FileVersion is '$($vi.FileVersion)', expected '$expected' - check the VersionInfo* directives in installer.iss"
+            }
+          }
+
       # ---------------------------------------------------------------------
       # Optional signing pass 2: the installer package itself.
       # ---------------------------------------------------------------------
