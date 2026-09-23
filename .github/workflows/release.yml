@@ -151,20 +151,24 @@ jobs:
       # missing VersionInfo* directive in installer.iss used to ship silently
       # (0.9.x), which makes the build lie about itself and is also the shape
       # heuristic AV engines dislike.
+      #
+      # .Trim() on the values is not cosmetic: FileSystemInfo.VersionInfo pads
+      # FileVersion to a fixed width ("0.10.12.0      "), which is exactly how the
+      # first version of this assertion failed on the v0.10.12 tag.
       - name: Assert the binaries carry the tag version
         shell: pwsh
         run: |
           $expected = "$env:APP_VERSION.0"
           $app = (Get-Item "build/adb_browser.exe").VersionInfo
-          "adb_browser.exe  FileVersion=$($app.FileVersion)  ProductVersion=$($app.ProductVersion)"
-          if ($app.FileVersion -ne $expected) {
-            throw "adb_browser.exe FileVersion is '$($app.FileVersion)', expected '$expected' - check adb_browser.rc / core/appinfo.h"
+          "adb_browser.exe  FileVersion='$($app.FileVersion)'  ProductVersion='$($app.ProductVersion)'"
+          if ($app.FileVersion.Trim() -ne $expected) {
+            throw "adb_browser.exe FileVersion is '$($app.FileVersion.Trim())', expected '$expected' - check adb_browser.rc / core/appinfo.h"
           }
           foreach ($setup in Get-ChildItem "dist/AdbTools-Setup-*.exe") {
             $vi = $setup.VersionInfo
-            "  $($setup.Name)  FileVersion=$($vi.FileVersion)  ProductName=$($vi.ProductName)"
-            if ($vi.FileVersion -ne $expected) {
-              throw "$($setup.Name) FileVersion is '$($vi.FileVersion)', expected '$expected' - check the VersionInfo* directives in installer.iss"
+            "  $($setup.Name)  FileVersion='$($vi.FileVersion)'  ProductName='$($vi.ProductName)'"
+            if ($vi.FileVersion.Trim() -ne $expected) {
+              throw "$($setup.Name) FileVersion is '$($vi.FileVersion.Trim())', expected '$expected' - check the VersionInfo* directives in installer.iss"
             }
           }
 
