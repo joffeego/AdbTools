@@ -3,7 +3,7 @@
   <assemblyIdentity
       type="win32"
       name="joffeego.AdbTools.adb_browser"
-      version="0.10.10.0"
+      version="0.10.11.0"
       processorArchitecture="*"/>
   <description>ADB 文件浏览器 (AdbTools)</description>
 

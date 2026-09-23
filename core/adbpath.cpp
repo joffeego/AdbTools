@@ -1,6 +1,7 @@
 #include "core/adbpath.h"
 
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 
@@ -37,9 +38,12 @@ bool isUsablePathEntry(const std::string& dir) {
     if (dir.empty()) return false;
 #ifdef _WIN32
     // A UNC entry is not probed at all. When the server is unreachable the stat
-    // blocks for the SMB connect timeout (measured ~19 s), and adb is not installed
-    // on network shares in practice - while a laptop off the office network hits
-    // exactly this case on every launch.
+    // blocks for the TCP connect timeout - measured at 21026 ms for
+    // "\\192.0.2.201\share\adb.exe" (TEST-NET-1), then 0.1 ms for every later call
+    // on that host thanks to the SMB negative cache, and another ~21 s for the
+    // next unreachable host. adb is not installed on network shares in practice,
+    // while a laptop off the office network hits exactly this case on every
+    // launch. See core/adbpath.h for the numbers.
     if (dir.size() >= 2 && (dir[0] == '\\' || dir[0] == '/') &&
         (dir[1] == '\\' || dir[1] == '/')) {
         return false;
@@ -51,6 +55,12 @@ bool isUsablePathEntry(const std::string& dir) {
         const std::wstring root = toWide(dir.substr(0, 2) + "\\");
         const UINT type = GetDriveTypeW(root.c_str());
         if (type == DRIVE_NO_ROOT_DIR || type == DRIVE_UNKNOWN) return false;
+        // A network drive is skipped as well: for a persistent mapping whose
+        // server is gone (the "red X" drive Explorer hangs on) the next stat
+        // triggers a reconnect and stalls for the same ~21 s. GetDriveTypeW
+        // itself answers DRIVE_REMOTE without any network traffic, so this check
+        // costs nothing - the stall it prevents would be the whole startup.
+        if (type == DRIVE_REMOTE) return false;
     }
     return true;
 #else
@@ -81,6 +91,14 @@ std::string findAdb() {
 
     const char* pathEnv = std::getenv("PATH");
     if (pathEnv != nullptr && *pathEnv != '\0') {
+        // Bounded, like the scrcpy scan in the GUI: whatever a machine's PATH
+        // happens to hold, locating adb must not be able to spend the whole startup
+        // on it. A single blocking probe cannot be interrupted from here - that is
+        // what the filters in isUsablePathEntry are for - but a long tail of merely
+        // slow entries is cut off. The candidates after this loop (next to the
+        // executable, which is where an on-demand download lands) are still probed,
+        // so giving up on PATH never loses a usable adb.
+        const auto scanDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
         std::string pathStr = pathEnv;
         std::size_t start = 0;
         while (start <= pathStr.size()) {
@@ -88,12 +106,13 @@ std::string findAdb() {
             std::string dir = pathStr.substr(start, end == std::string::npos ? std::string::npos : end - start);
             start = (end == std::string::npos) ? pathStr.size() + 1 : end + 1;
             // Skip entries that cannot hold adb and would stall the scan: an
-            // unreachable network share costs ~19 seconds to probe (see
+            // unreachable network share costs ~21 seconds to probe (see
             // isUsablePathEntry).
             if (!dir.empty() && isUsablePathEntry(dir)) {
                 candidates.push_back(dir + "\\adb.exe");
                 candidates.push_back(dir + "/adb");
             }
+            if (std::chrono::steady_clock::now() > scanDeadline) break;
         }
     }
 

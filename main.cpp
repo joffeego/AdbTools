@@ -2306,8 +2306,11 @@ std::string findScrcpy() {
             const std::size_t end = pathStr.find(';', start);
             const std::string d = pathStr.substr(start, end == std::string::npos ? std::string::npos : end - start);
             start = (end == std::string::npos) ? pathStr.size() + 1 : end + 1;
-            // Only entries that can actually hold scrcpy: probing an unreachable
-            // network share stalls for ~19 seconds before the window appears.
+            // Only entries that can actually hold scrcpy: the first touch of an
+            // unreachable network location costs the whole TCP connect timeout
+            // (measured 21026 ms for a UNC entry on PATH), and it lands before the
+            // window appears. See isUsablePathEntry - it also drops drive letters
+            // with no drive behind them and disconnected mapped drives.
             if (!d.empty() && core::isUsablePathEntry(d)) {
                 candidates.push_back(d + "\\scrcpy.exe");
                 candidates.push_back(d + "/scrcpy");

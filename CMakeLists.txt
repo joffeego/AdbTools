@@ -168,6 +168,7 @@ if(ADBTOOLS_BUILD_TESTS)
         ${ADBTOOLS_CORE_SOURCES}
         tests/test_main.cpp
         tests/test_adb.cpp
+        tests/test_adbpath.cpp
         tests/test_batch.cpp
         tests/test_fileio.cpp
         tests/test_package.cpp
