@@ -30,6 +30,14 @@ struct DslAppConfig {
     std::string trayIconPathValue;
     std::function<void(const eui::KeyEvent&)> keyEventHandler;
 
+    // Called when the app cannot start at all: GLFW fails, the window or the render
+    // backend cannot be created, or initialisation fails. The framework returns -1
+    // in those cases, which from the user's side is indistinguishable from "nothing
+    // happened" - they cannot tell a download blocked by antivirus from a machine
+    // whose graphics driver is too old for the required OpenGL version. The app
+    // supplies the message so it can be localised and made actionable.
+    std::function<void(const char* stage)> startupFailureHandler;
+
     DslAppConfig& title(std::string value) { titleValue = std::move(value); return *this; }
     DslAppConfig& pageId(std::string value) { pageIdValue = std::move(value); return *this; }
     DslAppConfig& clearColor(const eui::Color& value) { clearColorValue = value; return *this; }
@@ -72,6 +80,10 @@ struct DslAppConfig {
     }
     DslAppConfig& onKeyEvent(std::function<void(const eui::KeyEvent&)> handler) {
         keyEventHandler = std::move(handler);
+        return *this;
+    }
+    DslAppConfig& onStartupFailure(std::function<void(const char* stage)> handler) {
+        startupFailureHandler = std::move(handler);
         return *this;
     }
 };

@@ -19,6 +19,15 @@ std::string executableDir();
 // Returns "" when nothing is found; callers report that rather than guessing.
 std::string findAdb();
 
+// True when a PATH entry is worth probing for adb/scrcpy.
+//
+// Not every entry is: touching a UNC entry ("\\server\share") whose server is
+// unreachable blocks for the SMB connect timeout - measured at about 19 seconds on
+// a laptop whose VPN was down, all of it before the window appears. A PATH entry
+// pointing at a drive that does not exist (or is empty) is skipped for the same
+// reason: no binary can be there.
+bool isUsablePathEntry(const std::string& dir);
+
 // Default download directory: $USERPROFILE\Downloads, else $HOME/Downloads,
 // else ".".
 std::string defaultDownloadDir();

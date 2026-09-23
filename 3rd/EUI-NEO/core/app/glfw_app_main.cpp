@@ -642,9 +642,18 @@ GLFWwindow* findModalChildWindow(app::DslWindowManager<ManagedWindow>& windows) 
 }
 
 int eui_app_run() {
+    // Tell the app why we are about to give up. Returning -1 silently (the old
+    // behaviour) leaves the user with a process that flashes and disappears.
+    const auto reportStartupFailure = [](const char* stage) {
+        const std::function<void(const char*)>& handler = app::dslAppConfig().startupFailureHandler;
+        if (handler) {
+            handler(stage);
+        }
+    };
     core::platform::repairCurrentWorkingDirectory();
     core::render::initializeRenderBackendLoader();
     if (!glfwInit()) {
+        reportStartupFailure("glfwInit");
         return -1;
     }
     TimerResolutionGuard timerResolution;
@@ -685,6 +694,7 @@ int eui_app_run() {
     glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
     glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
     if (!window) {
+        reportStartupFailure("createWindow");
         glfwTerminate();
         return -1;
     }
@@ -720,15 +730,18 @@ int eui_app_run() {
 
     auto renderBackend = core::render::createRenderBackend(window);
     if (!renderBackend) {
+        reportStartupFailure("createRenderBackend");
         cleanupMainWindow();
         return -1;
     }
     if (!renderBackend->initialize()) {
+        reportStartupFailure("initializeRenderBackend");
         cleanupMainWindow();
         return -1;
     }
 
     if (!app::initialize(window)) {
+        reportStartupFailure("appInitialize");
         app::shutdown();
         renderBackend.reset();
         cleanupMainWindow();

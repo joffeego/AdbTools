@@ -2306,12 +2306,18 @@ std::string findScrcpy() {
             const std::size_t end = pathStr.find(';', start);
             const std::string d = pathStr.substr(start, end == std::string::npos ? std::string::npos : end - start);
             start = (end == std::string::npos) ? pathStr.size() + 1 : end + 1;
-            if (!d.empty()) {
+            // Only entries that can actually hold scrcpy: probing an unreachable
+            // network share stalls for ~19 seconds before the window appears.
+            if (!d.empty() && core::isUsablePathEntry(d)) {
                 candidates.push_back(d + "\\scrcpy.exe");
                 candidates.push_back(d + "/scrcpy");
             }
         }
     }
+    // Hard budget for the whole scan. The guards above cover the cases that were
+    // measured, but the startup path must not be at the mercy of whatever a
+    // machine's PATH contains: give up and fall back rather than hang.
+    const auto scanDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
     for (const std::string& candidate : candidates) {
         // is_regular_file semantics, not exists(): the "C:\dir/scrcpy" candidate
         // also names the scrcpy *directory*, so a plain existence check would
@@ -2324,6 +2330,7 @@ std::string findScrcpy() {
         // std::filesystem::path from it throws - and this file is compiled with
         // -fno-exceptions, where that throw becomes an abort.
         if (core::isRegularFileNoThrow(candidate)) return candidate;
+        if (std::chrono::steady_clock::now() > scanDeadline) break;
     }
     return "";
 }
@@ -6578,6 +6585,31 @@ void composeHelpDialog(eui::Ui& ui, float w, float h) {
         .build();
 }
 
+// Shown when the app cannot start at all. Without this the process simply exits,
+// and "nothing happened" is impossible for the user to act on or report - it looks
+// the same whether antivirus blocked the file, a graphics driver is too old, or the
+// download was incomplete.
+void reportStartupFailure(const char* stage) {
+#ifdef _WIN32
+    std::wstring message =
+        L"ADB 文件浏览器 启动失败，无法创建窗口。\n\n"
+        L"失败环节：";
+    message += core::toWide(stage != nullptr ? stage : "unknown");
+    message +=
+        L"\n\n最常见的原因：\n"
+        L"1. 显卡驱动过旧，或在远程桌面 / 虚拟机 / 精简系统里没有 OpenGL 3.3。\n"
+        L"   → 更新显卡驱动后重试；远程桌面下请在物理机上运行。\n"
+        L"2. 杀毒软件拦截了本程序（文件被隔离时也会表现为“点了没反应”）。\n"
+        L"   → 查看杀软的隔离记录，把程序目录加入白名单。\n"
+        L"3. 解压不完整，程序目录下缺少 assets 文件夹。\n\n"
+        L"命令行模式不需要窗口，可以确认程序本身能不能运行：\n"
+        L"    开一个 cmd 窗口，执行  adb_browser.exe devices\n\n"
+        L"程序版本 " + core::toWide(kAppVersion);
+    MessageBoxW(nullptr, message.c_str(), L"ADB 文件浏览器 - 启动失败",
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+#endif
+}
+
 const DslAppConfig& dslAppConfig() {
     static const DslAppConfig config = DslAppConfig{}
         .title("ADB 文件浏览器")
@@ -6586,6 +6618,7 @@ const DslAppConfig& dslAppConfig() {
         .windowSize(1000, 520)
         .textFont("C:/Windows/Fonts/msyh.ttc")
         .fps(90.0)
+        .onStartupFailure([](const char* stage) { reportStartupFailure(stage); })
         .onKeyEvent([](const eui::KeyEvent& ev) { handleGlobalKey(ev); });
     return config;
 }

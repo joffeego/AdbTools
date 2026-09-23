@@ -1,5 +1,6 @@
 #include "core/adbpath.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 
@@ -32,6 +33,32 @@ std::string executableDir() {
     return std::filesystem::current_path(ec).string();
 }
 
+bool isUsablePathEntry(const std::string& dir) {
+    if (dir.empty()) return false;
+#ifdef _WIN32
+    // A UNC entry is not probed at all. When the server is unreachable the stat
+    // blocks for the SMB connect timeout (measured ~19 s), and adb is not installed
+    // on network shares in practice - while a laptop off the office network hits
+    // exactly this case on every launch.
+    if (dir.size() >= 2 && (dir[0] == '\\' || dir[0] == '/') &&
+        (dir[1] == '\\' || dir[1] == '/')) {
+        return false;
+    }
+    // "X:..." - check the drive exists first. GetDriveTypeW does not touch the
+    // network for a mapped drive, and returns DRIVE_NO_ROOT_DIR for a letter that
+    // is no longer assigned, which GetFileAttributes would otherwise stall on.
+    if (dir.size() >= 2 && std::isalpha(static_cast<unsigned char>(dir[0])) && dir[1] == ':') {
+        const std::wstring root = toWide(dir.substr(0, 2) + "\\");
+        const UINT type = GetDriveTypeW(root.c_str());
+        if (type == DRIVE_NO_ROOT_DIR || type == DRIVE_UNKNOWN) return false;
+    }
+    return true;
+#else
+    (void)dir;
+    return true;
+#endif
+}
+
 std::string findAdb() {
     std::vector<std::string> candidates;
 
@@ -60,7 +87,10 @@ std::string findAdb() {
             std::size_t end = pathStr.find(';', start);
             std::string dir = pathStr.substr(start, end == std::string::npos ? std::string::npos : end - start);
             start = (end == std::string::npos) ? pathStr.size() + 1 : end + 1;
-            if (!dir.empty()) {
+            // Skip entries that cannot hold adb and would stall the scan: an
+            // unreachable network share costs ~19 seconds to probe (see
+            // isUsablePathEntry).
+            if (!dir.empty() && isUsablePathEntry(dir)) {
                 candidates.push_back(dir + "\\adb.exe");
                 candidates.push_back(dir + "/adb");
             }
