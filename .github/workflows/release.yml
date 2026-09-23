@@ -170,6 +170,17 @@ jobs:
             if ($vi.FileVersion.Trim() -ne $expected) {
               throw "$($setup.Name) FileVersion is '$($vi.FileVersion.Trim())', expected '$expected' - check the VersionInfo* directives in installer.iss"
             }
+            # The installer's own Chinese must survive the build machine's code page.
+            # It did not on the v0.10.12 tag: ISPP expanded {#MyAppName} through the
+            # runner's CP1252 and the version resource ended up as "ADB ae ae...a".
+            # Any Latin-1 letter in a product name that should be Chinese (or
+            # Japanese, or Korean) is that same bug.
+            if ([string]::IsNullOrWhiteSpace($vi.ProductName)) {
+              throw "$($setup.Name) has an empty ProductName - the VersionInfo* directives are not reaching the setup exe"
+            }
+            if ($vi.ProductName -match '[\u00c0-\u00ff]') {
+              throw "$($setup.Name) ProductName '$($vi.ProductName)' looks mis-encoded (non-ASCII was mangled by the code page); write it literally and keep the UTF-8 BOM on installer.iss"
+            }
           }
 
       # ---------------------------------------------------------------------

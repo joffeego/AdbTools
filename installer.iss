@@ -1,4 +1,4 @@
-; AdbTools installer script (Inno Setup 6)
+﻿; AdbTools installer script (Inno Setup 6)
 ;
 ; Build the portable files first (adb_browser.exe + assets/ + scrcpy/), then run:
 ;   iscc installer.iss
@@ -53,11 +53,19 @@ SignedUninstaller=no
 ; like a hand-rolled dropper. Inno writes the block below into the setup exe, and
 ; release.yml asserts the result, because nothing else can be verified about an
 ; unsigned installer.
+;
+; The Chinese product name is written out literally instead of as {#MyAppName}:
+; ISPP's inline substitution goes through the build machine's ANSI code page, and
+; on the CI runner (CP1252, Inno Setup 6.7.1) {#MyAppName} came out as
+; "ADB ae ae...a" mojibake in the version resource of the v0.10.12 build, while the
+; same text used literally (AppName, which Inno copied into ProductName in every
+; earlier release) was correct. The file also carries a UTF-8 BOM now, so its
+; encoding no longer depends on the code page of whichever machine compiles it.
 VersionInfoVersion={#MyAppVersionQuad}
 VersionInfoProductVersion={#MyAppVersionQuad}
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoProductName={#MyAppName}
-VersionInfoDescription={#MyAppName} 安装程序
+VersionInfoProductName=ADB 文件浏览器
+VersionInfoDescription=ADB 文件浏览器 安装程序
 VersionInfoCopyright=Copyright (C) 2025 joffeego. Licensed under the Apache License 2.0.
 
 ; Windows 10 or newer (see README): the program is built against the UCRT and needs
