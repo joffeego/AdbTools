@@ -91,7 +91,17 @@ jobs:
         run: |
           $v = "${{ github.ref_name }}"
           if ($v -like 'v*') { $v = $v.Substring(1) }
-          if (-not $v) { $v = "0.0.0" }
+          # A manual workflow_dispatch has no version in its ref (it is a branch
+          # name), and "main" is not a valid VERSIONINFO - iscc rejects
+          # "VersionInfoVersion=main.0" outright. Fall back to the version the source
+          # declares, which also keeps the assertion further down meaningful: a
+          # dispatch becomes a dry run of the current version.
+          if ($v -notmatch '^\d+\.\d+\.\d+$') {
+            $match = Select-String -Path core/appinfo.h -Pattern 'kAppVersion\s*=\s*"([0-9.]+)"' | Select-Object -First 1
+            if (-not $match) { throw "cannot read kAppVersion from core/appinfo.h" }
+            $v = $match.Matches[0].Groups[1].Value
+            Write-Host "Ref '${{ github.ref_name }}' is not a version tag; using kAppVersion $v from core/appinfo.h."
+          }
           "APP_VERSION=$v" >> $env:GITHUB_ENV
 
       # ---------------------------------------------------------------------
