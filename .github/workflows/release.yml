@@ -342,6 +342,26 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+      # Re-running this workflow for the same tag happens whenever a build fails
+      # partway (the tag gets moved) or a run is retried. `append_body: true` below
+      # then appends the release body to the one already there, so v0.10.12 ended up
+      # with the download table and the changelog twice. Drop the previous release
+      # first - the *tag* is kept, so the re-run still starts from the same commit.
+      - name: Drop a previous release for this tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $existing = gh release view $tag --json id --jq .id 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existing) {
+            Write-Host "A release for $tag already exists (id $existing); removing it so this run does not append to it."
+            gh release delete $tag --yes
+          } else {
+            Write-Host "No existing release for $tag - creating a new one."
+          }
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
