@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <sstream>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 namespace adb::core {
 
@@ -32,6 +34,125 @@ std::string lower(std::string s) {
 std::string shorten(const std::string& s, int limit) {
     if (limit < 4 || static_cast<int>(s.size()) <= limit) return s;
     return s.substr(0, static_cast<std::size_t>(limit - 3)) + "...";
+}
+
+namespace {
+
+// One UTF-8 code point: its value and how many bytes it occupies.
+struct CodePoint {
+    unsigned int value = 0;
+    std::size_t bytes = 1;
+};
+
+// Decode the sequence starting at `s[i]`. A malformed or truncated sequence is
+// reported as a single byte holding the raw value, so a corrupt string still
+// advances one byte at a time instead of desynchronising or looping forever.
+CodePoint decodeCodePoint(const std::string& s, std::size_t i) {
+    const unsigned char lead = static_cast<unsigned char>(s[i]);
+    CodePoint cp;
+    cp.value = lead;
+
+    std::size_t length = 1;
+    if (lead >= 0xF0u) {
+        length = 4;
+        cp.value = lead & 0x07u;
+    } else if (lead >= 0xE0u) {
+        length = 3;
+        cp.value = lead & 0x0Fu;
+    } else if (lead >= 0xC0u) {
+        length = 2;
+        cp.value = lead & 0x1Fu;
+    } else {
+        return cp;  // ASCII, or a stray continuation byte
+    }
+    if (i + length > s.size()) return cp;  // truncated at the end of the string
+
+    for (std::size_t k = 1; k < length; ++k) {
+        const unsigned char next = static_cast<unsigned char>(s[i + k]);
+        if ((next & 0xC0u) != 0x80u) return cp;  // not a continuation byte
+        cp.value = (cp.value << 6) | (next & 0x3Fu);
+    }
+    cp.bytes = length;
+    return cp;
+}
+
+// East Asian Wide / Fullwidth, plus the emoji blocks - the code points Windows
+// draws in a double-width cell. Borderline ranges are counted wide on purpose:
+// over-reporting costs one character of space, under-reporting would push text
+// out of its box, which is the bug this exists to prevent.
+bool isWideCodePoint(unsigned int cp) {
+    return (cp >= 0x1100u && cp <= 0x115Fu) ||   // Hangul Jamo
+           (cp >= 0x2E80u && cp <= 0x303Eu) ||   // CJK radicals, Kangxi, punctuation
+           (cp >= 0x3041u && cp <= 0x33FFu) ||   // kana, Bopomofo, Hangul compat, CJK compat
+           (cp >= 0x3400u && cp <= 0x4DBFu) ||   // CJK ext A
+           (cp >= 0x4E00u && cp <= 0x9FFFu) ||   // CJK unified ideographs
+           (cp >= 0xA000u && cp <= 0xA4CFu) ||   // Yi
+           (cp >= 0xAC00u && cp <= 0xD7A3u) ||   // Hangul syllables
+           (cp >= 0xF900u && cp <= 0xFAFFu) ||   // CJK compatibility ideographs
+           (cp >= 0xFE10u && cp <= 0xFE19u) ||   // vertical forms
+           (cp >= 0xFE30u && cp <= 0xFE6Fu) ||   // CJK compatibility forms
+           (cp >= 0xFF00u && cp <= 0xFF60u) ||   // fullwidth forms
+           (cp >= 0xFFE0u && cp <= 0xFFE6u) ||   // fullwidth signs
+           (cp >= 0x1F300u && cp <= 0x1F64Fu) || // emoji
+           (cp >= 0x1F680u && cp <= 0x1F6FFu) ||
+           (cp >= 0x1F900u && cp <= 0x1F9FFu) ||
+           (cp >= 0x1FA70u && cp <= 0x1FAFFu) ||
+           (cp >= 0x20000u && cp <= 0x3FFFDu);   // CJK ext B and beyond
+}
+
+int codePointColumns(const CodePoint& cp) { return isWideCodePoint(cp.value) ? 2 : 1; }
+
+// U+2026, "…". One column wide, unlike the three dots it replaces.
+constexpr char kEllipsis[] = "\xE2\x80\xA6";
+
+}  // namespace
+
+int displayColumns(const std::string& s) {
+    int columns = 0;
+    for (std::size_t i = 0; i < s.size();) {
+        const CodePoint cp = decodeCodePoint(s, i);
+        columns += codePointColumns(cp);
+        i += cp.bytes;
+    }
+    return columns;
+}
+
+std::string shortenColumns(const std::string& s, int maxColumns) {
+    if (maxColumns < 2 || displayColumns(s) <= maxColumns) return s;
+
+    const int budget = maxColumns - 1;  // the ellipsis takes one column
+    std::string out;
+    int used = 0;
+    for (std::size_t i = 0; i < s.size();) {
+        const CodePoint cp = decodeCodePoint(s, i);
+        const int width = codePointColumns(cp);
+        if (used + width > budget) break;
+        out.append(s, i, cp.bytes);
+        used += width;
+        i += cp.bytes;
+    }
+    return out + kEllipsis;
+}
+
+std::string shortenColumnsHead(const std::string& s, int maxColumns) {
+    if (maxColumns < 2 || displayColumns(s) <= maxColumns) return s;
+
+    const int budget = maxColumns - 1;
+    std::vector<std::pair<std::size_t, int>> units;  // code point offset -> width
+    for (std::size_t i = 0; i < s.size();) {
+        const CodePoint cp = decodeCodePoint(s, i);
+        units.emplace_back(i, codePointColumns(cp));
+        i += cp.bytes;
+    }
+
+    std::size_t start = s.size();
+    int used = 0;
+    for (std::size_t k = units.size(); k-- > 0;) {
+        if (used + units[k].second > budget) break;
+        used += units[k].second;
+        start = units[k].first;
+    }
+    return std::string(kEllipsis) + s.substr(start);
 }
 
 std::string formatSize(long long bytes) {

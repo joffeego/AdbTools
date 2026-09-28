@@ -67,3 +67,16 @@ ADB_TEST(splitPath_produces_components) {
     ADB_CHECK_EQ(splitPath("/a//b/").size(), static_cast<std::size_t>(2));
     ADB_CHECK_EQ(ADB_AT(splitPath("a/b"), 0), std::string("a"));
 }
+
+ADB_TEST(lastSegment_names_the_folder) {
+    // This is what the quick-path alias is suggested from: the folder you are in
+    // is a far better default label than the whole path.
+    ADB_CHECK_EQ(lastSegment("/sdcard/DCIM/Camera"), std::string("Camera"));
+    ADB_CHECK_EQ(lastSegment("/sdcard/DCIM/Camera/"), std::string("Camera"));
+    ADB_CHECK_EQ(lastSegment("/sdcard"), std::string("sdcard"));
+    ADB_CHECK_EQ(lastSegment("中文目录/下载"), std::string("下载"));
+    // The root has no name of its own, so the caller has to supply a label.
+    ADB_CHECK_EQ(lastSegment("/"), std::string(""));
+    ADB_CHECK_EQ(lastSegment(""), std::string(""));
+    ADB_CHECK_EQ(lastSegment("///"), std::string(""));
+}

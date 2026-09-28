@@ -116,6 +116,17 @@ using adb::core::kAppVersion;
 constexpr float kScrollbarWidth = 10.0f;
 constexpr float kRowHeight = 36.0f;
 
+// Quick-path (bookmark) aliases. The limit is in display columns, not bytes: a
+// Chinese character is two columns wide, so one number keeps both "Download" and
+// "下载文件夹" inside the same menu (see core::shortenColumns).
+constexpr int kAliasColumnsDefault = 20;
+constexpr int kAliasColumnsMin = 4;
+constexpr int kAliasColumnsMax = 40;
+
+// The quick-path menu is deliberately wider than the component default (190) so
+// an alias of the default length is shown whole instead of cut.
+constexpr float kBookmarkMenuWidth = 240.0f;
+
 
 // Rough visual width estimate for laying out breadcrumb segments (ASCII vs CJK).
 float approxTextWidth(const std::string& s, float fontSize) {
@@ -136,6 +147,38 @@ float approxTextWidth(const std::string& s, float fontSize) {
         }
     }
     return width;
+}
+
+// How wide one display column is assumed to be, in units of the font size.
+//
+// 0.62 is the estimate approxTextWidth has always used for mixed text (and the
+// same rate the file list's "px / 9" implied at 15px). It is the right figure for
+// a column of ordinary text, where lowercase Latin dominates.
+//
+// Uppercase Latin does not fit that: measured with Microsoft YaHei at 15px,
+// "DOWNLOAD_MANAGER_APP" (20 columns) is 213px - one glyph per column at ~1.0em,
+// not 0.62em. Labels that must never leave their box (the quick-path alias, in
+// the menu and in the manager) use the wider figure instead.
+constexpr float kColumnEm = 0.62f;
+constexpr float kWideColumnEm = 0.72f;
+
+// The inverse of approxTextWidth: how many display columns fit in `pixels`.
+//
+// This is what keeps a label inside the box it is drawn in. Text elements in the
+// framework neither wrap nor clip on their own (`maxWidth` only applies when
+// wrap is on), so a string that is too long is simply drawn past its own
+// background - a long quick-path label used to spill out of the popup's rounded
+// rectangle and across the window.
+//
+// The figure is an estimate, not a measurement: a label made only of M and W
+// glyphs still overshoots it. Every alias is additionally capped by the user's
+// own length setting, and the menu reserves 24px of margin on the right, which
+// absorbs the difference in every realistic case.
+int columnsFitting(float pixels, float fontSize, float perColumnEm) {
+    const float perColumn = fontSize * perColumnEm;
+    if (perColumn <= 0.0f) return 0;
+    const int columns = static_cast<int>(pixels / perColumn);
+    return columns < 0 ? 0 : columns;
 }
 
 // Subprocess execution now lives in core/process.cpp so the GUI and the CLI
@@ -191,6 +234,10 @@ struct AppSettings {
     int mirrorH = 640;
     int windowW = 1000;
     int windowH = 520;
+    // How much of a quick-path alias is shown *and* accepted, in display columns
+    // (a Chinese character is two). Kept short so the popup menu stays readable;
+    // see kAliasColumnsDefault and core::shortenColumns.
+    int bookmarkAliasColumns = kAliasColumnsDefault;
 };
 
 // A phone file that was pulled to a local file and opened with the user's default
@@ -296,7 +343,17 @@ struct AppState {
     bool promptOpen = false;
     std::string promptTitle;
     std::string promptValue;
-    int promptMode = 0;  // 0 = new folder, 1 = rename
+    // Placeholder text of the shared prompt box: "名称" for files, and a hint
+    // about the current alias limit when naming a quick path.
+    std::string promptPlaceholder = "名称";
+    // The prompt box is shared by several flows; the mode says which one opened
+    // it: 0 = new folder, 1 = rename, 2 = wireless connect, 3 = new quick path,
+    // 4 = rename a quick path.
+    int promptMode = 0;
+    // Quick-path prompts only: the path to bookmark (mode 3) and the bookmark
+    // being renamed (mode 4, -1 when adding).
+    std::string promptBookmarkPath;
+    int promptBookmarkIndex = -1;
 
     // Sorting & filtering
     int sortColumn = 0;      // 0 = name, 1 = size, 2 = date
@@ -681,6 +738,7 @@ void saveSettings() {
         {"mirrorH", std::to_string(settings.mirrorH)},
         {"windowW", std::to_string(settings.windowW)},
         {"windowH", std::to_string(settings.windowH)},
+        {"bookmarkAliasColumns", std::to_string(settings.bookmarkAliasColumns)},
         {"setupPromptDismissed", state.setupPromptDismissed ? "1" : "0"},
     };
     core::writeFileAtomic(settingsFilePath(), core::serializeKeyValues(values));
@@ -1102,6 +1160,7 @@ void loadSettings() {
         else if (key == "mirrorH") settings.mirrorH = std::atoi(value.c_str());
         else if (key == "windowW") settings.windowW = std::atoi(value.c_str());
         else if (key == "windowH") settings.windowH = std::atoi(value.c_str());
+        else if (key == "bookmarkAliasColumns") settings.bookmarkAliasColumns = std::atoi(value.c_str());
         else if (key == "setupPromptDismissed") state.setupPromptDismissed = (std::atoi(value.c_str()) != 0);
     }
 #ifdef _WIN32
@@ -1116,6 +1175,12 @@ void loadSettings() {
     }
     if (settings.uiScale < 0.5f || settings.uiScale > 2.5f) {
         settings.uiScale = 1.0f;
+    }
+    if (settings.bookmarkAliasColumns < kAliasColumnsMin ||
+        settings.bookmarkAliasColumns > kAliasColumnsMax) {
+        // A hand-edited settings file (or one from a future build) must not leave
+        // the menu drawing labels of an absurd length.
+        settings.bookmarkAliasColumns = kAliasColumnsDefault;
     }
 }
 
@@ -1229,8 +1294,14 @@ void rememberLastPath() {
 }
 
 void addBookmark(const std::string& name, const std::string& path) {
-    for (const Bookmark& b : bookmarks) {
-        if (b.path == path) return;
+    for (Bookmark& b : bookmarks) {
+        if (b.path == path) {
+            // The path is already saved: the user picked 添加当前路径 on a folder
+            // they bookmarked before, which means "call it this now".
+            b.name = name;
+            saveBookmarks();
+            return;
+        }
     }
     bookmarks.push_back({name, path});
     saveBookmarks();
@@ -1241,6 +1312,87 @@ void removeBookmark(std::size_t index) {
         bookmarks.erase(bookmarks.begin() + index);
         saveBookmarks();
     }
+}
+
+// --- quick-path aliases ------------------------------------------------------
+//
+// A bookmark is stored as "alias<TAB>path" (core/store.h). The alias is what the
+// popup menu shows, and it is the *only* thing it shows - which is why adding a
+// path used to dump the whole path into the menu (and past its edge).
+
+// The alias a new bookmark is suggested with: the folder you are in, so
+// "/sdcard/DCIM/Camera" proposes "Camera" rather than the whole path. The root
+// has no name of its own, so it gets a literal one.
+std::string suggestedAlias(const std::string& path) {
+    const std::string name = core::lastSegment(path);
+    return name.empty() ? "根目录" : name;
+}
+
+// A tab is the field separator and a newline ends the record, so they can never
+// survive into the bookmarks file; everything else is legitimate label text.
+std::string sanitizeAlias(const std::string& raw) {
+    std::string alias;
+    alias.reserve(raw.size());
+    for (char c : raw) {
+        if (c == '\t' || c == '\n' || c == '\r') continue;
+        alias += c;
+    }
+    return core::trim(alias);
+}
+
+void promptBookmarkAlias(int index) {
+    // index < 0 means "name and save the current path". Anything else has to be a
+    // row that still exists: the list is rebuilt after every delete, so a stale
+    // index must not silently turn into an "add" (that would re-save the path the
+    // user just removed).
+    if (index >= static_cast<int>(bookmarks.size())) return;
+    const bool editing = index >= 0;
+    state.promptMode = editing ? 4 : 3;
+    state.promptBookmarkIndex = editing ? index : -1;
+    state.promptBookmarkPath = editing ? bookmarks[static_cast<std::size_t>(index)].path
+                                       : state.currentPath;
+    state.promptTitle = editing ? "重命名快捷路径" : "添加快捷路径";
+    state.promptValue = editing ? bookmarks[static_cast<std::size_t>(index)].name
+                                : suggestedAlias(state.promptBookmarkPath);
+    state.promptPlaceholder = "别名（最多 " + std::to_string(settings.bookmarkAliasColumns) + " 个字符）";
+    state.promptOpen = true;
+}
+
+// Store the alias the user typed. The limit is applied here as well as when
+// drawing, so what the dialog promises ("最多 N 个字符") is what gets saved; a
+// pasted paragraph is cut instead of being rejected.
+void commitBookmarkAlias(const std::string& raw) {
+    std::string alias = sanitizeAlias(raw);
+    if (alias.empty()) {
+        toast("别名不能为空", "给它起个名字，例如“下载”或“Camera”。");
+        return;
+    }
+    const bool cut = core::displayColumns(alias) > settings.bookmarkAliasColumns;
+    alias = core::shortenColumns(alias, settings.bookmarkAliasColumns);
+    const std::string note = cut ? "（已截断到 " + std::to_string(settings.bookmarkAliasColumns) +
+                                       " 个字符）" : "";
+
+    if (state.promptMode == 4) {
+        const std::size_t index = static_cast<std::size_t>(state.promptBookmarkIndex);
+        if (index >= bookmarks.size()) return;
+        bookmarks[index].name = alias;
+        saveBookmarks();
+        toast("已重命名", alias + note);
+        return;
+    }
+
+    const std::string path = state.promptBookmarkPath;
+    const bool existed = std::any_of(bookmarks.begin(), bookmarks.end(),
+                                     [&path](const Bookmark& b) { return b.path == path; });
+    addBookmark(alias, path);
+    toast(existed ? "已更新快捷路径" : "已添加快捷路径", alias + note);
+}
+
+// The length limit lives in the quick-path dialog rather than in 设置: it only
+// affects these labels, and that is where they are on screen.
+void setBookmarkAliasColumns(int columns) {
+    settings.bookmarkAliasColumns = std::clamp(columns, kAliasColumnsMin, kAliasColumnsMax);
+    saveSettings();
 }
 
 void addCommand(const std::string& name, bool shell, const std::string& cmd) {
@@ -1834,6 +1986,7 @@ void deleteBatchStep(std::vector<std::string> names, std::size_t index, BatchOut
 void promptNewFolder() {
     state.promptTitle = "新建文件夹";
     state.promptValue = "";
+    state.promptPlaceholder = "名称";
     state.promptMode = 0;
     state.promptOpen = true;
 }
@@ -1842,6 +1995,7 @@ void promptRename() {
     if (state.selectedEntry.empty()) return;
     state.promptTitle = "重命名";
     state.promptValue = state.selectedEntry;
+    state.promptPlaceholder = "名称";
     state.promptMode = 1;
     state.promptOpen = true;
 }
@@ -1849,6 +2003,11 @@ void promptRename() {
 void confirmPrompt() {
     std::string value = core::trim(state.promptValue);
     state.promptOpen = false;
+    if (state.promptMode == 3 || state.promptMode == 4) {
+        // Quick-path alias: a purely local edit, no adb involved.
+        commitBookmarkAlias(value);
+        return;
+    }
     if (state.promptMode == 2) {
         // Wireless connect.
         if (value.empty()) return;
@@ -3846,6 +4005,7 @@ void openFileProperties() {
 void promptWirelessConnect() {
     state.promptTitle = "无线连接";
     state.promptValue = "192.168.1.100:5555";
+    state.promptPlaceholder = "地址:端口";
     state.promptMode = 2;
     state.promptOpen = true;
 }
@@ -4164,7 +4324,10 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
 
             ui.text(rowId + ".name")
                 .x(34.0f).y(0.0f).size(c.nameW, h)
-                .text(core::shorten(displayName, static_cast<int>(c.nameW / 9.0f)))
+                // Cut by display columns: the byte-based shorten() used here
+                // before split Chinese file names in half and the tail rendered
+                // as a replacement glyph.
+                .text(core::shortenColumns(displayName, columnsFitting(c.nameW, 15.0f, kColumnEm)))
                 .fontSize(15.0f)
                 .lineHeight(15.0f)
                 .color(kInk)
@@ -4544,7 +4707,9 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
                 .build();
             ui.text("topbar.device.name")
                 .x(42.0f).y(0.0f).size(devW - 74.0f, h)
-                .text(core::shorten(deviceLabel, static_cast<int>((devW - 74.0f) / 8.0f)))
+                // Device labels are model names ("Mi 11", "华为 Mate 40"), so
+                // the cut has to be character-aware like every other label here.
+                .text(core::shortenColumns(deviceLabel, columnsFitting(devW - 74.0f, 14.0f, kColumnEm)))
                 .fontSize(14.0f)
                 .lineHeight(14.0f)
                 .color(kInk)
@@ -5129,15 +5294,26 @@ void composeOptionField(eui::Ui& ui, const std::string& id, float x, float y, fl
 }
 
 void composeBookmarkMenu(eui::Ui& ui, float w, float h) {
+    // Labels are cut to what the menu can actually draw. A text element neither
+    // wraps nor clips by itself, so before this the alias (which used to be the
+    // whole path) was drawn straight past the popup's rounded rectangle and off
+    // the screen edge. Two limits apply: the user's alias length, and the width
+    // of the label box inside a 240px menu.
+    const components::theme::ThemeMetricTokens& metrics = themeTokens().metrics;
+    const float labelW = kBookmarkMenuWidth - metrics.spacing.compact * 2.0f - metrics.spacing.panel;
+    const int aliasColumns = std::min(settings.bookmarkAliasColumns,
+                                      columnsFitting(labelW, metrics.typography.option, kWideColumnEm));
+
     std::vector<std::string> items;
     items.push_back("★ 添加当前路径");
-    for (const Bookmark& b : bookmarks) items.push_back(b.name);
+    for (const Bookmark& b : bookmarks) items.push_back(core::shortenColumns(b.name, aliasColumns));
     items.push_back("管理快捷路径");
 
     components::contextMenu(ui, "bookmark.menu")
         .screen(w, h)
         .open(state.bookmarkMenuOpen)
         .position(state.bookmarkMenuX, state.bookmarkMenuY)
+        .size(kBookmarkMenuWidth, 0.0f)  // width only; 0 keeps the themed row height
         .theme(themeTokens())
         .items(items)
         .zIndex(1200)
@@ -5145,7 +5321,13 @@ void composeBookmarkMenu(eui::Ui& ui, float w, float h) {
             state.bookmarkMenuOpen = false;
             const int n = static_cast<int>(bookmarks.size());
             if (idx == 0) {
-                addBookmark(state.currentPath, state.currentPath);
+                if (state.selectedDevice.empty()) {
+                    toast("请先选择设备", "快捷路径指向手机上的目录。");
+                    return;
+                }
+                // Ask for the name first: saving "/sdcard/DCIM/Camera" verbatim
+                // is what made the menu unreadable.
+                promptBookmarkAlias(-1);
             } else if (idx == n + 1) {
                 state.bookmarkManageOpen = true;
             } else if (idx >= 1 && idx <= n) {
@@ -5211,9 +5393,17 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                     .x(24.0f).y(60.0f).size(pw - 48.0f, ph - 60.0f - 56.0f)
                     .theme(themeTokens())
                     .scrollbarWidth(8.0f).scrollbarGap(2.0f)
-                    .contentKey("bookmark.manage." + std::to_string(bookmarks.size()))
+                    // The alias limit is part of the key: changing it has to
+                    // rebuild the cached rows, or the old labels stay on screen.
+                    .contentKey("bookmark.manage." + std::to_string(bookmarks.size()) + "." +
+                                std::to_string(settings.bookmarkAliasColumns))
                     .content([&](eui::Ui& body, float cw, float) {
                         const float rowH = 40.0f;
+                        // Two buttons on the right, so the text gets what is left.
+                        const float textW = cw - 122.0f;
+                        const int nameColumns = std::min(settings.bookmarkAliasColumns,
+                                                         columnsFitting(textW, 13.0f, kWideColumnEm));
+                        const int pathColumns = columnsFitting(textW, 11.0f, kWideColumnEm);
                         for (std::size_t i = 0; i < bookmarks.size(); ++i) {
                             const Bookmark& b = bookmarks[i];
                             const std::string id = "bookmark.manage.row." + std::to_string(i);
@@ -5222,10 +5412,24 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                                 .y(y).size(cw, rowH)
                                 .content([&] {
                                     body.rect(id + ".bg").size(cw, rowH - 2.0f).color(kSurface).radius(6.0f).build();
-                                    body.text(id + ".name").x(10.0f).y(3.0f).size(cw - 70.0f, 18.0f)
-                                        .text(b.name).fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
-                                    body.text(id + ".path").x(10.0f).y(21.0f).size(cw - 70.0f, 15.0f)
-                                        .text(b.path).fontSize(11.0f).lineHeight(11.0f).color(kMuted).build();
+                                    body.text(id + ".name").x(10.0f).y(3.0f).size(textW, 18.0f)
+                                        .text(core::shortenColumns(b.name, nameColumns))
+                                        .fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
+                                    // Read from the end: the last folder is what
+                                    // tells two bookmarks apart.
+                                    body.text(id + ".path").x(10.0f).y(21.0f).size(textW, 15.0f)
+                                        .text(core::shortenColumnsHead(b.path, pathColumns))
+                                        .fontSize(11.0f).lineHeight(11.0f).color(kMuted).build();
+                                    body.rect(id + ".ren").x(cw - 104.0f).y(7.0f).size(46.0f, 26.0f)
+                                        .states(kSurfaceHover, kSurfaceAct, kBorder)
+                                        .radius(6.0f)
+                                        .onClick([i] { promptBookmarkAlias(static_cast<int>(i)); })
+                                        .build();
+                                    body.text(id + ".ren.label").x(cw - 104.0f).y(7.0f).size(46.0f, 26.0f)
+                                        .text("改名").fontSize(12.0f).lineHeight(12.0f).color(kInk)
+                                        .horizontalAlign(eui::HorizontalAlign::Center)
+                                        .verticalAlign(eui::VerticalAlign::Center)
+                                        .build();
                                     body.rect(id + ".del").x(cw - 54.0f).y(7.0f).size(46.0f, 26.0f)
                                         .states(kRose, eui::mixColor(kRose, kWhite, 0.12f), eui::mixColor(kRose, {0.0f, 0.0f, 0.0f, 1.0f}, 0.16f))
                                         .radius(6.0f)
@@ -5242,6 +5446,38 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                     })
                     .build();
             }
+
+            // The alias limit sits next to the labels it governs rather than in
+            // 设置: it affects nothing else, and this is where they are visible.
+            ui.text("bookmark.manage.alias.label")
+                .x(24.0f).y(ph - 56.0f).size(100.0f, 40.0f)
+                .text("别名最长字符")
+                .fontSize(12.5f).lineHeight(12.5f)
+                .color(kMuted)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
+            ui.stack("bookmark.manage.alias.wrap")
+                .x(130.0f).y(ph - 53.0f).size(120.0f, 34.0f)
+                .content([&] {
+                    components::stepper(ui, "bookmark.manage.alias")
+                        .theme(themeTokens())
+                        .size(120.0f, 34.0f)
+                        .value(settings.bookmarkAliasColumns)
+                        .min(kAliasColumnsMin)
+                        .max(kAliasColumnsMax)
+                        .step(2)
+                        .fontSize(14.0f)
+                        .onChange([](long long v) { setBookmarkAliasColumns(static_cast<int>(v)); })
+                        .build();
+                })
+                .build();
+            ui.text("bookmark.manage.alias.hint")
+                .x(256.0f).y(ph - 56.0f).size(76.0f, 40.0f)
+                .text("中文算 2 个")
+                .fontSize(10.0f).lineHeight(10.0f)
+                .color(kMuted)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
 
             toolButton(ui, "bookmark.manage.close", pw - 24.0f - 100.0f, ph - 56.0f, 100.0f, 40.0f,
                        0xF00D, "关闭", false, true, [] { state.bookmarkManageOpen = false; });
@@ -5350,7 +5586,8 @@ void composeCommandManageDialog(eui::Ui& ui, float w, float h) {
                                     body.text(id + ".name").x(10.0f).y(2.0f).size(cw - 170.0f, 18.0f)
                                         .text(c.name).fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
                                     body.text(id + ".cmd").x(10.0f).y(21.0f).size(cw - 170.0f, 14.0f)
-                                        .text(core::shorten(c.command, 50)).fontSize(11.0f).lineHeight(11.0f).color(kMuted).build();
+                                        .text(core::shortenColumns(c.command, columnsFitting(cw - 170.0f, 11.0f, kColumnEm)))
+                                        .fontSize(11.0f).lineHeight(11.0f).color(kMuted).build();
                                     body.text(id + ".type").x(cw - 160.0f).y(9.0f).size(100.0f, 18.0f)
                                         .text(c.shell ? "adb shell" : "cmd").fontSize(11.0f).lineHeight(11.0f)
                                         .color(c.shell ? kAccent : kAmber).horizontalAlign(eui::HorizontalAlign::Center).build();
@@ -6172,7 +6409,10 @@ void composePromptDialog(eui::Ui& ui, float w, float h) {
         .open(state.promptOpen)
         .theme(themeTokens())
         .size(460.0f, 200.0f)
-        .zIndex(1300)
+        // Above every dialog that can open it (the quick-path manager renames an
+        // alias from inside its own dialog), which is also the order closeTopmost
+        // unwinds them in.
+        .zIndex(1400)
         .content([&] {
             ui.text("prompt.title")
                 .x(24.0f).y(18.0f).size(412.0f, 26.0f)
@@ -6190,7 +6430,7 @@ void composePromptDialog(eui::Ui& ui, float w, float h) {
                         .size(412.0f, 40.0f)
                         .fontSize(15.0f)
                         .fontFamily("")
-                        .placeholder("名称")
+                        .placeholder(state.promptPlaceholder)
                         .value(state.promptValue)
                         .onChange([](const std::string& v) { state.promptValue = v; })
                         .onEnter([] { confirmPrompt(); })

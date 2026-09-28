@@ -24,4 +24,9 @@ std::string parentPath(const std::string& p);
 // Split a device path into components, dropping empties and leading "/".
 std::vector<std::string> splitPath(const std::string& p);
 
+// Last component of a device path: "/sdcard/DCIM/Camera" -> "Camera". Trailing
+// slashes are ignored. Empty for "/" or for an empty path, so the caller can
+// tell that the root has no name of its own and pick its own label.
+std::string lastSegment(const std::string& p);
+
 }  // namespace adb::core

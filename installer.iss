@@ -1,4 +1,4 @@
-﻿; AdbTools installer script (Inno Setup 6)
+; AdbTools installer script (Inno Setup 6)
 ;
 ; Build the portable files first (adb_browser.exe + assets/ + scrcpy/), then run:
 ;   iscc installer.iss
@@ -6,7 +6,7 @@
 ;   iscc installer.iss /DMyAppVersion=X.Y.Z   (the CI passes the tag version here)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.10.12"
+  #define MyAppVersion "0.10.13"
 #endif
 
 ; VERSIONINFO wants four components; the release tag only has three.

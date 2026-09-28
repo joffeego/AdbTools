@@ -44,4 +44,9 @@ std::vector<std::string> splitPath(const std::string& p) {
     return parts;
 }
 
+std::string lastSegment(const std::string& p) {
+    const std::vector<std::string> parts = splitPath(p);
+    return parts.empty() ? std::string() : parts.back();
+}
+
 }  // namespace adb::core
