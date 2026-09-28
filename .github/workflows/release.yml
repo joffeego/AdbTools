@@ -364,9 +364,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $existing = gh release view $tag --json id --jq .id 2>$null
-          if ($LASTEXITCODE -eq 0 -and $existing) {
-            Write-Host "A release for $tag already exists (id $existing); removing it so this run does not append to it."
+          # Look the release up with `gh release list`, not `gh release view`: for a
+          # tag that has no release yet, `view` exits non-zero and writes to stderr,
+          # and under the runner's `$ErrorActionPreference = 'Stop'` that aborts the
+          # step. It did exactly that on the first run that ever reached this step
+          # (v0.10.13, run 29), which then skipped "Create GitHub Release" entirely.
+          # `gh release list` always exits 0, so finding the release is a plain
+          # lookup instead of an expected error. Reproduced locally with a stub gh.
+          $releases = gh release list --limit 200 --json tagName,id | ConvertFrom-Json
+          $existing = $releases | Where-Object { $_.tagName -eq $tag } | Select-Object -First 1
+          if ($existing) {
+            Write-Host "A release for $tag already exists (id $($existing.id)); removing it so this run does not append to it."
             gh release delete $tag --yes
           } else {
             Write-Host "No existing release for $tag - creating a new one."
