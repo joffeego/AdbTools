@@ -359,25 +359,45 @@ jobs:
       # first - the *tag* is kept, so the re-run still starts from the same commit.
       - name: Drop a previous release for this tag
         if: startsWith(github.ref, 'refs/tags/')
+        # Best-effort cleanup, and it must never be the reason a release is missing:
+        # a duplicated body is recoverable, an unpublished release is not.
+        continue-on-error: true
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          # Look the release up with `gh release list`, not `gh release view`: for a
-          # tag that has no release yet, `view` exits non-zero and writes to stderr,
-          # and under the runner's `$ErrorActionPreference = 'Stop'` that aborts the
-          # step. It did exactly that on the first run that ever reached this step
-          # (v0.10.13, run 29), which then skipped "Create GitHub Release" entirely.
-          # `gh release list` always exits 0, so finding the release is a plain
-          # lookup instead of an expected error. Reproduced locally with a stub gh.
-          $releases = gh release list --limit 200 --json tagName,id | ConvertFrom-Json
-          $existing = $releases | Where-Object { $_.tagName -eq $tag } | Select-Object -First 1
-          if ($existing) {
-            Write-Host "A release for $tag already exists (id $($existing.id)); removing it so this run does not append to it."
-            gh release delete $tag --yes
-          } else {
-            Write-Host "No existing release for $tag - creating a new one."
+          # Talk to the REST API directly instead of shelling out to `gh`.
+          #
+          # History: this step failed on the first two runs that reached it (v0.10.13,
+          # runs 29 and 30) with a bare "Process completed with exit code 1" and no
+          # message at all, and the job-log download endpoint refuses this token
+          # ("Must have admin rights to Repository"), so the log could not be read
+          # back either. `gh` was the only component that could fail invisibly, and
+          # verifying a diagnosis I cannot observe is not worth another release run.
+          # Invoke-RestMethod is part of PowerShell, so there is nothing left to
+          # install or resolve; and because annotations *are* readable through the
+          # API, anything unexpected is reported as a warning instead of vanishing.
+          try {
+            $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept        = 'application/vnd.github+json'
+              'User-Agent'  = 'AdbTools-release-workflow'
+            }
+            $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases"
+            # `${base}` needs the braces: in a double-quoted string PowerShell reads
+            # `$base?per_page` as a variable named `base?`, which silently drops the
+            # host and produces "Invalid URI: cannot parse hostname".
+            $releases = Invoke-RestMethod -Headers $headers -Uri "${base}?per_page=100"
+            $existing = $releases | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
+            if ($existing) {
+              Write-Host "A release for $tag already exists (id $($existing.id)); removing it so this run does not append to it."
+              Invoke-RestMethod -Method Delete -Headers $headers -Uri "$base/$($existing.id)" | Out-Null
+            } else {
+              Write-Host "No existing release for $tag - creating a new one."
+            }
+          } catch {
+            Write-Host "::warning title=Drop previous release failed::$($_.Exception.Message)"
           }
 
       - name: Create GitHub Release
