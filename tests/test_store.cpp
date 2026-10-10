@@ -167,3 +167,32 @@ ADB_TEST(key_values_preserve_utf8_and_spaces) {
     ADB_CHECK_EQ(out.at("fontFamily"), std::string("微软雅黑"));
     ADB_CHECK_EQ(out.at("path"), std::string("C:\\Program Files\\x"));
 }
+
+ADB_TEST(a_utf8_bom_does_not_eat_the_first_line) {
+    // Notepad and PowerShell's `Set-Content -Encoding utf8` write a BOM. It used to
+    // stay glued to the first field, so the first key of a settings file never
+    // matched its name and was silently dropped - the user's first setting reverted
+    // on the next launch with nothing on screen to explain why.
+    const std::string bom = "\xEF\xBB\xBF";
+
+    const auto keys = parseKeyValues(bom + "fontFamily=SimSun\nuiScale=1.25\n");
+    ADB_CHECK_EQ(keys.size(), static_cast<std::size_t>(2));
+    ADB_CHECK(keys.count("fontFamily") == 1);
+    ADB_CHECK_EQ(keys.at("fontFamily"), std::string("SimSun"));
+
+    // The same three bytes must not end up inside the first record of any format.
+    const auto bookmarks = parseBookmarks(bom + "下载\t/sdcard/Download\n");
+    ADB_CHECK_EQ(bookmarks.size(), static_cast<std::size_t>(1));
+    ADB_CHECK_EQ(ADB_AT(bookmarks, 0).name, std::string("下载"));
+
+    const auto commands = parseCommands(bom + "重启 adb\tshell\tkill-server\n");
+    ADB_CHECK_EQ(commands.size(), static_cast<std::size_t>(1));
+    ADB_CHECK_EQ(ADB_AT(commands, 0).name, std::string("重启 adb"));
+
+    const auto paths = parseLastPaths(bom + "SERIAL1\t/sdcard/DCIM\n");
+    ADB_CHECK_EQ(paths.size(), static_cast<std::size_t>(1));
+    ADB_CHECK_EQ(paths.at("SERIAL1"), std::string("/sdcard/DCIM"));
+
+    // A BOM on its own (or in the middle) is not special: it is not a line.
+    ADB_CHECK_EQ(parseKeyValues(bom).size(), static_cast<std::size_t>(0));
+}

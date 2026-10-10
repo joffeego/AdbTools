@@ -818,6 +818,38 @@ std::vector<std::string> listSystemFonts(std::vector<char>& hasChinese) {
     return names;
 }
 
+// Which part of a registry font name refers to `target`?
+//
+// The registry names a family that shares one file with another as
+// "A & B (TrueType)" - "Microsoft YaHei & Microsoft YaHei UI", "SimSun &
+// NSimSun", "Microsoft JhengHei & Microsoft JhengHei UI". GDI lists *both*
+// halves as separate families, so B has to be matchable as well: requiring the
+// whole stem to start with the target left 27 of the 413 family names
+// unresolvable, and picking one of them (Microsoft YaHei UI sits right next to
+// Microsoft YaHei in the list) silently did nothing.
+//
+// `display` is the lowercased registry name without its "(TrueType)" suffix.
+// Returns the matching "&"-separated segment - so the caller can still read a
+// "bold"/"light" suffix off it - or an empty string when nothing matches.
+//
+// Caveat: a family that lives inside a .ttc collection is always rendered with
+// the collection's first face (the loader opens index 0), so "Microsoft YaHei UI"
+// draws the YaHei face and "NSimSun" the SimSun one - the same design the user
+// picked, just not the sibling face.
+std::string matchingFamilyPart(const std::string& display, const std::string& target) {
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t amp = display.find(" & ", start);
+        const std::string part =
+            display.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
+        if (part == target || part.rfind(target + " ", 0) == 0 || part.rfind(target + "&", 0) == 0) {
+            return part;
+        }
+        if (amp == std::string::npos) return {};
+        start = amp + 3;
+    }
+}
+
 // Resolve a font family to its font file for the given weight (300 light,
 // 400 regular, 700 bold). Reads both HKCU and HKLM (per-user fonts are in
 // HKCU and often point to a full path outside C:\Windows\Fonts).
@@ -846,14 +878,9 @@ std::string resolveFontFileForFamily(const std::string& family, int weight) {
             const std::size_t paren = name.find(" (");
             const std::string display = paren == std::string::npos ? name : name.substr(0, paren);
 
-            // The target family must be a leading word of the display name.
-            if (display != target &&
-                display.rfind(target + " ", 0) != 0 &&
-                display.rfind(target + " &", 0) != 0 &&
-                display.rfind(target + "&", 0) != 0) {
-                continue;
-            }
-            const std::string rest = display.substr(target.size());
+            const std::string matched = matchingFamilyPart(display, target);
+            if (matched.empty()) continue;
+            const std::string rest = matched.substr(target.size());
             const bool isBold = rest.find("bold") != std::string::npos ||
                                 rest.find("粗") != std::string::npos;
             const bool isLight = rest.find("light") != std::string::npos ||
@@ -1204,18 +1231,43 @@ void openSettingsDialog() {
     }
 }
 
+// Apply a font picked in Settings, or say why it cannot be applied.
+//
+// The list is built from GDI family names, but the renderer needs a font *file*,
+// which resolveFontFileForFamily() digs out of the registry. A few families have
+// no entry it can match even now that "&"-shared names match too (MS UI Gothic,
+// Nirmala UI, Yu Gothic, Cambria Math, the MingLiU-ExtB ones ...). That path used
+// to do nothing at all: no font change, no message, and the family was saved
+// anyway - so the settings file claimed a font that was never active and the next
+// launch quietly reverted it. Report it and keep the working font instead.
 void selectFontFamily(const std::string& family) {
-    settings.fontFamily = family;
 #ifdef _WIN32
-    settings.fontFile = resolveFontFileForFamily(family, settings.fontWeight);
+    const std::string file = resolveFontFileForFamily(family, settings.fontWeight);
+    if (file.empty() || !core::isRegularFileNoThrow(file)) {
+        toast("这个字体用不了", family + " 找不到对应的字体文件，已保持原来的字体。");
+        return;
+    }
+    settings.fontFamily = family;
+    settings.fontFile = file;
+#else
+    settings.fontFamily = family;
 #endif
     applySettingsNow();
 }
 
 void selectFontWeight(int weight) {
+    const int previousWeight = settings.fontWeight;
     settings.fontWeight = weight;
 #ifdef _WIN32
-    settings.fontFile = resolveFontFileForFamily(settings.fontFamily, weight);
+    const std::string file = resolveFontFileForFamily(settings.fontFamily, weight);
+    if (file.empty() || !core::isRegularFileNoThrow(file)) {
+        // Only reachable when the family itself is unresolvable: a lighter or
+        // bolder face of a resolvable family falls back to its regular file.
+        settings.fontWeight = previousWeight;
+        toast("这个字重用不了", settings.fontFamily + " 找不到对应的字体文件，已保持原来的设置。");
+        return;
+    }
+    settings.fontFile = file;
 #endif
     applySettingsNow();
 }
@@ -4749,7 +4801,13 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
                [] { doScreenshot(); });
     composeHoverTip(ui, "topbar.screenshot.tip", "topbar.screenshot.bg", "截图", ssX + h * 0.5f, y + h + 4.0f);
     const float apkX = ssX + h + 6.0f;
-    toolButton(ui, "topbar.install", apkX, y, h, h, 0xF50D, "", false, !state.selectedDevice.empty(),
+    // 0xF49E is fa-box-open as it exists in the Free Solid font. The codepoint used
+    // to be 0xF50D, which that font does not have at all: the glyph then came from
+    // whatever fallback font had something there, so the icon showed an empty box
+    // with one font, a Nerd Font's unrelated glyph with another, and nothing at all
+    // with a third. tests/test_icons.cpp now checks every codepoint used here
+    // against the shipped font file, so this cannot slip through again.
+    toolButton(ui, "topbar.install", apkX, y, h, h, 0xF49E, "", false, !state.selectedDevice.empty(),
                [] { doInstallApk(); });
     composeHoverTip(ui, "topbar.install.tip", "topbar.install.bg", "安装 APK", apkX + h * 0.5f, y + h + 4.0f);
     const float infoX = apkX + h + 6.0f;
@@ -6631,6 +6689,10 @@ void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
                     components::input(ui, "text.preview.input")
                         .theme(themeTokens()).size(pw - 48.0f, ph - 48.0f - 56.0f)
                         .fontSize(13.0f).fontFamily("").multiline(true)
+                        // A file is read from the top: without this the input parks the
+                        // caret at the end of whatever the async read delivered and the
+                        // follow-caret scroll opens the preview on the last line.
+                        .caretAtStartOnValueChange()
                         .value(state.textPreviewContent)
                         .onChange([](const std::string& v) { state.textPreviewContent = v; })
                         .build();

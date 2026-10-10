@@ -25,7 +25,12 @@ bool splitFields(const std::string& line, std::size_t fields, std::vector<std::s
 }
 
 void forEachLine(const std::string& text, const std::function<void(const std::string&)>& fn) {
-    std::size_t pos = 0;
+    // A UTF-8 BOM is a property of the file, not of its first line, but every
+    // parser here would otherwise treat it as part of the first field: the first
+    // key of a settings file stops matching and is silently dropped, and the first
+    // bookmark's name grows three invisible bytes. Notepad and PowerShell's
+    // `Set-Content -Encoding utf8` both write one, so a hand-edited file hits this.
+    std::size_t pos = text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
     while (pos < text.size()) {
         std::size_t end = text.find('\n', pos);
         if (end == std::string::npos) end = text.size();

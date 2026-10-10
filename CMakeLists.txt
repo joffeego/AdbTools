@@ -171,6 +171,7 @@ if(ADBTOOLS_BUILD_TESTS)
         tests/test_adbpath.cpp
         tests/test_batch.cpp
         tests/test_fileio.cpp
+        tests/test_icons.cpp
         tests/test_package.cpp
         tests/test_paths.cpp
         tests/test_process.cpp
@@ -182,6 +183,13 @@ if(ADBTOOLS_BUILD_TESTS)
     # The core sources are compiled twice on purpose: the app target has the
     # framework's flags applied to it, and the test target must stay free of
     # them (and must not link the GUI).
+    #
+    # test_icons.cpp is the one test that looks outside core/: it checks the icon
+    # codepoints written in main.cpp against the Font Awesome file shipped in
+    # assets/, which is the only way to catch a codepoint that font cannot draw
+    # (asking for one makes the icon depend on the user's own font instead).
+    target_compile_definitions(adbtools_tests PRIVATE
+        ADBTOOLS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     if(WIN32)
         target_link_libraries(adbtools_tests PRIVATE bcrypt)
     endif()

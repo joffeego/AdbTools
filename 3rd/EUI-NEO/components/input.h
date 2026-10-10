@@ -56,6 +56,13 @@ public:
     }
     InputBuilder& placeholder(std::string value) { placeholder_ = std::move(value); return *this; }
     InputBuilder& multiline(bool value = true) { multiline_ = value; return *this; }
+    // Park the caret at the start whenever `value()` is replaced from outside, so
+    // the view stays on the first line instead of following the caret to the end.
+    // Meant for document viewers (the text preview); edit fields keep the default.
+    InputBuilder& caretAtStartOnValueChange(bool value = true) {
+        caretAtStartOnValueChange_ = value;
+        return *this;
+    }
     InputBuilder& fontSize(float value) { fontSize_ = std::max(1.0f, value); return *this; }
     InputBuilder& fontFamily(std::string value) { fontFamily_ = std::move(value); return *this; }
     InputBuilder& inset(float value) { inset_ = std::max(0.0f, value); return *this; }
@@ -94,8 +101,19 @@ public:
         const std::function<void(const std::string&)> onChange = onChange_;
         const std::function<void()> onEnter = onEnter_;
         const std::function<void(bool)> onFocus = onFocus_;
-        const float textLineHeight = fontSize * 1.2f;
-        const float layoutLineHeight = std::max(1.0f, fontSize * fontScale) * 1.2f;
+        // One line height for everything the input draws or measures.
+        //
+        // TextBuilder scales a text element's glyph size and line height by
+        // runtimeFontScale, so the line *boxes* this component stacks must be scaled
+        // the same way as the layout that the selection rectangles, the caret, the
+        // hit testing and the scrolling are computed from. They used to diverge
+        // (boxes at 1.2*fontSize, layout at 1.2*fontSize*fontScale), so with any
+        // 字号 other than 默认 the highlight walked away from the text line by line
+        // and every box clipped its own glyphs - an 80-line file looked like a pile
+        // of overlapping lines in the text preview.
+        const float scaledFontSize = std::max(1.0f, fontSize * fontScale);
+        const float textLineHeight = scaledFontSize * 1.2f;
+        const float layoutLineHeight = textLineHeight;
         const float textY = multiline_ ? inset : std::max(0.0f, (height_ - layoutLineHeight) * 0.5f);
         const float textHeight = multiline_ ? std::max(0.0f, height_ - inset * 2.0f) : layoutLineHeight;
         const float width = width_;
@@ -105,7 +123,13 @@ public:
             const bool wasFocused = focused;
             state.text = text_;
             ++state.textRevision;
-            state.cursor = InputModel::clampUtf8Boundary(state.text, static_cast<int>(state.text.size()));
+            // A replacement from outside is not a caret move. A document viewer asks
+            // for the caret to stay at the start, so the follow-caret scroll below
+            // shows the first line; without that, loading an 80-line file left the
+            // preview scrolled to its last line before the user touched anything.
+            state.cursor = caretAtStartOnValueChange_
+                ? 0
+                : InputModel::clampUtf8Boundary(state.text, static_cast<int>(state.text.size()));
             state.selectionStart = state.cursor;
             state.selectionEnd = state.cursor;
             if (!wasFocused) {
@@ -471,6 +495,10 @@ private:
     std::string text_;
     std::string placeholder_ = "Hello EUI-NEO 😉";
     bool multiline_ = false;
+    // Where the caret goes when `value()` is replaced from outside. Off (the
+    // default) parks it at the end, which is right for a prefilled edit field;
+    // document viewers want the start so the view opens on the first line.
+    bool caretAtStartOnValueChange_ = false;
     float width_ = 260.0f;
     float height_ = 44.0f;
     float x_ = 0.0f;

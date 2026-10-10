@@ -30,6 +30,11 @@ adb_browser_edit_tmp.txt
 # ---- Local-only docs (contain secrets / token, never push) ----
 维护与发版指南.md
 
+# ---- GraphFlow (context-packaging tool; its graph is tens of MB of local cache) ----
+/.graphflow/
+/.graphflow-cache/
+/graphflow-out/
+
 # ---- IDE / OS ----
 .vscode/
 .idea/
