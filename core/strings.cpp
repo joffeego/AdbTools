@@ -155,6 +155,51 @@ std::string shortenColumnsHead(const std::string& s, int maxColumns) {
     return std::string(kEllipsis) + s.substr(start);
 }
 
+std::vector<TextMatch> findMatches(const std::string& haystack, const std::string& needle,
+                                   bool caseSensitive, std::size_t maxMatches) {
+    std::vector<TextMatch> matches;
+    if (needle.empty() || maxMatches == 0 || haystack.size() < needle.size()) {
+        return matches;
+    }
+
+    const std::string text = caseSensitive ? haystack : lower(haystack);
+    const std::string query = caseSensitive ? needle : lower(needle);
+
+    std::size_t from = 0;
+    while (from + query.size() <= text.size()) {
+        const std::size_t hit = text.find(query, from);
+        if (hit == std::string::npos) break;
+
+        // Only accept hits that cover whole characters. A byte match inside a
+        // multi-byte character is not something the user can see, and selecting it
+        // would draw half a glyph. Both ends matter: a needle that is itself half a
+        // character ("\xE4\xB8") starts on a boundary but ends inside one.
+        const std::size_t end = hit + query.size();
+        const unsigned char lead = static_cast<unsigned char>(haystack[hit]);
+        const bool startsMidCharacter = (lead & 0xC0u) == 0x80u;
+        const bool endsMidCharacter =
+            end < haystack.size() && (static_cast<unsigned char>(haystack[end]) & 0xC0u) == 0x80u;
+        if (startsMidCharacter || endsMidCharacter) {
+            from = hit + 1;
+            continue;
+        }
+
+        matches.push_back({hit, end});
+        if (matches.size() >= maxMatches) break;
+        from = end;
+    }
+    return matches;
+}
+
+std::size_t lineNumberAt(const std::string& text, std::size_t offset) {
+    std::size_t line = 1;
+    const std::size_t limit = offset < text.size() ? offset : text.size();
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (text[i] == '\n') ++line;
+    }
+    return line;
+}
+
 std::string formatSize(long long bytes) {
     if (bytes < 0) return "";
     static const char* kUnits[] = {"B", "KB", "MB", "GB", "TB"};

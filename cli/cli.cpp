@@ -376,7 +376,14 @@ int cmdList(const Options& options) {
 
     const std::string path = options.args.front();
     const ProcessResult r = runProcess(g_adbPath, adb::core::listArgs(serial, path), 30000);
-    if (r.exitCode != 0) return failWithAdb(r, "读取目录");
+    if (r.exitCode != 0) {
+        // Report only the part that came from `ls`: the write marker and the
+        // writability flag are this command's own protocol (see
+        // core::listingErrorText) and mean nothing to whoever ran the CLI.
+        ProcessResult reported = r;
+        reported.out = adb::core::listingErrorText(r.out);
+        return failWithAdb(reported, "读取目录");
+    }
 
     const adb::core::ListingResult listing = adb::core::parseListingOutput(r.out);
     if (options.json) {

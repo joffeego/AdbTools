@@ -232,6 +232,25 @@ ADB_TEST(parseListingOutput_without_marker_is_not_writable) {
     ADB_CHECK(!result.writable);
 }
 
+ADB_TEST(listingErrorText_drops_the_protocol_tail) {
+    // Captured from a real run: `list /nope` on a device without that path. The
+    // marker and the flag belong to the listing protocol, so a failure report that
+    // includes them shows the user two lines they cannot act on.
+    const std::string out = std::string("ls: /nope: No such file or directory\n") +
+                            kWriteMarker + "\n1\n";
+    ADB_CHECK_EQ(listingErrorText(out), std::string("ls: /nope: No such file or directory\n"));
+
+    // No marker (adb died early): the whole output is the message.
+    const std::string noMarker = "error: device offline\n";
+    ADB_CHECK_EQ(listingErrorText(noMarker), noMarker);
+
+    // A path that legitimately contains the marker text stays intact up to it.
+    const std::string odd = std::string("ls: /sdcard/__WRITE__: Not a directory\n") + kWriteMarker + "\n0\n";
+    ADB_CHECK_EQ(listingErrorText(odd), std::string("ls: /sdcard/__WRITE__: Not a directory\n"));
+
+    ADB_CHECK_EQ(listingErrorText(""), std::string(""));
+}
+
 ADB_TEST(command_builders_quote_device_paths) {
     ADB_CHECK_EQ(deleteArgs("S1", "/sdcard/My Dir").size(), static_cast<std::size_t>(6));
     ADB_CHECK_EQ(ADB_AT(deleteArgs("S1", "/sdcard/My Dir"), 5), std::string("'/sdcard/My Dir'"));

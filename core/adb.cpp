@@ -44,6 +44,30 @@ std::vector<Device> parseDevices(const std::string& output) {
     return devices;
 }
 
+namespace {
+
+// Position of the write marker's first character, or npos.
+//
+// The marker is echoed on a line of its own (`echo __WRITE__`), so it is matched as
+// a whole line. A plain find() would also hit a path that happens to contain the
+// text - `ls: /sdcard/__WRITE__: Not a directory` - and cut the listing (or the
+// error message) off in the middle.
+std::size_t findWriteMarkerLine(const std::string& output) {
+    const std::string marker(kWriteMarker);
+    std::size_t from = 0;
+    while (true) {
+        const std::size_t at = output.find(marker, from);
+        if (at == std::string::npos) return std::string::npos;
+        const bool atLineStart = (at == 0) || output[at - 1] == '\n';
+        const std::size_t after = at + marker.size();
+        const bool atLineEnd = (after >= output.size()) || output[after] == '\n' || output[after] == '\r';
+        if (atLineStart && atLineEnd) return at;
+        from = at + 1;
+    }
+}
+
+}  // namespace
+
 std::vector<FsEntry> parseLsLa(const std::string& output) {
     std::vector<FsEntry> entries;
     std::istringstream in(output);
@@ -117,13 +141,18 @@ std::vector<std::string> thirdPartyPackagesArgs(const std::string& serial) {
 
 ListingResult parseListingOutput(const std::string& output) {
     ListingResult result;
-    const std::size_t marker = output.find(kWriteMarker);
+    const std::size_t marker = findWriteMarkerLine(output);
     const std::string lsOut = marker == std::string::npos ? output : output.substr(0, marker);
     const std::string writeOut =
         marker == std::string::npos ? std::string{} : output.substr(marker + std::string(kWriteMarker).size());
     result.entries = parseLsLa(lsOut);
     result.writable = (trim(writeOut) == "1");
     return result;
+}
+
+std::string listingErrorText(const std::string& output) {
+    const std::size_t marker = findWriteMarkerLine(output);
+    return marker == std::string::npos ? output : output.substr(0, marker);
 }
 
 std::vector<std::string> pullArgs(const std::string& serial, const std::string& remote,

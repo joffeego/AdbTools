@@ -286,6 +286,10 @@ struct AppState {
     std::string pathInput = "/";
     bool pathEditing = false;
     std::vector<std::string> pathSuggestions;
+    // Which suggestion the arrow keys picked (-1 = none, Enter then commits the typed
+    // text). Reset whenever the list changes, so a stale index can never point at a
+    // suggestion that is no longer offered.
+    int pathSuggestionIndex = -1;
     std::vector<FsEntry> entries;
     bool loading = false;
     bool busy = false;
@@ -397,6 +401,16 @@ struct AppState {
     std::string textPreviewPath;
     std::string textPreviewContent;
     std::string textPreviewRemote;
+    // Find-as-you-type inside the preview (Ctrl+F): the query, its matches, which one
+    // is current, and the range the editor should select/scroll to. The request
+    // counter distinguishes repeats, so "next" works even with a single match.
+    bool textPreviewSearchOpen = false;
+    std::string textPreviewQuery;
+    std::vector<core::TextMatch> textPreviewMatches;
+    int textPreviewMatchIndex = -1;   // -1 = nothing selected
+    int textPreviewRevealStart = -1;
+    int textPreviewRevealEnd = -1;
+    int textPreviewRevealRequest = 0;
 
     // scrcpy screen mirroring (embedded window)
     bool scrcpyOpen = false;
@@ -1520,6 +1534,10 @@ void runCommandEntry(const CommandEntry& cmd) {
 // =============================================================================
 void refreshListing(bool force = false);
 void closeMirrorWindow();
+// Defined with the rest of the path-suggestion code; the global key handler needs
+// them for the up/down arrows while the path bar is being edited.
+void movePathSuggestion(int delta);
+void cancelPathEdit();
 
 void applyDeviceList(const std::vector<Device>& devices) {
     const std::string prevSerial = state.selectedDevice;
@@ -1714,17 +1732,18 @@ void refreshListing(bool force) {
         "adb.list",
         [adb, serial, path]() -> app::async::Result<ListingResult> {
             // One round-trip for both the listing and the writable check.
-            const std::string shellCmd =
-                "ls -la " + core::shellQuote(path) + " 2>&1; __r=$?; echo __WRITE__; "
-                "test -w " + core::shellQuote(path) + " && echo 1 || echo 0; exit $__r";
-            ProcessResult r = runProcess(adb, {"-s", serial, "shell", shellCmd}, 30000);
+            // The listing command and its output format live in core/adb.cpp: the CLI
+            // runs the same command through core::listArgs, and both front ends parse
+            // it with core::parseListingOutput. Building the shell line here as well
+            // (and matching "__WRITE__" by hand) meant two copies of one protocol.
+            ProcessResult r = runProcess(adb, core::listArgs(serial, path), 30000);
             // Retry once on a transient adb drop (e.g. device still reconnecting).
             if (r.exitCode == 255 && core::trim(r.out).empty()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(800));
-                r = runProcess(adb, {"-s", serial, "shell", shellCmd}, 30000);
+                r = runProcess(adb, core::listArgs(serial, path), 30000);
             }
             if (r.exitCode != 0) {
-                std::string msg = core::trim(r.out);
+                std::string msg = core::trim(core::listingErrorText(r.out));
                 if (msg.empty()) {
                     msg = "读取目录失败（退出码 " + std::to_string(r.exitCode) + "）";
                     if (r.exitCode == 255) {
@@ -1734,13 +1753,7 @@ void refreshListing(bool force) {
                 }
                 return app::async::failure<ListingResult>(msg);
             }
-            ListingResult result;
-            const std::size_t marker = r.out.find("__WRITE__");
-            const std::string lsOut = marker == std::string::npos ? r.out : r.out.substr(0, marker);
-            const std::string writeOut = marker == std::string::npos ? std::string{} : r.out.substr(marker + 9);
-            result.entries = core::parseLsLa(lsOut);
-            result.writable = (core::trim(writeOut) == "1");
-            return app::async::success(result);
+            return app::async::success(core::parseListingOutput(r.out));
         },
         [cacheKey](const app::async::Result<ListingResult>& result) {
             state.loading = false;
@@ -3634,6 +3647,14 @@ void openTextPreview(const std::string& name) {
     state.textPreviewOpen = true;
     state.textPreviewContent = "加载中…";
     state.textPreviewRemote = remote;
+    // Each file starts with a clean find box: keeping the previous query would either
+    // highlight nothing or jump somewhere the user did not ask for.
+    state.textPreviewSearchOpen = false;
+    state.textPreviewQuery.clear();
+    state.textPreviewMatches.clear();
+    state.textPreviewMatchIndex = -1;
+    state.textPreviewRevealStart = -1;
+    state.textPreviewRevealEnd = -1;
     app::async::restart(
         "adb.text.read",
         [adb, serial, remote]() -> app::async::Result<std::string> {
@@ -3679,6 +3700,73 @@ void saveTextPreview() {
             state.busy = false;
             toast(result.ok ? "完成" : "保存失败", result.ok ? result.value : result.error);
         });
+}
+
+// --- searching inside the text preview -----------------------------------------
+//
+// The matching itself lives in core (findMatches: UTF-8 safe, ASCII
+// case-insensitive, capped) so it can be unit tested; this decides which hit is
+// current and asks the editor to select and scroll to it.
+void textPreviewRevealCurrentMatch() {
+    const int count = static_cast<int>(state.textPreviewMatches.size());
+    if (count == 0 || state.textPreviewMatchIndex < 0 || state.textPreviewMatchIndex >= count) {
+        state.textPreviewRevealStart = -1;
+        state.textPreviewRevealEnd = -1;
+        return;
+    }
+    const core::TextMatch& match =
+        state.textPreviewMatches[static_cast<std::size_t>(state.textPreviewMatchIndex)];
+    state.textPreviewRevealStart = static_cast<int>(match.start);
+    state.textPreviewRevealEnd = static_cast<int>(match.end);
+    ++state.textPreviewRevealRequest;  // a repeat of the same range still counts as a jump
+}
+
+// Drop the highlight the search put on the text. The selection is collapsed where the
+// match was instead of being cleared outright: the caret - and with it the view - then
+// stays where the user was reading, and no stale highlight is left behind.
+void clearTextPreviewHighlight() {
+    if (state.textPreviewRevealStart < 0) return;
+    state.textPreviewRevealEnd = state.textPreviewRevealStart;
+    ++state.textPreviewRevealRequest;
+}
+
+// Recompute the hits. `jumpToFirst` is what typing in the find box does; editing the
+// text itself only refreshes the count (no jumping while somebody types).
+void refreshTextPreviewMatches(bool jumpToFirst) {
+    state.textPreviewMatches = core::findMatches(state.textPreviewContent, state.textPreviewQuery);
+    const int count = static_cast<int>(state.textPreviewMatches.size());
+    if (count == 0) {
+        state.textPreviewMatchIndex = -1;
+        clearTextPreviewHighlight();
+        return;
+    }
+    if (jumpToFirst || state.textPreviewMatchIndex < 0 || state.textPreviewMatchIndex >= count) {
+        state.textPreviewMatchIndex = 0;
+    }
+    textPreviewRevealCurrentMatch();
+}
+
+void openTextPreviewSearch() {
+    state.textPreviewSearchOpen = true;
+    refreshTextPreviewMatches(true);
+    app::requestFocus("text.preview.find.hit");
+}
+
+void closeTextPreviewSearch() {
+    state.textPreviewSearchOpen = false;
+    state.textPreviewQuery.clear();
+    state.textPreviewMatches.clear();
+    state.textPreviewMatchIndex = -1;
+    clearTextPreviewHighlight();
+}
+
+// Next (+1) or previous (-1) hit, wrapping around at both ends.
+void stepTextPreviewMatch(int delta) {
+    const int count = static_cast<int>(state.textPreviewMatches.size());
+    if (count == 0) return;
+    const int current = state.textPreviewMatchIndex < 0 ? 0 : state.textPreviewMatchIndex;
+    state.textPreviewMatchIndex = ((current + delta) % count + count) % count;
+    textPreviewRevealCurrentMatch();
 }
 
 // -----------------------------------------------------------------------------
@@ -4181,6 +4269,9 @@ void closeTopmost() {
     else if (state.commandOutputOpen) state.commandOutputOpen = false;
     else if (state.deviceInfoOpen) state.deviceInfoOpen = false;
     else if (state.logcatOpen) state.logcatOpen = false;
+    // The preview's find bar sits inside the dialog, so Escape closes it first and a
+    // second Escape closes the dialog itself.
+    else if (state.textPreviewSearchOpen) closeTextPreviewSearch();
     else if (state.textPreviewOpen) state.textPreviewOpen = false;
     else if (state.imagePreviewOpen) state.imagePreviewOpen = false;
     else if (state.propertiesOpen) state.propertiesOpen = false;
@@ -4207,13 +4298,22 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
     if (!ev.isDown()) return;
     if (anyOverlayOpen()) {
         if (ev.key == eui::InputKey::Escape) closeTopmost();
+        // Ctrl+F belongs to the text preview while it is open (its own find bar);
+        // the file list's search box would be hidden behind the dialog.
+        else if (ev.key == eui::InputKey::F && ev.modifiers.control && state.textPreviewOpen) {
+            openTextPreviewSearch();
+        }
         return;
     }
     if (state.pathEditing) {
         if (ev.key == eui::InputKey::Escape) {
-            state.pathEditing = false;
-            state.pathInput = state.currentPath;
-            state.pathSuggestions.clear();
+            cancelPathEdit();
+        } else if (ev.key == eui::InputKey::Down) {
+            // The path field is single-line, so the input component leaves the arrow keys
+            // alone (it only uses them when multi-line) and they arrive here.
+            movePathSuggestion(1);
+        } else if (ev.key == eui::InputKey::Up) {
+            movePathSuggestion(-1);
         }
         return;
     }
@@ -4910,7 +5010,44 @@ void updatePathSuggestions() {
         },
         [](const app::async::Result<std::vector<std::string>>& result) {
             if (result.ok) state.pathSuggestions = result.value;
+            // A new list invalidates the highlight: it is the only thing that keeps the
+            // arrow keys from committing an entry that is no longer on screen.
+            state.pathSuggestionIndex = -1;
         });
+}
+
+// Move the suggestion highlight with the arrow keys. The list is capped at 8 entries
+// (updatePathSuggestions), so it always fits on screen and nothing has to scroll.
+void movePathSuggestion(int delta) {
+    const int count = static_cast<int>(state.pathSuggestions.size());
+    if (count == 0) return;
+    if (state.pathSuggestionIndex < 0) {
+        // First arrow press enters the list from the end the user is heading towards.
+        state.pathSuggestionIndex = delta > 0 ? 0 : count - 1;
+        return;
+    }
+    state.pathSuggestionIndex = std::clamp(state.pathSuggestionIndex + delta, 0, count - 1);
+}
+
+// The suggestion the arrow keys picked, or "" when the typed text is what counts.
+std::string pickedPathSuggestion() {
+    const int index = state.pathSuggestionIndex;
+    if (index < 0 || index >= static_cast<int>(state.pathSuggestions.size())) return "";
+    return state.pathSuggestions[static_cast<std::size_t>(index)];
+}
+
+void commitPathEdit(const std::string& target) {
+    state.pathSuggestions.clear();
+    state.pathSuggestionIndex = -1;
+    state.pathEditing = false;
+    goToPath(target);
+}
+
+void cancelPathEdit() {
+    state.pathSuggestions.clear();
+    state.pathSuggestionIndex = -1;
+    state.pathEditing = false;
+    state.pathInput = state.currentPath;
 }
 
 void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
@@ -4953,23 +5090,20 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                         updatePathSuggestions();
                     })
                     .onEnter([] {
-                        state.pathSuggestions.clear();
-                        state.pathEditing = false;
-                        goToPath(state.pathInput);
+                        // Enter takes the highlighted suggestion when the arrows picked
+                        // one, otherwise it commits exactly what was typed. A picked path
+                        // is already complete, so it needs no trailing separator logic.
+                        const std::string picked = pickedPathSuggestion();
+                        commitPathEdit(picked.empty() ? state.pathInput : picked);
                     })
                     .build();
                 toolButton(ui, "path.edit.ok", inputW + 8.0f, 0.0f, btnW, h, 0xF00C, "", true, true,
                            [] {
-                               state.pathSuggestions.clear();
-                               state.pathEditing = false;
-                               goToPath(state.pathInput);
+                               const std::string picked = pickedPathSuggestion();
+                               commitPathEdit(picked.empty() ? state.pathInput : picked);
                            });
                 toolButton(ui, "path.edit.cancel", inputW + btnW + 16.0f, 0.0f, btnW, h, 0xF00D, "", false, true,
-                           [] {
-                               state.pathSuggestions.clear();
-                               state.pathEditing = false;
-                               state.pathInput = state.currentPath;
-                           });
+                           [] { cancelPathEdit(); });
             })
             .build();
 
@@ -4990,15 +5124,15 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                     for (std::size_t i = 0; i < state.pathSuggestions.size(); ++i) {
                         const std::string& s = state.pathSuggestions[i];
                         const float iy = 4.0f + static_cast<float>(i) * 28.0f;
+                        // The arrow-key pick wears the app's "selected" colour
+                        // (kAccentSoft, as in the app manager) so it cannot be mistaken
+                        // for the row the mouse happens to hover.
+                        const bool picked = static_cast<int>(i) == state.pathSuggestionIndex;
                         ui.rect("path.suggest.item." + std::to_string(i))
                             .x(4.0f).y(iy).size(crumbW - 8.0f, 28.0f)
-                            .states(kClear, kSurfaceHover, kSurfaceAct)
+                            .states(picked ? kAccentSoft : kClear, kSurfaceHover, kSurfaceAct)
                             .radius(6.0f)
-                            .onClick([s] {
-                                state.pathSuggestions.clear();
-                                state.pathEditing = false;
-                                goToPath(s);
-                            })
+                            .onClick([s] { commitPathEdit(s); })
                             .build();
                         ui.text("path.suggest.label." + std::to_string(i))
                             .x(14.0f).y(iy).size(crumbW - 28.0f, 28.0f)
@@ -6683,20 +6817,91 @@ void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
                 .x(24.0f).y(16.0f).size(pw - 48.0f, 26.0f)
                 .text(state.textPreviewRemote)
                 .fontSize(15.0f).lineHeight(15.0f).color(kInk).build();
+
+            // Find bar (Ctrl+F). It steals one row from the editor, so it only exists
+            // while somebody is actually searching.
+            const int matchCount = static_cast<int>(state.textPreviewMatches.size());
+            float inputY = 48.0f;
+            float inputH = ph - 48.0f - 56.0f;
+            if (state.textPreviewSearchOpen) {
+                ui.stack("text.preview.find.wrap")
+                    .x(24.0f).y(44.0f).size(pw - 48.0f, 32.0f)
+                    .content([&] {
+                        components::input(ui, "text.preview.find")
+                            .theme(themeTokens()).size(384.0f, 32.0f)
+                            .fontSize(13.0f).fontFamily("")
+                            .placeholder("在文件里查找…")
+                            .value(state.textPreviewQuery)
+                            .onChange([](const std::string& v) {
+                                state.textPreviewQuery = v;
+                                refreshTextPreviewMatches(true);
+                            })
+                            .onEnter([] { stepTextPreviewMatch(1); })
+                            .onEscape([] { closeTextPreviewSearch(); })
+                            .build();
+                    }).build();
+
+                std::string countLabel;
+                if (!state.textPreviewQuery.empty()) {
+                    countLabel = matchCount == 0
+                        ? "无匹配"
+                        : std::to_string(state.textPreviewMatchIndex + 1) + " / " +
+                              std::to_string(matchCount) +
+                              (matchCount >= 5000 ? "+" : "");
+                }
+                ui.text("text.preview.find.count")
+                    .x(414.0f).y(44.0f).size(64.0f, 32.0f)
+                    .text(countLabel)
+                    .fontSize(12.0f).lineHeight(12.0f)
+                    .color(matchCount == 0 && !state.textPreviewQuery.empty() ? kRose : kMuted)
+                    .horizontalAlign(eui::HorizontalAlign::Right)
+                    .verticalAlign(eui::VerticalAlign::Center)
+                    .build();
+                toolButton(ui, "text.preview.find.prev", 482.0f, 44.0f, 34.0f, 32.0f,
+                           0xF060, "", false, matchCount > 0, [] { stepTextPreviewMatch(-1); });
+                toolButton(ui, "text.preview.find.next", 520.0f, 44.0f, 34.0f, 32.0f,
+                           0xF061, "", false, matchCount > 0, [] { stepTextPreviewMatch(1); });
+                toolButton(ui, "text.preview.find.close", 558.0f, 44.0f, 34.0f, 32.0f,
+                           0xF00D, "", false, true, [] { closeTextPreviewSearch(); });
+                inputY = 88.0f;
+                inputH = ph - 88.0f - 56.0f;
+            }
+
             ui.stack("text.preview.input.wrap")
-                .x(24.0f).y(48.0f).size(pw - 48.0f, ph - 48.0f - 56.0f)
+                .x(24.0f).y(inputY).size(pw - 48.0f, inputH)
                 .content([&] {
-                    components::input(ui, "text.preview.input")
-                        .theme(themeTokens()).size(pw - 48.0f, ph - 48.0f - 56.0f)
+                    auto editor = components::input(ui, "text.preview.input")
+                        .theme(themeTokens()).size(pw - 48.0f, inputH)
                         .fontSize(13.0f).fontFamily("").multiline(true)
                         // A file is read from the top: without this the input parks the
                         // caret at the end of whatever the async read delivered and the
                         // follow-caret scroll opens the preview on the last line.
                         .caretAtStartOnValueChange()
                         .value(state.textPreviewContent)
-                        .onChange([](const std::string& v) { state.textPreviewContent = v; })
-                        .build();
+                        .onChange([](const std::string& v) {
+                            state.textPreviewContent = v;
+                            // Keep the count honest while the text is edited, but do not
+                            // jump anywhere: the user is typing, not searching.
+                            refreshTextPreviewMatches(false);
+                        })
+                        // Escape reaches the focused input before the global key handler,
+                        // so the editor mirrors closeTopmost() itself: the find bar first,
+                        // then the dialog.
+                        .onEscape([] {
+                            if (state.textPreviewSearchOpen) closeTextPreviewSearch();
+                            else state.textPreviewOpen = false;
+                        });
+                    if (state.textPreviewRevealStart >= 0) {
+                        editor.revealRange(state.textPreviewRevealStart, state.textPreviewRevealEnd,
+                                           state.textPreviewRevealRequest);
+                    }
+                    editor.build();
                 }).build();
+            toolButton(ui, "text.preview.find.toggle", 24.0f, ph - 56.0f, 110.0f, 40.0f,
+                       0xF002, "查找", false, true, [] {
+                           if (state.textPreviewSearchOpen) closeTextPreviewSearch();
+                           else openTextPreviewSearch();
+                       });
             toolButton(ui, "text.preview.save", pw - 24.0f - 200.0f, ph - 56.0f, 92.0f, 40.0f,
                        0xF0C7, "保存", true, true, [] { saveTextPreview(); });
             toolButton(ui, "text.preview.close", pw - 24.0f - 100.0f, ph - 56.0f, 100.0f, 40.0f,

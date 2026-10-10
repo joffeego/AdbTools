@@ -1,5 +1,9 @@
 # CLI
 
+> 要让**别的 AI / 脚本**接入这个 CLI，看 **[AI-INTEGRATION.md](AI-INTEGRATION.md)**：
+> 那份是接口契约（每条命令的 stdout / JSON 字段 / 退出码 / 编码 / 超时，全部实测过），
+> 还带一段可以直接粘贴给 AI 的提示词。**本文件是维护者视角**（为什么这样实现、怎么测试）。
+
 One executable, two modes:
 
 ```

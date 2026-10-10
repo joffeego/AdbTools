@@ -46,6 +46,30 @@ std::string shortenColumns(const std::string& s, int maxColumns);
 // where you are - so the quick-path dialog shows paths this way.
 std::string shortenColumnsHead(const std::string& s, int maxColumns);
 
+// --- searching text ----------------------------------------------------------
+//
+// A byte range inside a string: [start, end).
+struct TextMatch {
+    std::size_t start = 0;
+    std::size_t end = 0;
+};
+
+// Every occurrence of `needle` in `haystack`, in order.
+//
+// Matches only start on a UTF-8 code point boundary: looking for "中" must not hit
+// the middle of some other character's three bytes. Comparison is ASCII
+// case-insensitive (the same rule as `lower` - bytes >= 0x80 are compared as-is),
+// so "README" finds "readme" while "Ä" only finds "Ä".
+//
+// Stops after `maxMatches` hits so a one-letter query in a huge file cannot
+// allocate without bound; the caller can tell it was cut off because the result is
+// exactly `maxMatches` long.
+std::vector<TextMatch> findMatches(const std::string& haystack, const std::string& needle,
+                                   bool caseSensitive = false, std::size_t maxMatches = 5000);
+
+// 1-based number of the line containing byte `offset` (for "第 N 行" style hints).
+std::size_t lineNumberAt(const std::string& text, std::size_t offset);
+
 // Human-readable byte count, e.g. 1536 -> "1.5 KB". Negative input -> "".
 std::string formatSize(long long bytes);
 

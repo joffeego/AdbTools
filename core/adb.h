@@ -82,6 +82,16 @@ extern const char* const kWriteMarker;
 // directory it knows is writable.
 ListingResult parseListingOutput(const std::string& output);
 
+// The part of a listing command's output that is worth showing a user: everything
+// before kWriteMarker.
+//
+// A failed listing still contains the protocol tail ("__WRITE__" and the 0/1
+// writability flag) because buildListCommand echoes both no matter how `ls`
+// exited. Reporting the raw output therefore shows the user two lines of internal
+// plumbing - and on a device where the path does not exist that is the *only*
+// thing they would see next to adb's own message.
+std::string listingErrorText(const std::string& output);
+
 // --- device-side operations -------------------------------------------------
 
 // `adb -s <serial> pull <remote> <localDir>`

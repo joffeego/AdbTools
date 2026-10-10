@@ -180,3 +180,61 @@ ADB_TEST(shortenColumnsHead_keeps_the_tail_of_a_path) {
     ADB_CHECK_EQ(shortenColumnsHead("/sdcard/DCIM/Camera", 1), std::string("/sdcard/DCIM/Camera"));
     ADB_CHECK(isWellFormedUtf8(shortenColumnsHead("中文目录/下载", 6)));
 }
+
+ADB_TEST(findMatches_finds_every_occurrence) {
+    const std::string text = "abc abc abc";
+    const std::vector<TextMatch> hits = findMatches(text, "abc");
+    ADB_CHECK_EQ(hits.size(), static_cast<std::size_t>(3));
+    ADB_CHECK_EQ(ADB_AT(hits, 0).start, static_cast<std::size_t>(0));
+    ADB_CHECK_EQ(ADB_AT(hits, 1).start, static_cast<std::size_t>(4));
+    ADB_CHECK_EQ(ADB_AT(hits, 2).start, static_cast<std::size_t>(8));
+    ADB_CHECK_EQ(ADB_AT(hits, 2).end, static_cast<std::size_t>(11));
+    // The range is what the editor selects, so it has to cover exactly the hit.
+    ADB_CHECK_EQ(text.substr(ADB_AT(hits, 1).start, ADB_AT(hits, 1).end - ADB_AT(hits, 1).start),
+                 std::string("abc"));
+}
+
+ADB_TEST(findMatches_is_ascii_case_insensitive_by_default) {
+    ADB_CHECK_EQ(findMatches("README readme ReadMe", "readme").size(), static_cast<std::size_t>(3));
+    ADB_CHECK_EQ(findMatches("README", "readme", true).size(), static_cast<std::size_t>(0));
+    ADB_CHECK_EQ(findMatches("readme", "readme", true).size(), static_cast<std::size_t>(1));
+    // CJK has no case, but must still be findable next to mixed-case ASCII.
+    ADB_CHECK_EQ(findMatches("Path: /sdcard/下载", "下载").size(), static_cast<std::size_t>(1));
+}
+
+ADB_TEST(findMatches_never_matches_inside_a_character) {
+    // 0xB8 is the middle byte of both 中 (E4 B8 AD) and 文 (E6 96 87): a byte-wise
+    // search would report hits that select half a glyph.
+    const std::string chinese = "中文";
+    ADB_CHECK_EQ(findMatches(chinese, "\xE4\xB8").size(), static_cast<std::size_t>(0));
+    ADB_CHECK_EQ(findMatches(chinese, "\xB8\xAD").size(), static_cast<std::size_t>(0));
+    ADB_CHECK_EQ(findMatches(chinese, "\xE4\xB8\xAD").size(), static_cast<std::size_t>(1));
+
+    // A real hit after a rejected one is still found.
+    const std::string mixed = "中文 abc";
+    const std::vector<TextMatch> hits = findMatches(mixed, "abc");
+    ADB_CHECK_EQ(hits.size(), static_cast<std::size_t>(1));
+    ADB_CHECK_EQ(ADB_AT(hits, 0).start, static_cast<std::size_t>(7));
+}
+
+ADB_TEST(findMatches_edges) {
+    ADB_CHECK_EQ(findMatches("abc", "").size(), static_cast<std::size_t>(0));
+    ADB_CHECK_EQ(findMatches("", "a").size(), static_cast<std::size_t>(0));
+    ADB_CHECK_EQ(findMatches("aaa", "aaaa").size(), static_cast<std::size_t>(0));
+    // Scanning resumes after each hit, so counting stays predictable.
+    ADB_CHECK_EQ(findMatches("aaaa", "aa").size(), static_cast<std::size_t>(2));
+    // The cap keeps a pathological query bounded, and the caller can detect it.
+    ADB_CHECK_EQ(findMatches("aaaaaaaa", "a", false, 3).size(), static_cast<std::size_t>(3));
+    ADB_CHECK_EQ(findMatches("aaaaaaaa", "a", false, 0).size(), static_cast<std::size_t>(0));
+}
+
+ADB_TEST(lineNumberAt_counts_lines) {
+    const std::string text = "one\ntwo\n\nfour\n";
+    ADB_CHECK_EQ(lineNumberAt(text, 0), static_cast<std::size_t>(1));
+    ADB_CHECK_EQ(lineNumberAt(text, 4), static_cast<std::size_t>(2));   // "two"
+    ADB_CHECK_EQ(lineNumberAt(text, 8), static_cast<std::size_t>(3));   // the empty line
+    ADB_CHECK_EQ(lineNumberAt(text, 9), static_cast<std::size_t>(4));
+    // Past the end clamps instead of running off.
+    ADB_CHECK_EQ(lineNumberAt(text, 999), static_cast<std::size_t>(5));
+    ADB_CHECK_EQ(lineNumberAt("", 0), static_cast<std::size_t>(1));
+}

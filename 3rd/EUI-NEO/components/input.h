@@ -56,6 +56,20 @@ public:
     }
     InputBuilder& placeholder(std::string value) { placeholder_ = std::move(value); return *this; }
     InputBuilder& multiline(bool value = true) { multiline_ = value; return *this; }
+    // Scroll this byte range into view and select it.
+    //
+    // Meant for a viewer's search: the match becomes the visible selection instead of
+    // just a number in a label, and the follow-caret scroll brings its line on screen.
+    // The range is applied once per distinct value, so it does not keep re-selecting
+    // while the user clicks or types somewhere else. Call it again with a new range to
+    // jump again (the text preview's "next match" does exactly that).
+    InputBuilder& revealRange(int start, int end, int request = 0) {
+        revealStart_ = start;
+        revealEnd_ = end;
+        revealRequest_ = request;
+        hasReveal_ = true;
+        return *this;
+    }
     // Park the caret at the start whenever `value()` is replaced from outside, so
     // the view stays on the first line instead of following the caret to the end.
     // Meant for document viewers (the text preview); edit fields keep the default.
@@ -85,6 +99,13 @@ public:
         onEnter_ = std::move(callback);
         return *this;
     }
+    // What Escape does while this input has focus. Without it Escape keeps the old
+    // meaning of "same as Enter" (a one-line field accepts what you typed); a find
+    // box wants Escape to close itself, which Enter must not do.
+    InputBuilder& onEscape(std::function<void()> callback) {
+        onEscape_ = std::move(callback);
+        return *this;
+    }
     InputBuilder& onFocus(std::function<void(bool)> callback) {
         onFocus_ = std::move(callback);
         return *this;
@@ -100,6 +121,7 @@ public:
         const bool allowMultiline = multiline_;
         const std::function<void(const std::string&)> onChange = onChange_;
         const std::function<void()> onEnter = onEnter_;
+        const std::function<void()> onEscape = onEscape_;
         const std::function<void(bool)> onFocus = onFocus_;
         // One line height for everything the input draws or measures.
         //
@@ -142,6 +164,21 @@ public:
         state.cursor = InputModel::clampUtf8Boundary(state.text, state.cursor);
         state.selectionStart = InputModel::clampUtf8Boundary(state.text, state.selectionStart);
         state.selectionEnd = InputModel::clampUtf8Boundary(state.text, state.selectionEnd);
+        if (hasReveal_) {
+            // Select `revealRange_` once per request, then leave the state alone so it
+            // cannot fight the user's own clicks or typing. The layout's follow-caret
+            // scrolling (build(), below) pulls the selection into view. `request`
+            // distinguishes repeats of the same range ("next match" on a single hit).
+            RevealState& reveal = ui_.state<RevealState>(id_ + ".reveal");
+            if (!reveal.applied || reveal.request != revealRequest_) {
+                reveal.applied = true;
+                reveal.request = revealRequest_;
+                state.cursor = InputModel::clampUtf8Boundary(state.text, revealEnd_);
+                state.selectionStart = InputModel::clampUtf8Boundary(state.text, revealStart_);
+                state.selectionEnd = state.cursor;
+                state.horizontalScroll = 0.0f;
+            }
+        }
         const InputLayout layout = InputLayout::build(state, textWidth, textHeight, width_, inset, textY, layoutLineHeight, fontFamily_, fontSize, multiline_);
         const bool empty = state.text.empty();
         const bool hasComposition = focused && !state.compositionText.empty();
@@ -219,7 +256,7 @@ public:
                             layout.maxVerticalScroll);
                     });
                 }
-                hit.onKeyEvent([&state, allowMultiline, onChange, onEnter, width, inset, fontSize, fontFamily, textHeight](const core::KeyEvent& event) {
+                hit.onKeyEvent([&state, allowMultiline, onChange, onEnter, onEscape, width, inset, fontSize, fontFamily, textHeight](const core::KeyEvent& event) {
                         if (!event.isDown()) {
                             return false;
                         }
@@ -336,7 +373,9 @@ public:
                                 onEnter();
                             }
                         } else if (event.key == core::InputKey::Escape) {
-                            if (onEnter) {
+                            if (onEscape) {
+                                onEscape();
+                            } else if (onEnter) {
                                 onEnter();
                             }
                         } else {
@@ -491,6 +530,7 @@ private:
     core::Transition transition_ = core::Transition::make(0.16f, core::Ease::OutCubic);
     std::function<void(const std::string&)> onChange_;
     std::function<void()> onEnter_;
+    std::function<void()> onEscape_;
     std::function<void(bool)> onFocus_;
     std::string text_;
     std::string placeholder_ = "Hello EUI-NEO 😉";
@@ -499,6 +539,16 @@ private:
     // default) parks it at the end, which is right for a prefilled edit field;
     // document viewers want the start so the view opens on the first line.
     bool caretAtStartOnValueChange_ = false;
+    // `revealRange()` request, plus the state slot that remembers the last one
+    // applied (the builder itself is rebuilt every frame).
+    bool hasReveal_ = false;
+    int revealStart_ = 0;
+    int revealEnd_ = 0;
+    int revealRequest_ = 0;
+    struct RevealState {
+        bool applied = false;
+        int request = -1;
+    };
     float width_ = 260.0f;
     float height_ = 44.0f;
     float x_ = 0.0f;
