@@ -8,6 +8,11 @@ namespace eui {
 
 using Ui = core::dsl::Ui;
 using Screen = core::dsl::Screen;
+// Element-level input events. DragEvent carries the total movement since the press
+// (totalX/totalY), which is what a "has the user actually started dragging?" test
+// needs: an app that hands files to the shell as an OLE drag source cannot decide that
+// from clicks alone.
+using DragEvent = core::dsl::DragEvent;
 
 inline std::string utf8(unsigned int codepoint) {
     std::string result;

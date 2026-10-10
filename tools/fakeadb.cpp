@@ -29,10 +29,15 @@ static std::string phoneRoot() {
 }
 
 // Strips the leading '/' so the phone path can be joined onto FAKE_PHONE_ROOT.
+//
+// u8path, not path: on Windows a fs::path built from a narrow string goes through the
+// ANSI code page, so any Chinese file name arrives as invalid bytes and construction
+// throws "Cannot convert character sequence" - the stub crashed on `pull` of
+// /sdcard/拖拽测试文件.txt while the real adb handles such names fine.
 static fs::path phonePath(const std::string& remote) {
     std::string relative = remote;
     while (!relative.empty() && relative.front() == '/') relative.erase(relative.begin());
-    return fs::path(phoneRoot()) / relative;
+    return fs::u8path(phoneRoot()) / fs::u8path(relative);
 }
 
 static int copyFile(const fs::path& from, const fs::path& to) {
@@ -101,8 +106,7 @@ static std::string unquote(const std::string& value) {
     return value;
 }
 
-int main(int argc, char** argv) {
-    std::vector<std::string> args(argv + 1, argv + argc);
+static int runFakeAdb(std::vector<std::string> args) {
 
     // Skip the "-s <serial>" selector and operation flags the app passes.
     std::size_t i = 0;
@@ -252,3 +256,42 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
+// Windows hands a program its command line in the ANSI code page, so the UTF-8 names the
+// app passes (any Chinese file name) arrived as invalid bytes and std::filesystem threw
+// "Cannot convert character sequence" - the stub died on `pull /sdcard/拖拽测试文件.txt`
+// while the real adb handles such names fine.
+//
+// Read the *wide* command line instead. Deliberately not wmain: that would require
+// building with -municode, and the documented build command (see cli/AI-INTEGRATION.md)
+// has no such flag - anyone following it must still get a working adb.
+#ifdef _WIN32
+#include <windows.h>
+
+#include <shellapi.h>
+
+int main() {
+    int argc = 0;
+    LPWSTR* wide = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::vector<std::string> args;
+    if (wide != nullptr) {
+        args.reserve(static_cast<std::size_t>(argc > 0 ? argc - 1 : 0));
+        for (int i = 1; i < argc; ++i) {
+            const int need =
+                WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, nullptr, 0, nullptr, nullptr);
+            std::string text;
+            if (need > 1) {
+                text.resize(static_cast<std::size_t>(need - 1));
+                WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, text.data(), need, nullptr, nullptr);
+            }
+            args.push_back(std::move(text));
+        }
+        LocalFree(wide);
+    }
+    return runFakeAdb(std::move(args));
+}
+#else
+int main(int argc, char** argv) {
+    return runFakeAdb(std::vector<std::string>(argv + 1, argv + argc));
+}
+#endif

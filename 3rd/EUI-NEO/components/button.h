@@ -121,8 +121,14 @@ public:
         shadow.spread *= scale_;
         core::Color textColor = style_.text;
         core::Color iconColor = style_.icon;
-        textColor.a *= style_.opacity;
-        iconColor.a *= style_.opacity;
+        // A disabled button has to *look* disabled. `disabled()` used to only set a flag
+        // (hit-testing), so a greyed-out label still carried a fully saturated accent
+        // icon - in the app manager the disabled "卸载" looked as clickable as the
+        // primary button next to it (measured: identical RGB(64,139,241)). Dimming both
+        // the label and the icon here fixes every button in the app at once.
+        const float effectiveOpacity = disabled_ ? std::min(style_.opacity, 0.4f) : style_.opacity;
+        textColor.a *= effectiveOpacity;
+        iconColor.a *= effectiveOpacity;
         const std::function<void()> onPress = onPress_;
         const std::function<void()> onRelease = onRelease_;
 
@@ -140,7 +146,9 @@ public:
                     .size(w, h)
                     .states(style_.normal, style_.hover, style_.pressed)
                     .radius(style_.radius * scale_)
-                    .opacity(style_.opacity)
+                    // The fill carries the same dimming as the label/icon, so a disabled
+                    // primary button is not a solid accent block either.
+                    .opacity(effectiveOpacity)
                     .border(border)
                     .shadow(shadow)
                     .translate(translateX_, translateY_)

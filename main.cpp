@@ -59,6 +59,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// Drag-out needs the OLE data-object interfaces and the shell's drag-image helper.
+#include <objidl.h>
+#include <shlobj.h>
 #include <bcrypt.h>
 #include <shellapi.h>
 #include <winhttp.h>
@@ -181,6 +184,85 @@ int columnsFitting(float pixels, float fontSize, float perColumnEm) {
     return columns < 0 ? 0 : columns;
 }
 
+// Cut `text` to what really fits in `maxWidth`, with "…" when something was dropped.
+//
+// The name column used to be limited by columnsFitting() above - an estimate that
+// assumes every glyph is ~25% wider than an ASCII one actually is. Measured on the
+// real list: a long English file name was cut with ~300 device px of the column still
+// empty, while a CJK name could still touch the next column. Asking the text engine
+// removes both errors: ASCII fills the box, CJK runs out of budget sooner because its
+// glyphs are twice as wide, and neither can paint past its own rectangle.
+//
+// Candidate cuts are UTF-8 boundaries, so a character is never sliced in half; the
+// search is binary over those boundaries, which keeps it to ~log2(n) measurements.
+std::string ellipsizeToWidth(const std::string& text, float maxWidth, float fontSize,
+                             int fontWeight = 400) {
+    if (text.empty() || maxWidth <= 0.0f) return std::string();
+    // Measure at the size the text is actually drawn at. TextBuilder multiplies every
+    // font size by the user's 字号 (runtimeFontScale), so measuring at the bare logical
+    // size claims a string fits when it is 30% wider than that at 字号=特大 - the name
+    // column would then cut it early (or let it run into the next column).
+    const float drawnSize = fontSize * ::core::runtimeFontScale();
+    if (eui::measureTextWidth(text, {}, drawnSize, fontWeight) <= maxWidth) return text;
+
+    static const std::string kEllipsis = "…";
+    const float ellipsisWidth = eui::measureTextWidth(kEllipsis, {}, drawnSize, fontWeight);
+    const float budget = maxWidth - ellipsisWidth;
+    if (budget <= 0.0f) return kEllipsis;
+
+    std::vector<std::size_t> boundaries;
+    boundaries.reserve(text.size() + 1);
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if ((static_cast<unsigned char>(text[i]) & 0xC0u) != 0x80u) boundaries.push_back(i);
+    }
+    boundaries.push_back(text.size());
+
+    std::size_t best = 0;
+    std::size_t lo = 0;
+    std::size_t hi = boundaries.size() - 1;
+    while (lo <= hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        const std::size_t cut = boundaries[mid];
+        if (eui::measureTextWidth(text.substr(0, cut), {}, drawnSize, fontWeight) <= budget) {
+            best = cut;
+            lo = mid + 1;
+        } else if (mid == 0) {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return text.substr(0, best) + kEllipsis;
+}
+
+// Log level of a logcat line, for colouring.
+//
+// The default (threadtime) format is "MM-DD HH:MM:SS.mmm  PID  TID LEVEL TAG: msg", so
+// the level is the letter right after the fifth field. Anything that does not look
+// like that reports ' ' and is drawn in the normal colour, which keeps `logcat -v` with
+// some other format from being painted at random.
+char logcatLevel(const std::string& line) {
+    std::size_t i = 0;
+    for (int field = 0; field < 4; ++field) {
+        while (i < line.size() && line[i] == ' ') ++i;
+        while (i < line.size() && line[i] != ' ') ++i;
+    }
+    while (i < line.size() && line[i] == ' ') ++i;
+    if (i >= line.size()) return ' ';
+    switch (line[i]) {
+        case 'V': case 'D': case 'I': case 'W': case 'E': case 'F': case 'A': return line[i];
+        default: return ' ';
+    }
+}
+
+eui::Color logcatLevelColor(const std::string& line) {
+    switch (logcatLevel(line)) {
+        case 'E': case 'F': case 'A': return kRose;
+        case 'W': return kAmber;
+        default: return kInk;
+    }
+}
+
 // Subprocess execution now lives in core/process.cpp so the GUI and the CLI
 // share one implementation (and one place to fix process-handling bugs).
 using adb::core::ProcessResult;
@@ -301,6 +383,27 @@ struct AppState {
     std::chrono::steady_clock::time_point lastClickTime;
     std::chrono::steady_clock::time_point lastTitlePressTime;
     bool lastClickCtrl = false;
+    bool lastClickShift = false;
+    // Keyboard navigation over the file list. `selectAnchor` is where a Shift-range
+    // grows from, `keyboardNav` only turns the focus ring on once the keyboard was
+    // actually used (mouse users see no extra chrome), and `listViewportH` is written
+    // by composeFileList so a moving selection can be scrolled back into view.
+    std::string selectAnchor;
+    bool keyboardNav = false;
+    float listViewportH = 0.0f;
+    // Dragging files out to Explorer: the download that has to finish before Windows
+    // can be handed real paths, and its progress (written by the worker thread).
+    bool dragOutPending = false;
+    std::atomic<int> dragOutDone{0};
+    int dragOutTotal = 0;
+    std::vector<std::string> dragOutQueue;
+    std::vector<std::string> dragOutLocal;
+    std::size_t dragOutIndex = 0;
+    std::string dragOutRemoteDir;
+    // Armed by a row press; pumpDragOut turns it into a drag once the pointer has moved
+    // far enough with the button still down.
+    std::string dragPressRow;
+    POINT dragPressPoint{};
 
     eui::Signal<float> fileListScroll;
     int listGeneration = 0;
@@ -1141,6 +1244,11 @@ void centerWindowOnWorkArea() {
 void applyMinWindowSize() {
 #ifdef _WIN32
     const float scale = windowDpiScale() * settings.uiScale;
+    // The toolbar lays itself out from both ends (device selector + 9 tool icons from the
+    // left, 5 file actions from the right) and shrinks its buttons to fit. With the real
+    // counts that needs 868 logical px at 40px buttons, so the original 880 minimum is
+    // enough - the window keeps the size it had. The 950 that briefly replaced it was
+    // based on a miscount and would have made everyone's window wider for nothing.
     app::setMinWindowSize(static_cast<int>(880.0f * scale),
                           static_cast<int>(420.0f * scale));
 #endif
@@ -1832,6 +1940,120 @@ void goForward() {
     refreshListing();
 }
 
+// --- keyboard navigation over the file list -----------------------------------
+//
+// The list is the app's main surface and could only be driven with the mouse: arrow
+// keys went nowhere and nothing moved the selection, so every action needed a click
+// plus a right-click. These helpers give it what every file manager has - arrows,
+// Home/End, PageUp/PageDown, Shift to extend, a first letter to jump - and keep the
+// moving row inside the viewport, because a selection you cannot see is a selection
+// you cannot act on.
+//
+// Everything works on displayEntries: that is what the rows show (sorted and filtered),
+// so indexes here and rows on screen agree even while a filter is active.
+
+int rowIndexByName(const std::string& name) {
+    for (std::size_t i = 0; i < state.displayEntries.size(); ++i) {
+        if (state.displayEntries[i].name == name) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+int currentRowIndex() {
+    const int index = rowIndexByName(state.selectedEntry);
+    if (index >= 0) return index;
+    return state.displayEntries.empty() ? -1 : 0;
+}
+
+// Scroll so row `index` is fully visible.
+void revealListRow(int index) {
+    if (index < 0 || state.listViewportH <= 0.0f) return;
+    const float top = static_cast<float>(index) * kRowHeight;
+    const float bottom = top + kRowHeight;
+    float scroll = state.fileListScroll.get();
+    if (top < scroll) {
+        scroll = top;
+    } else if (bottom > scroll + state.listViewportH) {
+        scroll = bottom - state.listViewportH;
+    }
+    state.fileListScroll.set(std::max(0.0f, scroll));
+}
+
+// Select every row between the anchor and `index` (inclusive), the way Shift+click and
+// Shift+arrow behave everywhere else.
+void selectListRange(int index) {
+    const int anchor = rowIndexByName(state.selectAnchor);
+    if (anchor < 0 || index < 0 || index >= static_cast<int>(state.displayEntries.size())) {
+        return;
+    }
+    const int lo = std::min(anchor, index);
+    const int hi = std::max(anchor, index);
+    state.selectedSet.clear();
+    for (int i = lo; i <= hi; ++i) {
+        state.selectedSet.insert(state.displayEntries[static_cast<std::size_t>(i)].name);
+    }
+}
+
+// Move the selection to row `index`. `extend` grows a range from the anchor instead of
+// replacing the selection; `fromKeyboard` decides whether the focus ring shows.
+void selectListRow(int index, bool extend, bool fromKeyboard = true) {
+    if (index < 0 || index >= static_cast<int>(state.displayEntries.size())) return;
+    const std::string& name = state.displayEntries[static_cast<std::size_t>(index)].name;
+    if (extend && !state.selectAnchor.empty()) {
+        selectListRange(index);
+    } else {
+        state.selectedSet.clear();
+        state.selectedSet.insert(name);
+        state.selectAnchor = name;
+    }
+    state.selectedEntry = name;
+    state.keyboardNav = fromKeyboard;
+    revealListRow(index);
+}
+
+void moveListSelection(int delta, bool extend) {
+    const int count = static_cast<int>(state.displayEntries.size());
+    if (count == 0) return;
+    const int next = std::clamp(currentRowIndex() + delta, 0, count - 1);
+    selectListRow(next, extend);
+}
+
+// Type-ahead: the next entry that starts with `ch`, wrapping around the end. Only ASCII
+// can be matched this way (the key event carries a key, not a character), which is how
+// this works in most file managers too.
+void jumpListSelection(char ch) {
+    const int count = static_cast<int>(state.displayEntries.size());
+    if (count == 0) return;
+    const int current = std::max(0, currentRowIndex());
+    const unsigned char wanted = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(ch)));
+    for (int step = 1; step <= count; ++step) {
+        const int index = (current + step) % count;
+        const std::string& name = state.displayEntries[static_cast<std::size_t>(index)].name;
+        if (!name.empty() &&
+            static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(name[0]))) == wanted) {
+            selectListRow(index, false);
+            return;
+        }
+    }
+}
+
+// The letter or digit a key event carries, or '\0'. A..Z and Digit0..Digit9 are
+// declared contiguously in InputKey, so this needs no 36-case switch (the range check
+// uses the real enumerators, not a hardcoded count).
+char keyChar(eui::InputKey key) {
+    const int value = static_cast<int>(key);
+    const int firstLetter = static_cast<int>(eui::InputKey::A);
+    const int lastLetter = static_cast<int>(eui::InputKey::Z);
+    const int firstDigit = static_cast<int>(eui::InputKey::Digit0);
+    if (value >= firstLetter && value <= lastLetter) {
+        return static_cast<char>('a' + (value - firstLetter));
+    }
+    if (value >= firstDigit && value < firstDigit + 10) {
+        return static_cast<char>('0' + (value - firstDigit));
+    }
+    return '\0';
+}
+
 void onEntryClick(const std::string& name, bool isDir) {
     const auto now = std::chrono::steady_clock::now();
     const bool isDouble = (name == state.lastClickedName) &&
@@ -1839,19 +2061,37 @@ void onEntryClick(const std::string& name, bool isDir) {
     state.lastClickedName = name;
     state.lastClickTime = now;
     const bool ctrl = state.lastClickCtrl;
+    const bool shift = state.lastClickShift;
 
-    if (isDir && isDouble && !ctrl) {
+    if (isDir && isDouble && !ctrl && !shift) {
         enterDir(name);  // double-click a folder opens it
     } else if (ctrl) {
         // Ctrl+click toggles multi-selection.
         if (state.selectedSet.count(name)) state.selectedSet.erase(name);
         else state.selectedSet.insert(name);
         state.selectedEntry = name;
+        state.selectAnchor = name;
+    } else if (shift) {
+        // Shift+click extends from the anchor, exactly like Shift+arrow.
+        const int index = rowIndexByName(name);
+        const bool hadAnchor = !state.selectAnchor.empty() && rowIndexByName(state.selectAnchor) >= 0;
+        if (hadAnchor && index >= 0) {
+            selectListRange(index);
+            state.selectedEntry = name;
+        } else {
+            state.selectedSet.clear();
+            state.selectedSet.insert(name);
+            state.selectedEntry = name;
+            state.selectAnchor = name;
+        }
     } else {
         state.selectedEntry = name;
         state.selectedSet.clear();
         state.selectedSet.insert(name);
+        state.selectAnchor = name;
     }
+    // A click means the mouse is driving again: drop the keyboard focus ring.
+    state.keyboardNav = false;
 }
 
 void openRowMenu(float x, float y, const std::string& name) {
@@ -4321,6 +4561,37 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
         case eui::InputKey::F5: refreshListing(true); break;
         case eui::InputKey::F2: promptRename(); break;
         case eui::InputKey::Backspace: goUp(); break;
+        // Keyboard navigation over the list (see the helpers above): the arrows move the
+        // selection, Shift extends it, PageUp/PageDown jump a screen, Home/End go to the
+        // ends, Left/Right walk the directory tree like Backspace/Enter do.
+        case eui::InputKey::Up:
+            moveListSelection(-1, ev.modifiers.shift);
+            break;
+        case eui::InputKey::Down:
+            moveListSelection(1, ev.modifiers.shift);
+            break;
+        case eui::InputKey::PageUp: {
+            const int rows = std::max(1, static_cast<int>(state.listViewportH / kRowHeight) - 1);
+            moveListSelection(-rows, ev.modifiers.shift);
+            break;
+        }
+        case eui::InputKey::PageDown: {
+            const int rows = std::max(1, static_cast<int>(state.listViewportH / kRowHeight) - 1);
+            moveListSelection(rows, ev.modifiers.shift);
+            break;
+        }
+        case eui::InputKey::Home:
+            selectListRow(0, ev.modifiers.shift);
+            break;
+        case eui::InputKey::End:
+            selectListRow(static_cast<int>(state.displayEntries.size()) - 1, ev.modifiers.shift);
+            break;
+        case eui::InputKey::Left: goUp(); break;
+        case eui::InputKey::Right: {
+            const FsEntry* e = findSelected();
+            if (e && e->isDir) enterDir(e->name);
+            break;
+        }
         case eui::InputKey::Enter: {
             const FsEntry* e = findSelected();
             if (e && e->isDir) enterDir(e->name);
@@ -4358,9 +4629,346 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
                 resetListScroll();
             }
             break;
-        default: break;
+        default: {
+            // Type-ahead: a bare letter or digit jumps to the next name starting with
+            // it, wrapping around. Ctrl/Alt chords are the app's shortcuts (Ctrl+C/X/V/A/
+            // F/L) and must never be eaten by this.
+            if (!ev.modifiers.control && !ev.modifiers.alt && !ev.modifiers.super) {
+                const char ch = keyChar(ev.key);
+                if (ch != '\0') jumpListSelection(ch);
+            }
+            break;
+        }
     }
 }
+
+// =============================================================================
+// Dragging files out to Explorer (OLE drag source)
+// =============================================================================
+//
+// The window already accepted drops (Explorer -> app uploads). The other direction
+// needs the app to act as an OLE drag source, and Windows only understands one shape
+// for a file copy: CF_HDROP, i.e. real local paths. So a device file is fetched into a
+// temp directory first - which is why the transfer card is on screen *during* the
+// gesture - and only then does the drag start.
+//
+// The ghost that follows the cursor comes from IDragSourceHelper: it snapshots the
+// window region under the cursor, so the row the user grabbed travels with the cursor,
+// file name included.
+#ifdef _WIN32
+
+// The shell's drop target enumerates the offered formats before it accepts anything, so
+// "E_NOTIMPL, just ask for CF_HDROP" is not enough - the drop is simply refused. One
+// entry, no cloning subtleties.
+class FormatEnumerator final : public IEnumFORMATETC {
+public:
+    FormatEnumerator() {
+        entry_.cfFormat = CF_HDROP;
+        entry_.ptd = nullptr;
+        entry_.dwAspect = DVASPECT_CONTENT;
+        entry_.lindex = -1;
+        entry_.tymed = TYMED_HGLOBAL;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IEnumFORMATETC) {
+            *ppv = static_cast<IEnumFORMATETC*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (left == 0) delete this;
+        return left;
+    }
+    HRESULT STDMETHODCALLTYPE Next(ULONG count, FORMATETC* out, ULONG* fetched) override {
+        if (out == nullptr) return E_POINTER;
+        ULONG done = 0;
+        while (done < count && !exhausted()) {
+            out[done] = entry_;
+            ++index_;
+            ++done;
+        }
+        if (fetched != nullptr) *fetched = done;
+        return done == count ? S_OK : S_FALSE;
+    }
+    HRESULT STDMETHODCALLTYPE Skip(ULONG count) override {
+        index_ += count;
+        return exhausted() ? S_FALSE : S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Reset() override {
+        index_ = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Clone(IEnumFORMATETC** out) override {
+        if (out == nullptr) return E_POINTER;
+        auto* copy = new FormatEnumerator();
+        copy->index_ = index_;
+        *out = copy;
+        return S_OK;
+    }
+
+private:
+    bool exhausted() const { return index_ > 0; }
+    FORMATETC entry_{};
+    ULONG index_ = 0;
+    ULONG refs_ = 1;
+};
+
+class FileDropData final : public IDataObject {
+public:
+    explicit FileDropData(std::vector<std::wstring> paths) : paths_(std::move(paths)) {
+        for (const std::wstring& path : paths_) totalChars_ += path.size() + 1;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) {
+            *ppv = static_cast<IDataObject*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (left == 0) delete this;
+        return left;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetData(FORMATETC* format, STGMEDIUM* medium) override {
+        if (format == nullptr || medium == nullptr) return E_POINTER;
+        if (format->cfFormat != CF_HDROP || (format->tymed & TYMED_HGLOBAL) == 0) {
+            return DV_E_FORMATETC;
+        }
+        const std::size_t bytes = sizeof(DROPFILES) + (totalChars_ + 1) * sizeof(wchar_t);
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+        if (memory == nullptr) return E_OUTOFMEMORY;
+        auto* drop = static_cast<DROPFILES*>(GlobalLock(memory));
+        if (drop == nullptr) {
+            GlobalFree(memory);
+            return E_OUTOFMEMORY;
+        }
+        drop->pFiles = sizeof(DROPFILES);
+        drop->fWide = TRUE;
+        auto* cursor = reinterpret_cast<wchar_t*>(reinterpret_cast<char*>(drop) + sizeof(DROPFILES));
+        for (const std::wstring& path : paths_) {
+            std::memcpy(cursor, path.c_str(), (path.size() + 1) * sizeof(wchar_t));
+            cursor += path.size() + 1;
+        }
+        *cursor = L'\0';  // a DROPFILES list ends with a second NUL
+        GlobalUnlock(memory);
+        medium->tymed = TYMED_HGLOBAL;
+        medium->hGlobal = memory;
+        medium->pUnkForRelease = nullptr;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* format) override {
+        if (format == nullptr) return E_POINTER;
+        const bool ok = format->cfFormat == CF_HDROP && (format->tymed & TYMED_HGLOBAL) != 0;
+        return ok ? S_OK : DV_E_FORMATETC;
+    }
+    HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
+    // Only CF_HDROP exists here, and the documented answer for "no other format" is
+    // E_NOTIMPL (the caller then uses the FORMATETC it already has).
+    HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override {
+        if (out != nullptr) out->ptd = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD direction, IEnumFORMATETC** out) override {
+        if (out == nullptr) return E_POINTER;
+        *out = nullptr;
+        if (direction != DATADIR_GET) return E_NOTIMPL;
+        *out = new FormatEnumerator();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override {
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+    HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA**) override { return OLE_E_ADVISENOTSUPPORTED; }
+
+private:
+    std::vector<std::wstring> paths_;
+    std::size_t totalChars_ = 0;
+    ULONG refs_ = 1;
+};
+
+class FileDropSource final : public IDropSource {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropSource) {
+            *ppv = static_cast<IDropSource*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs_;
+        if (left == 0) delete this;
+        return left;
+    }
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override {
+        if (escapePressed) return DRAGDROP_S_CANCEL;
+        if ((keyState & MK_LBUTTON) == 0) return DRAGDROP_S_DROP;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
+
+private:
+    ULONG refs_ = 1;
+};
+
+// Local files that a drag-out is being prepared from. Kept out of the user's download
+// folder: these are copies Explorer will take over, not the result the user asked for.
+std::string dragCacheDir() {
+    return core::executableDir() + "\\drag-cache";
+}
+
+
+
+void startOutgoingDrag(const std::vector<std::string>& localPaths) {
+    if (localPaths.empty()) return;
+    static bool oleReady = false;
+    if (!oleReady) {
+        OleInitialize(nullptr);
+        oleReady = true;
+    }
+
+    std::vector<std::wstring> wide;
+    wide.reserve(localPaths.size());
+    for (const std::string& path : localPaths) wide.push_back(core::toWide(path));
+
+    auto* data = new FileDropData(std::move(wide));
+    auto* source = new FileDropSource();
+
+    // Drag image: the row under the cursor, so the file name travels with the pointer.
+    POINT cursor{};
+    if (GetCursorPos(&cursor)) {
+        IDragSourceHelper* helper = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_IDragSourceHelper,
+                                       reinterpret_cast<void**>(&helper))) &&
+            helper != nullptr) {
+            helper->InitializeFromWindow(static_cast<HWND>(app::mainWindowHwnd()), &cursor, data);
+            helper->Release();
+        }
+    }
+
+    DWORD effect = DROPEFFECT_COPY;
+    DoDragDrop(data, source, DROPEFFECT_COPY, &effect);
+    source->Release();
+    data->Release();
+    // Explorer has its own copies now; the temp tree only exists for the handover.
+    std::error_code ec;
+    std::filesystem::remove_all(dragCacheDir(), ec);
+}
+
+// Fetch the dragged entries one at a time, then hand them to Explorer.
+//
+// A worker thread was the first attempt and it stalled: the completion callback never
+// reached this app's event loop, so the drag sat at "0/1" forever with no OLE drag ever
+// starting. The download button already solves this differently - one file per frame
+// step, driven by compose() - and that pattern needs no cross-thread handoff at all,
+// which is why drag-out uses it too.
+void startDragOutFor(const std::string& name) {
+    if (state.selectedDevice.empty() || state.busy) return;
+    if (!state.selectedSet.count(name)) {
+        state.selectedSet.clear();
+        state.selectedSet.insert(name);
+        state.selectedEntry = name;
+        state.selectAnchor = name;
+    }
+    state.dragOutQueue = selectedNames();
+    state.dragOutIndex = 0;
+    state.dragOutLocal.clear();
+    state.dragOutRemoteDir = state.currentPath;
+    state.dragOutTotal = static_cast<int>(state.dragOutQueue.size());
+    state.dragOutDone.store(0);
+    state.progress = 0.0f;
+    state.progressLabel = "准备拖出 " + std::to_string(state.dragOutTotal) + " 项";
+    state.busy = true;
+}
+
+// One fetch per frame, called from compose(). Also the drag-out *trigger*: the
+// framework's element-level onDrag needs the element to still be "pressed" on a frame
+// where the pointer moved, and with a real mouse the first move event can already be
+// outside the row - so the callback never ran (no probe fired, no cache directory was
+// ever created, nothing happened at all for the user). Polling the button state and the
+// cursor instead is both simpler and the same signal OLE itself uses.
+void pumpDragOut() {
+    if (!state.dragPressRow.empty()) {
+        const bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        POINT now{};
+        GetCursorPos(&now);
+        const long dx = now.x - state.dragPressPoint.x;
+        const long dy = now.y - state.dragPressPoint.y;
+        if (!down) {
+            state.dragPressRow.clear();  // an ordinary click: no drag to start
+        } else if (dx * dx + dy * dy >= 12 * 12) {
+            const std::string row = state.dragPressRow;
+            state.dragPressRow.clear();
+            state.dragOutPending = true;
+            startDragOutFor(row);
+        }
+    }
+
+    if (state.dragOutQueue.empty()) return;
+    const std::size_t total = state.dragOutQueue.size();
+    const std::string localDir = dragCacheDir();
+    if (state.dragOutIndex == 0 && state.dragOutLocal.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(localDir, ec);
+    }
+    const std::string name = state.dragOutQueue[state.dragOutIndex];
+    const std::string remote = core::joinPath(state.dragOutRemoteDir, name);
+    const ProcessResult r = runProcess(state.adbPath, core::pullArgs(state.selectedDevice, remote, localDir), 600000);
+    if (r.exitCode != 0) {
+        const std::string reason = core::trim(r.out);
+        state.dragOutQueue.clear();
+        state.dragOutLocal.clear();
+        state.dragOutIndex = 0;
+        state.dragOutTotal = 0;
+        state.busy = false;
+        state.progress = 0.0f;
+        state.progressLabel.clear();
+        state.dragOutPending = false;
+        toast("拖出失败", reason.empty() ? "无法把文件取到本地。" : reason);
+        return;
+    }
+    state.dragOutLocal.push_back(localDir + "\\" + name);
+    ++state.dragOutIndex;
+    state.dragOutDone.store(static_cast<int>(state.dragOutIndex));
+    state.progress = static_cast<float>(state.dragOutIndex) / static_cast<float>(total);
+    state.progressLabel = "取到本地 " + std::to_string(state.dragOutIndex) + "/" +
+                          std::to_string(total);
+    if (state.dragOutIndex < state.dragOutQueue.size()) return;
+
+    std::vector<std::string> local = state.dragOutLocal;
+    state.dragOutQueue.clear();
+    state.dragOutLocal.clear();
+    state.dragOutIndex = 0;
+    state.dragOutTotal = 0;
+    state.busy = false;
+    state.progress = 0.0f;
+    state.progressLabel.clear();
+    state.dragOutPending = false;
+    startOutgoingDrag(local);
+}
+
+#endif  // _WIN32
 
 // =============================================================================
 // UI helpers
@@ -4386,7 +4994,7 @@ Columns columns(float contentWidth) {
 
 void toolButton(eui::Ui& ui, const std::string& id, float x, float y, float w, float h,
                 unsigned int icon, const std::string& label, bool primary, bool enabled,
-                std::function<void()> onClick) {
+                std::function<void()> onClick, float iconSize = 13.0f, float fontSize = 13.0f) {
     eui::Color base = primary ? kAccent : kSurface;
     eui::Color hover = primary ? eui::mixColor(kAccent, kWhite, 0.14f) : kSurfaceHover;
     eui::Color pressed = primary ? eui::mixColor(kAccent, {0.0f, 0.0f, 0.0f, 1.0f}, 0.16f) : kSurfaceAct;
@@ -4398,8 +5006,8 @@ void toolButton(eui::Ui& ui, const std::string& id, float x, float y, float w, f
             components::button(ui, id)
                 .size(w, h)
                 .icon(icon)
-                .iconSize(13.0f)
-                .fontSize(13.0f)
+                .iconSize(iconSize)
+                .fontSize(fontSize)
                 .text(label)
                 .colors(base, hover, pressed)
                 .textColor(textCol)
@@ -4455,14 +5063,35 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
                 .size(w, h - 2.0f)
                 .states(normal, hover, pressed)
                 .radius(6.0f)
-                .onPress([](const eui::PointerEvent& ev, const eui::Rect&) {
+                .onPress([name = e.name](const eui::PointerEvent& ev, const eui::Rect&) {
                     state.lastClickCtrl = ev.modifiers.control;
+                    state.lastClickShift = ev.modifiers.shift;
+                    // Arm the drag-out detector: if the pointer then moves far enough with
+                    // the button still down, pumpDragOut() starts handing this row to
+                    // Explorer. See pumpDragOut for why the framework's own drag callback
+                    // could not be used.
+                    if (!state.selectedDevice.empty() && !state.busy) {
+                        state.dragPressRow = name;
+                        GetCursorPos(&state.dragPressPoint);
+                    }
                 })
                 .onClick([name = e.name, isDir = e.isDir] { onEntryClick(name, isDir); })
                 .onContextMenu([name = e.name](const eui::PointerEvent& ev, const eui::Rect&) {
                     openRowMenu(static_cast<float>(ev.x), static_cast<float>(ev.y), name);
                 })
                 .build();
+
+            // Focus ring, drawn only while the keyboard is doing the driving: with the
+            // selection moving under the arrow keys, this is what tells the eye which row
+            // the next action will apply to. Mouse users never see it.
+            if (selected && state.keyboardNav) {
+                ui.rect(rowId + ".focus")
+                    .size(w, h - 2.0f)
+                    .color(kClear)
+                    .radius(6.0f)
+                    .border(1.5f, kAccent)
+                    .build();
+            }
 
             ui.text(rowId + ".icon")
                 .x(6.0f).y(0.0f).size(24.0f, h)
@@ -4476,10 +5105,10 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
 
             ui.text(rowId + ".name")
                 .x(34.0f).y(0.0f).size(c.nameW, h)
-                // Cut by display columns: the byte-based shorten() used here
-                // before split Chinese file names in half and the tail rendered
-                // as a replacement glyph.
-                .text(core::shortenColumns(displayName, columnsFitting(c.nameW, 15.0f, kColumnEm)))
+                // Fewer bytes than the column holds would be cut off, and the tail of a
+                // Chinese name must never render as a replacement glyph, so the cut is
+                // measured against the real glyph widths (see ellipsizeToWidth).
+                .text(ellipsizeToWidth(displayName, c.nameW - 6.0f, 15.0f))
                 .fontSize(15.0f)
                 .lineHeight(15.0f)
                 .color(kInk)
@@ -4623,13 +5252,20 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
     }
 
     if (state.entries.empty()) {
-        centeredMessage(ui, "list.empty", x, y, w, h, "空文件夹");
+        // Say what can be done here, not just that there is nothing: an empty phone
+        // folder is the natural moment to mention that dropping files on the window
+        // uploads them.
+        centeredMessage(ui, "list.empty", x, y + h * 0.5f - 44.0f, w, 88.0f,
+                        "这个文件夹是空的\n把文件拖到窗口里即可上传，或用工具栏的上传按钮");
         return;
     }
 
     if (state.displayEntries.empty()) {
         centeredMessage(ui, "list.nomatch", x, y, w, h, "没有匹配的文件");
     } else {
+        // Remembered so keyboard navigation can scroll the selected row back into view
+        // (the list itself only knows its own scroll offset).
+        state.listViewportH = h - 12.0f;
         components::virtualList(ui, "file.list." + std::to_string(state.listGeneration))
             .x(x + 6.0f).y(y + 6.0f)
             .size(w - 12.0f, h - 12.0f)
@@ -4831,8 +5467,41 @@ void composeHoverTip(eui::Ui& ui, const std::string& id, const std::string& sour
         .build();
 }
 
-void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
-    const float devW = 200.0f;
+void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
+    // The toolbar has fixed positions from both ends (device selector + tool icons from
+    // the left, the file actions from the right) and no overflow handling, so a narrow
+    // window used to make the two groups overlap on top of each other - the right-hand
+    // upload button sat on the mirror and external-edit icons. Widening those right-hand
+    // buttons from 38 to 44 (to match the left group's padding) took the last 30px of
+    // headroom and made it happen at the default window width.
+    //
+    // Instead of guessing a minimum, the buttons now shrink until both groups fit, and
+    // only if even the smallest size does not fit does the device selector give up width
+    // as well. Everything stays reachable; nothing is hidden behind an overflow menu.
+    constexpr float kButtonSizes[] = {44.0f, 40.0f, 36.0f, 32.0f};
+    // 9 tool icons on the left, 5 file actions on the right. Getting these counts wrong
+    // is not cosmetic: the first version said 15 + 5, which over-reserved six buttons and
+    // left a ~220px dead gap between the two groups.
+    constexpr int kToolIcons = 9;
+    constexpr int kFileActions = 5;
+    const float gap = 6.0f;          // the constant the placement code below uses
+    const auto neededWidth = [&](float buttonH, float selectorW) {
+        return selectorW + (kToolIcons + kFileActions) * (buttonH + gap) + 24.0f;
+    };
+    float devW = 200.0f;
+    float h = kButtonSizes[3];
+    for (float selectorW : {200.0f, 150.0f}) {
+        bool found = false;
+        for (float candidate : kButtonSizes) {
+            if (neededWidth(candidate, selectorW) <= w) {
+                devW = selectorW;
+                h = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (found) break;
+    }
 
     // Device selector (opens a context menu).
     std::string deviceLabel = state.selectedDevice.empty() ? "无设备" : state.selectedDevice;
@@ -4915,6 +5584,15 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
                [] { openDeviceInfo(); });
     composeHoverTip(ui, "topbar.info.tip", "topbar.info.bg", "设备信息", infoX + h * 0.5f, y + h + 4.0f);
     const float logcatX = infoX + h + 6.0f;
+    // Thin separators so fifteen equally sized icons read as groups (devices / tools /
+    // editing) instead of one undifferentiated wall.
+    const auto groupSeparator = [&](float sx) {
+        ui.rect("topbar.sep." + std::to_string(static_cast<int>(sx)))
+            .x(sx - 4.0f).y(y + 9.0f).size(1.0f, h - 18.0f)
+            .color(kBorder)
+            .build();
+    };
+    groupSeparator(logcatX);
     toolButton(ui, "topbar.logcat", logcatX, y, h, h, 0xF15C, "", false, !state.selectedDevice.empty(),
                [] { openLogcat(); });
     composeHoverTip(ui, "topbar.logcat.tip", "topbar.logcat.bg", "logcat", logcatX + h * 0.5f, y + h + 4.0f);
@@ -4930,6 +5608,7 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
 
     // Files opened in an external editor; highlighted while something is unsynced.
     const float extX = mirrorX + h + 6.0f;
+    groupSeparator(extX);
     std::size_t extPending = 0;
     for (const ExternalEdit& edit : state.externalEdits) {
         if (edit.pendingPush) ++extPending;
@@ -4948,9 +5627,9 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float h) {
     float rightX = x + w;
     auto place = [&](const std::string& id, unsigned int icon, bool primary, bool enabled,
                      std::function<void()> cb, const std::string& tip) {
-        rightX -= 38.0f;
-        toolButton(ui, id, rightX, y, 38.0f, h, icon, "", primary, enabled, std::move(cb));
-        composeHoverTip(ui, id + ".tip", id + ".bg", tip, rightX + 19.0f, y + h + 4.0f);
+        rightX -= 44.0f;
+        toolButton(ui, id, rightX, y, 44.0f, h, icon, "", primary, enabled, std::move(cb));
+        composeHoverTip(ui, id + ".tip", id + ".bg", tip, rightX + 22.0f, y + h + 4.0f);
         rightX -= 6.0f;
     };
 
@@ -5254,20 +5933,28 @@ void composeStatusBar(eui::Ui& ui, float x, float y, float w, float h) {
         : (state.selectedDevice.empty() ? "adb 就绪" : state.selectedDevice);
     left += "   下载目录: " + state.downloadDir;
 
-    std::string count;
-    if (state.busy) count = "处理中…";
-    else if (state.loading) count = "加载中…";
-    else count = std::to_string(state.entries.size()) + " 项";
-
+    // The device/download line stays put. A selection action bar lived here for a while
+    // (已选 N 项 + 下载/复制/删除/取消选择) and was removed on request: the buttons in a
+    // 30px strip never looked right next to the 13px status text, and everything they did
+    // is already one right-click (or one key) away. What remains is what a status bar is
+    // for: where files land, whether the directory is writable, how many items, progress.
+    const float leftW = w * 0.45f;
     ui.text("status.left")
-        .x(x).y(y).size(w * 0.45f, h)
-        .text(left)
+        .x(x).y(y).size(leftW, h)
+        .text(ellipsizeToWidth(left, leftW - 8.0f, 13.0f))
         .fontSize(13.0f).lineHeight(13.0f)
         .color(kMuted)
         .verticalAlign(eui::VerticalAlign::Center)
         .build();
 
-    // Writable status of the current directory.
+    std::string count;
+    if (state.busy) count = "处理中…";
+    else if (state.loading) count = "加载中…";
+    else count = std::to_string(state.entries.size()) + " 项";
+
+    // Writable status of the current directory. Hidden while selection actions occupy
+    // the middle of the bar: this note is the least important thing on the line and it
+    // used to be drawn right on top of those buttons.
     if (!state.selectedDevice.empty() && !state.loading && !state.busy) {
         ui.text("status.writable")
             .x(x + w * 0.45f).y(y).size(w * 0.14f, h)
@@ -5310,6 +5997,61 @@ void composeStatusBar(eui::Ui& ui, float x, float y, float w, float h) {
             .verticalAlign(eui::VerticalAlign::Center)
             .build();
     }
+}
+
+void composeTransferCard(eui::Ui& ui, float w, float h) {
+    // Progress card for a running transfer. The status bar already carries a thin bar,
+    // but a drag-out download is started by a gesture, not by the download button - so
+    // it says what is happening, how far along it is, and how many files are left,
+    // without the user having to look away from the pointer.
+    if (!state.busy || state.progressLabel.empty()) return;
+
+    int done = state.dragOutDone.load();
+    const int total = state.dragOutTotal;
+    float ratio = state.progress;
+    if (total > 0) {
+        done = std::min(done, total);
+        ratio = static_cast<float>(done) / static_cast<float>(total);
+    }
+
+    const float cw = 320.0f, ch = 78.0f;
+    const float cx = w - cw - 24.0f, cy = h - ch - 72.0f;  // clear of the toast area
+    ui.stack("transfer.card")
+        .x(cx).y(cy).size(cw, ch)
+        .zIndex(1350)
+        .content([&] {
+            ui.rect("transfer.card.bg")
+                .size(cw, ch)
+                .color(kSurface).radius(10.0f).border(1.0f, kBorder)
+                .shadow(0.0f, 4.0f, 16.0f, eui::Color{0.0f, 0.0f, 0.0f, 0.10f})
+                .build();
+            ui.text("transfer.card.title")
+                .x(16.0f).y(12.0f).size(cw - 32.0f, 20.0f)
+                .text(total > 0
+                          ? (state.progressLabel + "（" + std::to_string(done) + "/" +
+                             std::to_string(total) + "）")
+                          : state.progressLabel)
+                .fontSize(13.0f).lineHeight(13.0f).color(kInk)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
+            const float barY = 44.0f, barW = cw - 32.0f;
+            ui.rect("transfer.card.track")
+                .x(16.0f).y(barY).size(barW, 6.0f)
+                .color(kSurfaceHover).radius(3.0f).build();
+            if (ratio >= 0.0f) {
+                const float p = std::clamp(ratio, 0.0f, 1.0f);
+                ui.rect("transfer.card.fill")
+                    .x(16.0f).y(barY).size(std::max(2.0f, barW * p), 6.0f)
+                    .color(kAccent).radius(3.0f).build();
+            }
+            ui.text("transfer.card.hint")
+                .x(16.0f).y(54.0f).size(cw - 32.0f, 16.0f)
+                .text(ratio >= 1.0f ? "即将开始拖拽…" : "取到本地后即可拖到资源管理器")
+                .fontSize(11.5f).lineHeight(11.5f).color(kMuted)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
+        })
+        .build();
 }
 
 void composeToast(eui::Ui& ui, float w, float h) {
@@ -5671,8 +6413,8 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
 
-            toolButton(ui, "bookmark.manage.close", pw - 24.0f - 100.0f, ph - 56.0f, 100.0f, 40.0f,
-                       0xF00D, "关闭", false, true, [] { state.bookmarkManageOpen = false; });
+            toolButton(ui, "bookmark.manage.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
+                       0xF00D, "", false, true, [] { state.bookmarkManageOpen = false; });
         })
         .onOpenChange([](bool v) { state.bookmarkManageOpen = v; })
         .build();
@@ -5693,8 +6435,8 @@ void composeCommandManageDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(18.0f).lineHeight(18.0f)
                 .color(kInk)
                 .build();
-            toolButton(ui, "command.manage.close", pw - 24.0f - 100.0f, 12.0f, 100.0f, 36.0f,
-                       0xF00D, "关闭", false, true, [] { state.commandManageOpen = false; });
+            toolButton(ui, "command.manage.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
+                       0xF00D, "", false, true, [] { state.commandManageOpen = false; });
 
             ui.text("command.manage.name.label").x(24.0f).y(54.0f).size(100.0f, 22.0f)
                 .text("名称").fontSize(13.0f).lineHeight(13.0f).color(kMuted).verticalAlign(eui::VerticalAlign::Center).build();
@@ -5842,8 +6584,8 @@ void composeCommandOutputDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
 
-            toolButton(ui, "command.output.close", pw - 24.0f - 100.0f, ph - 56.0f, 100.0f, 40.0f,
-                       0xF00D, "关闭", false, true, [] { state.commandOutputOpen = false; });
+            toolButton(ui, "command.output.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
+                       0xF00D, "", false, true, [] { state.commandOutputOpen = false; });
         })
         .onOpenChange([](bool v) { state.commandOutputOpen = v; })
         .build();
@@ -5868,8 +6610,8 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(19.0f).lineHeight(19.0f)
                 .color(kInk)
                 .build();
-            toolButton(ui, "settings.close", pw - 24.0f - 100.0f, 12.0f, 100.0f, 36.0f,
-                       0xF00D, "关闭", false, true, [] { state.settingsOpen = false; });
+            toolButton(ui, "settings.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
+                       0xF00D, "", false, true, [] { state.settingsOpen = false; });
 
             // Theme row: dark mode toggle + accent color swatches.
             ui.stack("settings.dark.wrap")
@@ -6020,6 +6762,9 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                  std::to_string(state.fontList.size()) + " 个字体"))
                     .fontSize(11.5f).lineHeight(11.5f)
                     .color(kMuted)
+                    // Right-aligned so it sits under the search box it is describing; at
+                    // the left edge it had the entire dialog width empty beside it.
+                    .horizontalAlign(eui::HorizontalAlign::Right)
                     .build();
                 ui.stack("settings.font.wrap")
                     .x(24.0f).y(210.0f).size(pw - 48.0f, fontListH)
@@ -6042,6 +6787,16 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                         (state.fontOnlyChinese ? ".cjk" : ".all"))
                             .content([&](eui::Ui& body, float cw, float) {
                                 const float rowH = 30.0f;
+                                // Rows are cut by the rounded container bottom because the
+                                // viewport height is not a multiple of rowH: the last row
+                                // arrived sliced in half with no hint that the list simply
+                                // continues. A little breathing room below the last row
+                                // makes the cut read as "there is more" instead of "broken".
+                                body.rect("settings.font.tailpad")
+                                    .x(0.0f).y(static_cast<float>(visibleFonts.size()) * rowH)
+                                    .size(cw, 10.0f)
+                                    .color(kClear)
+                                    .build();
                                 for (std::size_t r = 0; r < visibleFonts.size(); ++r) {
                                     const std::size_t index = visibleFonts[r];
                                     const std::string& name = state.fontList[index];
@@ -6193,8 +6948,8 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(19.0f).lineHeight(19.0f)
                 .color(kInk)
                 .build();
-            toolButton(ui, "update.close", pw - 24.0f - 100.0f, 12.0f, 100.0f, 36.0f,
-                       0xF00D, "关闭", false, true, [] { state.updateOpen = false; });
+            toolButton(ui, "update.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
+                       0xF00D, "", false, true, [] { state.updateOpen = false; });
 
             // --- This app section ---
             ui.text("update.app.title")
@@ -6565,8 +7320,8 @@ void composeExternalEditDialog(eui::Ui& ui, float w, float h) {
                            [index] { stopExternalEdit(index); });
             }
 
-            toolButton(ui, "extedit.close", 24.0f, ph - 48.0f, 110.0f, 34.0f,
-                       0xF00D, "关闭", false, true, [] { state.externalEditListOpen = false; });
+            toolButton(ui, "extedit.close", 24.0f, ph - 48.0f, 44.0f, 34.0f,
+                       0xF00D, "", false, true, [] { state.externalEditListOpen = false; });
             toolButton(ui, "extedit.syncall", 142.0f, ph - 48.0f, 110.0f, 34.0f,
                        0xF021, "全部同步", false, pending > 0, [] {
                            for (std::size_t i = 0; i < state.externalEdits.size(); ++i) {
@@ -6674,8 +7429,8 @@ void composeDeviceInfoDialog(eui::Ui& ui, float w, float h) {
                     }
                 })
                 .build();
-            toolButton(ui, "device.info.close", pw - 24.0f - 100.0f, ph - 56.0f, 100.0f, 40.0f,
-                       0xF00D, "关闭", false, true, [] { state.deviceInfoOpen = false; });
+            toolButton(ui, "device.info.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
+                       0xF00D, "", false, true, [] { state.deviceInfoOpen = false; });
         })
         .onOpenChange([](bool v) { state.deviceInfoOpen = v; })
         .build();
@@ -6702,8 +7457,8 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(streaming ? kGreen : kMuted)
                 .verticalAlign(eui::VerticalAlign::Center).build();
-            toolButton(ui, "logcat.close", pw - 24.0f - 100.0f, 12.0f, 100.0f, 36.0f,
-                       0xF00D, "关闭", false, true, [] { state.logcatOpen = false; });
+            toolButton(ui, "logcat.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
+                       0xF00D, "", false, true, [] { state.logcatOpen = false; });
 
             // Filter (case-insensitive regex).
             const float actionW = 104.0f;
@@ -6787,9 +7542,16 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
                         return;
                     }
                     for (std::size_t i = 0; i < shown.size(); ++i) {
+                        // Monospace + level colour: a log is column-aligned data, and in the
+                        // proportional UI font the timestamp/pid/tag columns wander, which
+                        // makes a stream of lines much harder to scan. The level colour
+                        // (E red, W amber, everything else ink) is what the eye looks for
+                        // first when something went wrong.
                         body.text("logcat.line." + std::to_string(i))
                             .x(4.0f).y(static_cast<float>(i) * 18.0f).size(cw - 8.0f, 18.0f)
-                            .text(shown[i]).fontSize(11.0f).lineHeight(11.0f).color(kInk).build();
+                            .text(shown[i]).fontSize(11.0f).lineHeight(11.0f)
+                            .fontFamily("Consolas")
+                            .color(logcatLevelColor(shown[i])).build();
                     }
                 })
                 .build();
@@ -6904,8 +7666,8 @@ void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
                        });
             toolButton(ui, "text.preview.save", pw - 24.0f - 200.0f, ph - 56.0f, 92.0f, 40.0f,
                        0xF0C7, "保存", true, true, [] { saveTextPreview(); });
-            toolButton(ui, "text.preview.close", pw - 24.0f - 100.0f, ph - 56.0f, 100.0f, 40.0f,
-                       0xF00D, "关闭", false, true, [] { state.textPreviewOpen = false; });
+            toolButton(ui, "text.preview.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
+                       0xF00D, "", false, true, [] { state.textPreviewOpen = false; });
         })
         .onOpenChange([](bool v) { state.textPreviewOpen = v; })
         .build();
@@ -6924,8 +7686,8 @@ void composeImagePreviewDialog(eui::Ui& ui, float w, float h) {
                 .x(24.0f).y(16.0f).size(pw - 140.0f, 28.0f)
                 .text(state.imagePreviewRemote)
                 .fontSize(15.0f).lineHeight(15.0f).color(kInk).build();
-            toolButton(ui, "image.preview.close", pw - 24.0f - 100.0f, 12.0f, 100.0f, 36.0f,
-                       0xF00D, "关闭", false, true, [] { state.imagePreviewOpen = false; });
+            toolButton(ui, "image.preview.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
+                       0xF00D, "", false, true, [] { state.imagePreviewOpen = false; });
             ui.rect("image.preview.bg")
                 .x(24.0f).y(56.0f).size(pw - 48.0f, ph - 72.0f)
                 .color(kBackground).radius(10.0f).border(1.0f, kBorder).build();
@@ -6975,8 +7737,8 @@ void composePropertiesDialog(eui::Ui& ui, float w, float h) {
                     }
                 })
                 .build();
-            toolButton(ui, "file.properties.close", pw - 24.0f - 100.0f, ph - 56.0f, 100.0f, 40.0f,
-                       0xF00D, "关闭", false, true, [] { state.propertiesOpen = false; });
+            toolButton(ui, "file.properties.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
+                       0xF00D, "", false, true, [] { state.propertiesOpen = false; });
         })
         .onOpenChange([](bool v) { state.propertiesOpen = v; })
         .build();
@@ -7004,9 +7766,9 @@ void composeAppManageDialog(eui::Ui& ui, float w, float h) {
                         .build();
                 }).build();
             toolButton(ui, "app.manage.refresh", pw - 24.0f - 200.0f, 12.0f, 92.0f, 36.0f,
-                       0xF021, "刷新", true, true, [] { fetchAppList(); });
-            toolButton(ui, "app.manage.close", pw - 24.0f - 100.0f, 12.0f, 100.0f, 36.0f,
-                       0xF00D, "关闭", false, true, [] { state.appManageOpen = false; });
+                       0xF021, "刷新", false, true, [] { fetchAppList(); });
+            toolButton(ui, "app.manage.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
+                       0xF00D, "", false, true, [] { state.appManageOpen = false; });
 
             const float listH = ph - 56.0f - 56.0f;
             ui.rect("app.manage.list.bg")
@@ -7088,8 +7850,8 @@ void composeHelpDialog(eui::Ui& ui, float w, float h) {
                     }
                 })
                 .build();
-            toolButton(ui, "help.close", pw - 24.0f - 100.0f, ph - 56.0f, 100.0f, 40.0f,
-                       0xF00D, "关闭", false, true, [] { state.helpOpen = false; });
+            toolButton(ui, "help.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
+                       0xF00D, "", false, true, [] { state.helpOpen = false; });
         })
         .onOpenChange([](bool v) { state.helpOpen = v; })
         .build();
@@ -7185,7 +7947,9 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
     const float topBarH = 44.0f;
     const float gap = 10.0f;
     const float pathY = topY + topBarH + gap;
-    const float pathBarH = 40.0f;
+    // Same height as the action row above: 44 vs 40 used to read as two different
+    // toolbars stacked on top of each other.
+    const float pathBarH = topBarH;
     const float headerY = pathY + pathBarH + gap;
     const float headerH = 24.0f;
     const float listY = headerY + headerH + 4.0f;
@@ -7209,6 +7973,28 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeStatusBar(ui, x, statusY, contentW, statusH);
 
             composeToast(ui, W, H);
+            composeTransferCard(ui, W, H);
+#ifdef _WIN32
+            // Drag-out watching. compose() alone is not enough: pressing a row suppresses
+            // its hover state, so the app has no reason to repaint while the pointer is
+            // held down - pumpDragOut() then ran exactly once, after the button was
+            // already released (the debug log showed "down=0 dx=48" and nothing else).
+            // The ticker must also stay alive while the fetch is running: it drives one
+            // file per tick, and clearing the press as soon as the drag starts left a
+            // multi-file drag stuck after the first file.
+            if (!state.dragPressRow.empty() || !state.dragOutQueue.empty()) {
+                ui.stack("drag.watch")
+                    .x(-10.0f).y(-10.0f).size(1.0f, 1.0f)
+                    .content([&] {
+                        ui.rect("drag.watch.tick")
+                            .size(1.0f, 1.0f)
+                            .color(kClear)
+                            .onTimer(0.016f, [] { pumpDragOut(); })
+                            .build();
+                    })
+                    .build();
+            }
+#endif
             composeDeviceMenu(ui, W, H);
             composeRowMenu(ui, W, H);
             composeBookmarkMenu(ui, W, H);
