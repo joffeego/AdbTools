@@ -22,6 +22,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shobjidl.h>   // IFileOpenDialog + FOS_PICKFOLDERS (folder picker)
+#include <objbase.h>     // OleInitialize
 #include <shellapi.h>
 #include <commdlg.h>
 #elif defined(__APPLE__)
@@ -689,6 +691,53 @@ std::string chooseFile(const FileDialogOptions& options) {
     singleOptions.allowMultiple = false;
     const FileDialogResult result = openFileDialog(singleOptions);
     return result.selected() ? result.paths.front() : std::string{};
+}
+
+// Folder picker. GetOpenFileNameW (what openFileDialog uses) cannot do this at all, so
+// Windows needs the shell's modern dialog with FOS_PICKFOLDERS - the same one Explorer
+// shows for "选择文件夹".
+std::string chooseFolder(const std::string& prompt) {
+#if defined(_WIN32)
+    // The UI thread may never have started OLE (the drag-out path does it lazily), and
+    // CoCreateInstance fails without it.
+    const HRESULT oleResult = OleInitialize(nullptr);
+    const bool oleOwned = SUCCEEDED(oleResult);
+
+    IFileOpenDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || dialog == nullptr) {
+        if (oleOwned) OleUninitialize();
+        return {};
+    }
+
+    DWORD options = 0;
+    if (SUCCEEDED(dialog->GetOptions(&options))) {
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    }
+    const std::wstring title = utf8ToWide(prompt.empty() ? "选择文件夹" : prompt);
+    dialog->SetTitle(title.c_str());
+
+    std::string chosen;
+    if (SUCCEEDED(dialog->Show(nullptr))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item)) && item != nullptr) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path != nullptr) {
+                chosen = wideToUtf8(path);
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+    }
+    dialog->Release();
+    if (oleOwned) OleUninitialize();
+    return chosen;
+#else
+    // No folder dialog is wired up off Windows; callers fall back to a text field.
+    (void)prompt;
+    return {};
+#endif
 }
 
 std::vector<std::string> chooseFiles(const FileDialogOptions& options) {

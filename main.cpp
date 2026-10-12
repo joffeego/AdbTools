@@ -314,6 +314,12 @@ struct AppSettings {
     // 1.3, not 1.0: a fresh install should look like what people were picking anyway
     // (this used to be the 特大 step and is now 默认 - see the 字号 dropdown).
     float fontSizeScale = 1.3f;
+    // Where downloads (and screenshots) are saved. Empty means "use the system default
+    // download folder", which is what the app did before this became configurable.
+    std::string downloadDir;
+    // Bound to the settings text field; committed on Enter so a half-typed path never
+    // becomes the download target.
+    std::string downloadDirDraft;
     int mirrorW = 320;
     int mirrorH = 640;
     int windowW = 1000;
@@ -380,6 +386,9 @@ struct AppState {
     bool dirWritable = false;
     std::string selectedEntry;
     std::string downloadDir;
+    // Bound to the settings text field; committed on Enter so a half-typed path never
+    // becomes the download target.
+    std::string downloadDirDraft;
 
     std::string lastClickedName;
     std::chrono::steady_clock::time_point lastClickTime;
@@ -847,6 +856,7 @@ void saveSettings() {
         {"uiScale", std::to_string(settings.uiScale)},
         {"darkMode", settings.darkMode ? "1" : "0"},
         {"fontScale", std::to_string(settings.fontSizeScale)},
+        {"downloadDir", settings.downloadDir},
         {"accent", std::to_string(settings.accentR) + "," + std::to_string(settings.accentG) + "," +
                        std::to_string(settings.accentB)},
         {"sortColumn", std::to_string(state.sortColumn)},
@@ -1378,6 +1388,7 @@ void loadSettings() {
         else if (key == "uiScale") settings.uiScale = static_cast<float>(std::atof(value.c_str()));
         else if (key == "darkMode") settings.darkMode = (std::atoi(value.c_str()) != 0);
         else if (key == "fontScale") settings.fontSizeScale = static_cast<float>(std::atof(value.c_str()));
+        else if (key == "downloadDir") settings.downloadDir = value;
         else if (key == "accent") {
             const std::size_t c1 = value.find(',');
             const std::size_t c2 = value.find(',', c1 + 1);
@@ -1421,6 +1432,7 @@ void loadSettings() {
 
 void openSettingsDialog() {
     state.settingsOpen = true;
+    state.downloadDirDraft = state.downloadDir;
     if (!state.fontsLoaded) {
         state.fontsLoaded = true;
         app::async::runOnce(
@@ -2574,7 +2586,18 @@ void doScreenshot() {
         [](const app::async::Result<std::string>& result) {
             state.busy = false;
             state.progress = 0.0f;
-            toast(result.ok ? "截图完成" : "截图失败", result.ok ? result.value : result.error);
+            if (!result.ok) {
+                toast("截图失败", result.error);
+                return;
+            }
+            // A screenshot exists to be looked at. The file is already on disk and the
+            // preview renders from a local path, so open it right away instead of only
+            // naming it in a toast.
+            const std::string& file = result.value;
+            state.imagePreviewRemote = file.substr(file.find_last_of("/\\") + 1);
+            state.imagePreviewLocal = file;
+            state.imagePreviewOpen = true;
+            toast("截图完成", file);
         });
 }
 
@@ -4604,7 +4627,20 @@ void openImagePreview(const std::string& name) {
 }
 
 void closeTopmost() {
-    if (state.settingsOpen) state.settingsOpen = false;
+    // An open dropdown is the innermost thing on screen: Escape closes it first, and only
+    // a second Escape closes the dialog that contains it.
+    if (state.weightDropdownOpen || state.scaleDropdownOpen || state.fontSizeDropdownOpen) {
+        state.weightDropdownOpen = false;
+        state.scaleDropdownOpen = false;
+        state.fontSizeDropdownOpen = false;
+        return;
+    }
+    if (state.settingsOpen) {
+        state.settingsOpen = false;
+        state.weightDropdownOpen = false;
+        state.scaleDropdownOpen = false;
+        state.fontSizeDropdownOpen = false;
+    }
     else if (state.updateOpen) state.updateOpen = false;
     else if (state.confirmDialogOpen) state.confirmDialogOpen = false;
     else if (state.promptOpen) state.promptOpen = false;
@@ -5383,11 +5419,32 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
             .build();
     }
 
-    // Floating search box at the top-right of the list (Ctrl+F to show, X to hide).
-    if (state.searchOpen) {
-        ui.stack("list.search.wrap")
-            .x(x + w - 244.0f).y(y + 4.0f).size(228.0f, 32.0f)
-            .zIndex(20)
+    // Floating search box at the top-right of the list. Opened by the magnifier in the
+    // path bar or by Ctrl+F, closed by X or Esc. It slides in from the right and eases
+    // down into place rather than appearing between two frames; the animation asks for
+    // the next frame itself and stops once it has settled.
+    {
+        constexpr float kSearchAnimSeconds = 0.16f;
+        static float searchAnimT = 0.0f;
+        static double searchAnimLastMs = 0.0;
+        const double nowMs = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+        const double elapsed = searchAnimLastMs > 0.0 ? (nowMs - searchAnimLastMs) / 1000.0 : 0.016;
+        searchAnimLastMs = nowMs;
+        const float target = state.searchOpen ? 1.0f : 0.0f;
+        const float step = static_cast<float>(std::min(0.05, elapsed) / kSearchAnimSeconds);
+        searchAnimT = (target > searchAnimT) ? std::min(target, searchAnimT + step)
+                                             : std::max(target, searchAnimT - step);
+        if (searchAnimT != target) app::requestUpdate();
+        if (searchAnimT > 0.002f) {
+            const float eased =
+                1.0f - (1.0f - searchAnimT) * (1.0f - searchAnimT) * (1.0f - searchAnimT);
+            const float slideX = (1.0f - eased) * 26.0f;  // in from the right
+            const float slideY = (1.0f - eased) * -6.0f;  // and slightly down
+            ui.stack("list.search.wrap")
+                .x(x + w - 244.0f + slideX).y(y + 4.0f + slideY).size(228.0f, 32.0f)
+                .zIndex(20)
             .content([&] {
                 components::input(ui, "list.search.input")
                     .theme(themeTokens())
@@ -5424,6 +5481,7 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
             })
             .build();
     }
+}
 }
 
 void composeTitleBar(eui::Ui& ui, float W, float h) {
@@ -5544,7 +5602,14 @@ void composeTitleBar(eui::Ui& ui, float W, float h) {
 // A small hover label that appears below an element (never covering it).
 void composeHoverTip(eui::Ui& ui, const std::string& id, const std::string& sourceId,
                      const std::string& text, float cx, float top) {
-    const float tw = approxTextWidth(text, 12.0f) + 28.0f;
+    // Measured, not estimated. This used a hand-rolled width heuristic (0.62 em per
+    // ASCII byte, 1 em per code point) which is wrong for CJK fonts and for anything
+    // wider than the average glyph - the box came out too small and the tooltip text,
+    // which is neither wrapped nor clipped by the text element, simply ran past the
+    // rounded rectangle. Same trap as the file name column: measure with the size the
+    // text is actually drawn at (the user's 字号 is a multiplier on top of fontSize).
+    const float drawnSize = 12.0f * ::core::runtimeFontScale();
+    const float tw = eui::measureTextWidth(text, {}, drawnSize) + 24.0f;
     ui.stack(id)
         .x(cx - tw * 0.5f).y(top)
         .size(tw, 26.0f)
@@ -5955,7 +6020,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
 
                     auto addSegment = [&](const std::string& id, const std::string& label,
                                           const std::string& path, bool isLast) {
-                        const float labelW = approxTextWidth(label, fontSize) + 24.0f;
+                        const float labelW = eui::measureTextWidth(label, {}, fontSize * ::core::runtimeFontScale()) + 24.0f;
                         if (isLast) {
                             ui.text(id)
                                 .x(cursorX).y(0.0f).size(labelW, h)
@@ -6011,7 +6076,34 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                 })
                 .build();
 
-            ui.rect("breadcrumb.edit.hit")
+// Filter the current listing. This used to be keyboard-only (Ctrl+F), which meant
+              // nobody found it. It now has a permanent button next to the path-edit pencil:
+              // the path bar is the list's own toolbar, so a control that acts on the list
+              // belongs there. It stays highlighted while a filter is active.
+              const float searchBtnW = editW;
+              const float searchBtnX = crumbW - editW * 2.0f - 8.0f;
+              ui.rect("breadcrumb.search.hit")
+                  .x(searchBtnX).y(3.0f).size(searchBtnW, h - 6.0f)
+                  .states(state.searchOpen ? kAccentSoft : kClear, kSurfaceHover, kSurfaceAct)
+                  .radius(6.0f)
+                  .onClick([] {
+                      if (state.searchOpen && state.fileFilter.empty()) {
+                          state.searchOpen = false;
+                      } else {
+                          state.searchOpen = true;
+                          app::requestFocus("list.search.input.hit");
+                      }
+                  })
+                  .build();
+              ui.text("breadcrumb.search.icon")
+                  .x(searchBtnX).y(3.0f).size(searchBtnW, h - 6.0f)
+                  .icon(0xF002)
+                  .fontSize(13.0f).lineHeight(13.0f)
+                  .color(state.searchOpen ? kAccent : kMuted)
+                  .horizontalAlign(eui::HorizontalAlign::Center)
+                  .verticalAlign(eui::VerticalAlign::Center)
+                  .build();
+              ui.rect("breadcrumb.edit.hit")
                 .x(crumbW - editW - 4.0f).y(3.0f).size(editW, h - 6.0f)
                 .states(kClear, kSurfaceHover, kSurfaceAct)
                 .radius(6.0f)
@@ -6735,7 +6827,7 @@ void composeCommandOutputDialog(eui::Ui& ui, float w, float h) {
 void composeSettingsDialog(eui::Ui& ui, float w, float h) {
     // Responsive panel size so the settings stay fully visible on small windows.
     const float pw = std::min(560.0f, std::max(360.0f, w - 48.0f));
-    const float ph = std::min(560.0f, std::max(380.0f, h - 48.0f));
+    const float ph = std::min(600.0f, std::max(380.0f, h - 48.0f));
 
     components::dialog(ui, "settings.dialog")
         .screen(w, h)
@@ -6752,7 +6844,12 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .color(kInk)
                 .build();
             toolButton(ui, "settings.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
-                       0xF00D, "", false, true, [] { state.settingsOpen = false; });
+                       0xF00D, "", false, true, [] {
+                           state.settingsOpen = false;
+                           state.weightDropdownOpen = false;
+                           state.scaleDropdownOpen = false;
+                           state.fontSizeDropdownOpen = false;
+                       });
 
             // Theme row: dark mode toggle + accent color swatches.
             ui.stack("settings.dark.wrap")
@@ -6800,12 +6897,62 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             // Font label + scrollable font list (composed first so the dropdown
             // popups below render on top of it).
             //
+            // Download directory. Editable text field rather than a picker: the platform
+            // layer only offers file dialogs (a folder chooser would mean picking a file
+            // and taking its parent, which is worse than typing or pasting a path), and
+            // this is a path people already have on the clipboard from Explorer.
+            ui.text("settings.downloaddir.label")
+                .x(24.0f).y(200.0f).size(60.0f, 36.0f)
+                .text("下载目录")
+                .fontSize(13.0f).lineHeight(13.0f)
+                .color(kMuted)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
+            ui.stack("settings.downloaddir.wrap")
+                .x(90.0f).y(200.0f).size(pw - 90.0f - 24.0f, 36.0f)
+                .content([&] {
+                    // The field keeps 96px for the button, so a long path is still readable.
+                    components::input(ui, "settings.downloaddir")
+                        .theme(themeTokens())
+                        .size(pw - 90.0f - 24.0f - 100.0f, 36.0f)
+                        .fontSize(12.5f)
+                        .value(state.downloadDirDraft)
+                        .placeholder("下载文件保存到哪个文件夹")
+                        .onChange([](const std::string& v) { state.downloadDirDraft = v; })
+                        .onEnter([] {
+                            const std::string trimmed = core::trim(state.downloadDirDraft);
+                            if (trimmed.empty()) return;
+                            state.downloadDir = trimmed;
+                            toast("下载目录", state.downloadDir);
+                            saveSettings();
+                        })
+                        .build();
+                    // Pick a folder with the system's own dialog - typing a path is fine,
+                    // but "browse to it" is what people expect from a directory setting.
+                    //
+                    // x is *stack*-relative: this stack starts at 90 (the control column),
+                    // so a dialog-relative 480 is 390 here. Passing the dialog value put
+                    // the button ~90px too far right, over the card's edge.
+                    toolButton(ui, "settings.downloaddir.browse",
+                               pw - 210.0f, 0.0f, 96.0f, 36.0f,
+                               0xF07C, "选择…", false, true, [&] {
+                                   const std::string picked =
+                                       eui::platform::chooseFolder("选择下载目录");
+                                   if (picked.empty()) return;
+                                   state.downloadDirDraft = picked;
+                                   state.downloadDir = picked;
+                                   toast("下载目录", state.downloadDir);
+                                   saveSettings();
+                               }, 12.0f, 12.5f);
+                })
+                .build();
+
             // One row, three non-overlapping slots: the label, the capability
             // filter, and the search box on the right. (They used to be placed
             // independently, and the label ended up drawn underneath the filter
             // checkbox - same x range, overlapping y.)
             ui.text("settings.font.label")
-                .x(24.0f).y(200.0f).size(60.0f, 36.0f)
+                .x(24.0f).y(248.0f).size(60.0f, 36.0f)
                 .text("字体")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
@@ -6863,7 +7010,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             }
 
             ui.stack("settings.font.search.wrap")
-                .x(pw - 24.0f - 190.0f).y(200.0f).size(190.0f, 36.0f)
+                .x(pw - 24.0f - 190.0f).y(248.0f).size(190.0f, 36.0f)
                 .content([&] {
                     components::input(ui, "settings.font.search")
                         .theme(themeTokens())
@@ -6876,7 +7023,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
             ui.stack("settings.font.cjk.wrap")
-                .x(90.0f).y(200.0f).size(210.0f, 36.0f)
+                .x(90.0f).y(248.0f).size(210.0f, 36.0f)
                 .content([&] {
                     components::checkbox(ui, "settings.font.cjk")
                         .size(210.0f, 34.0f)
@@ -6889,10 +7036,10 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
 
-            const float fontListH = std::max(60.0f, ph - 284.0f);
+            const float fontListH = std::max(60.0f, ph - 332.0f);
             if (state.fontList.empty()) {
                 ui.text("settings.font.loading")
-                    .x(24.0f).y(252.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(300.0f).size(pw - 48.0f, fontListH)
                     .text("正在加载字体…")
                     .fontSize(14.0f).lineHeight(14.0f)
                     .color(kMuted)
@@ -6901,7 +7048,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .build();
             } else {
                 ui.text("settings.font.count")
-                    .x(24.0f).y(244.0f).size(pw - 48.0f, 18.0f)
+                    .x(24.0f).y(292.0f).size(pw - 48.0f, 18.0f)
                     .text(visibleFonts.size() == state.fontList.size()
                               ? ("共 " + std::to_string(state.fontList.size()) + " 个字体")
                               : ("匹配 " + std::to_string(visibleFonts.size()) + " / " +
@@ -6913,7 +7060,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .horizontalAlign(eui::HorizontalAlign::Right)
                     .build();
                 ui.stack("settings.font.wrap")
-                    .x(24.0f).y(266.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(314.0f).size(pw - 48.0f, fontListH)
                     .content([&] {
                         ui.rect("settings.font.wrap.bg")
                             .size(pw - 48.0f, fontListH)
@@ -8054,7 +8201,8 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
         state.initialized = true;
         state.adbPath = findAdb();
         state.adbFound = !state.adbPath.empty();
-        state.downloadDir = defaultDownloadDir();
+        state.downloadDir = settings.downloadDir.empty() ? defaultDownloadDir() : settings.downloadDir;
+    state.downloadDirDraft = state.downloadDir;
         loadSettings();
         applyTheme();
         loadBookmarks();
@@ -8155,6 +8303,23 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeCommandMenu(ui, W, H);
             composeConfirmDialog(ui, W, H);
             composePromptDialog(ui, W, H);
+            // Click-away layer for the settings dropdowns: while one is open, a
+            // full-window transparent rect sits under the dialog (zIndex below the
+            // dialog's 1300, above the rest of the UI) and closes it. Without this the
+            // popup stayed open until an item was picked or the field was clicked again -
+            // clicking anywhere else did nothing, which reads as a stuck menu.
+            if (state.weightDropdownOpen || state.scaleDropdownOpen || state.fontSizeDropdownOpen) {
+                ui.rect("settings.dropdown.dismiss")
+                    .x(0.0f).y(0.0f).size(W, H)
+                    .color(kClear)
+                    .zIndex(1250)
+                    .onClick([] {
+                        state.weightDropdownOpen = false;
+                        state.scaleDropdownOpen = false;
+                        state.fontSizeDropdownOpen = false;
+                    })
+                    .build();
+            }
             composeSettingsDialog(ui, W, H);
             composeUpdateDialog(ui, W, H);
             composeSetupDialog(ui, W, H);

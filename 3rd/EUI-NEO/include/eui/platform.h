@@ -10,6 +10,7 @@ using core::platform::FileDialogStatus;
 using core::platform::TrayOptions;
 using core::platform::chooseFile;
 using core::platform::chooseFiles;
+using core::platform::chooseFolder;
 using core::platform::openFileDialog;
 using core::platform::openUrl;
 using core::platform::resolveResourcePath;

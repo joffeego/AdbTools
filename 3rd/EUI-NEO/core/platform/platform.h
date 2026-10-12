@@ -42,6 +42,11 @@ bool openUrl(const std::string& url);
 FileDialogResult openFileDialog(const FileDialogOptions& options = {});
 std::string chooseFile(const FileDialogOptions& options = {});
 std::vector<std::string> chooseFiles(const FileDialogOptions& options = {});
+// Pick a *directory*. A separate entry point rather than a flag on FileDialogOptions,
+// because the existing dialog has no folder mode at all: openFileDialog() is built on
+// GetOpenFileNameW, which cannot select a folder - Windows needs IFileOpenDialog with
+// FOS_PICKFOLDERS for that. Returns an empty string when the user cancels.
+std::string chooseFolder(const std::string& prompt = {});
 bool initializeTray(const TrayOptions& options);
 bool isTrayInitialized();
 void pollTray(bool blocking = false);
