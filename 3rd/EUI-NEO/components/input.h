@@ -177,6 +177,9 @@ public:
                 state.selectionStart = InputModel::clampUtf8Boundary(state.text, revealStart_);
                 state.selectionEnd = state.cursor;
                 state.horizontalScroll = 0.0f;
+                // Ask the layout to put this line in the upper third rather than at the
+                // bottom edge (see InputState::revealScrollPending).
+                state.revealScrollPending = true;
             }
         }
         const InputLayout layout = InputLayout::build(state, textWidth, textHeight, width_, inset, textY, layoutLineHeight, fontFamily_, fontSize, multiline_);

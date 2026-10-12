@@ -45,6 +45,10 @@ struct InputModel {
         bool selecting = false;
         bool hasPreferredCursorX = false;
         bool followCaret = true;
+        // Set when a revealRange() request moves the caret, so the next layout can place
+        // the revealed line where it reads (upper third) instead of merely making it
+        // visible at the bottom edge.
+        bool revealScrollPending = false;
         float preferredCursorX = 0.0f;
         float horizontalScroll = 0.0f;
         float verticalScroll = 0.0f;
@@ -127,7 +131,20 @@ struct InputModel {
                 layout.maxVerticalScroll = std::max(0.0f, layout.contentHeight - viewportHeight);
                 state.verticalScroll = std::clamp(state.verticalScroll, 0.0f, layout.maxVerticalScroll);
                 if (state.followCaret) {
-                    syncVerticalScroll(state, layout.cursorLine, lineHeight, viewportHeight);
+                    if (state.revealScrollPending) {
+                        // A search jump is not a caret nudge. The minimal follow-caret
+                        // scroll only guarantees the line is *visible*, which pins the hit
+                        // to the very bottom edge of the viewport - exactly where a reader
+                        // looking at the middle of the screen will not notice it, so "next
+                        // match" looked like it did nothing. Editors put the hit in the
+                        // upper third; do that.
+                        state.revealScrollPending = false;
+                        const float target = static_cast<float>(layout.cursorLine) * lineHeight -
+                                             viewportHeight * 0.34f;
+                        state.verticalScroll = std::clamp(target, 0.0f, layout.maxVerticalScroll);
+                    } else {
+                        syncVerticalScroll(state, layout.cursorLine, lineHeight, viewportHeight);
+                    }
                 }
                 state.verticalScroll = std::clamp(state.verticalScroll, 0.0f, layout.maxVerticalScroll);
                 layout.currentVerticalScroll = state.verticalScroll;

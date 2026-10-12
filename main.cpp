@@ -311,7 +311,9 @@ struct AppSettings {
     float accentR = 0.25f;
     float accentG = 0.545f;
     float accentB = 0.945f;
-    float fontSizeScale = 1.0f;
+    // 1.3, not 1.0: a fresh install should look like what people were picking anyway
+    // (this used to be the 特大 step and is now 默认 - see the 字号 dropdown).
+    float fontSizeScale = 1.3f;
     int mirrorW = 320;
     int mirrorH = 640;
     int windowW = 1000;
@@ -967,53 +969,106 @@ std::string matchingFamilyPart(const std::string& display, const std::string& ta
     }
 }
 
+// Can the renderer actually use this file?
+//
+// The registry also lists bitmap fonts (.fon: MS Sans Serif, Courier, Small Fonts,
+// Modern ...). They resolve to a real file, so the picker accepted them, saved them and
+// reported success - and then nothing changed on screen, because FreeType cannot rasterise
+// a bitmap font at all. Eleven such entries on this machine, and "I picked a font and the
+// UI font did not change" is exactly what that looks like from the outside.
+//
+// Extension first (cheap), then the four-byte signature that every TrueType/OpenType
+// file starts with, so a mislabelled file is caught too.
+bool isRenderableFontFile(const std::string& path) {
+    const std::string lower = core::lower(path);
+    const bool plausible = lower.size() > 4 &&
+                           (lower.compare(lower.size() - 4, 4, ".ttf") == 0 ||
+                            lower.compare(lower.size() - 4, 4, ".ttc") == 0 ||
+                            lower.compare(lower.size() - 4, 4, ".otf") == 0 ||
+                            lower.compare(lower.size() - 4, 4, ".otc") == 0);
+    if (!plausible) return false;
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    unsigned char header[4] = {0, 0, 0, 0};
+    in.read(reinterpret_cast<char*>(header), 4);
+    if (in.gcount() != 4) return false;
+    const unsigned int tag = (static_cast<unsigned int>(header[0]) << 24) |
+                             (static_cast<unsigned int>(header[1]) << 16) |
+                             (static_cast<unsigned int>(header[2]) << 8) |
+                             static_cast<unsigned int>(header[3]);
+    return tag == 0x00010000u ||   // TrueType outlines
+           tag == 0x4F54544Fu ||   // 'OTTO' - CFF outlines
+           tag == 0x74746366u ||   // 'ttcf' - TrueType collection
+           tag == 0x74727565u;     // 'true' - legacy Apple TrueType
+}
+
 // Resolve a font family to its font file for the given weight (300 light,
 // 400 regular, 700 bold). Reads both HKCU and HKLM (per-user fonts are in
 // HKCU and often point to a full path outside C:\Windows\Fonts).
+//
+// The registry is scanned once and cached: the font picker resolves every family it
+// offers (to filter out the ones that cannot be rendered) and every visible row of the
+// list resolves its own family for the preview, so a per-call scan would re-enumerate
+// ~400 registry values hundreds of times.
+struct FontRegistryEntry {
+    std::string display;  // value name, lower-cased, weight suffix included
+    std::string data;     // file name or full path
+};
+
+const std::vector<FontRegistryEntry>& fontRegistryEntries() {
+    static const std::vector<FontRegistryEntry> entries = [] {
+        std::vector<FontRegistryEntry> out;
+        auto readHive = [&out](HKEY root, const wchar_t* subkey) {
+            HKEY key = nullptr;
+            if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) return;
+            DWORD index = 0;
+            for (;;) {
+                wchar_t valueName[512];
+                wchar_t valueData[512];
+                DWORD nameSize = 512;
+                DWORD dataSize = 512 * sizeof(wchar_t);
+                const LONG result = RegEnumValueW(key, index, valueName, &nameSize, nullptr, nullptr,
+                                                  reinterpret_cast<LPBYTE>(valueData), &dataSize);
+                if (result != ERROR_SUCCESS) break;
+                ++index;
+                FontRegistryEntry entry;
+                entry.display = core::lower(core::toUtf8(valueName));
+                entry.data = core::toUtf8(valueData);
+                out.push_back(std::move(entry));
+            }
+            RegCloseKey(key);
+        };
+        readHive(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
+        readHive(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
+        return out;
+    }();
+    return entries;
+}
+
 std::string resolveFontFileForFamily(const std::string& family, int weight) {
     std::string regularFile, boldFile, lightFile;
     const std::string target = core::lower(family);
 
-    auto readHive = [&](HKEY root, const wchar_t* subkey) {
-        HKEY key = nullptr;
-        if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
-            return;
-        }
-        DWORD index = 0;
-        for (;;) {
-            wchar_t valueName[512];
-            wchar_t valueData[512];
-            DWORD nameSize = 512;
-            DWORD dataSize = 512 * sizeof(wchar_t);
-            const LONG result = RegEnumValueW(key, index, valueName, &nameSize, nullptr, nullptr,
-                                              reinterpret_cast<LPBYTE>(valueData), &dataSize);
-            if (result != ERROR_SUCCESS) break;
-            ++index;
+    for (const FontRegistryEntry& entry : fontRegistryEntries()) {
+        const std::string& name = entry.display;
+        const std::size_t paren = name.find(" (");
+        const std::string display = paren == std::string::npos ? name : name.substr(0, paren);
 
-            const std::string name = core::lower(core::toUtf8(valueName));
-            const std::string data = core::toUtf8(valueData);
-            const std::size_t paren = name.find(" (");
-            const std::string display = paren == std::string::npos ? name : name.substr(0, paren);
-
-            const std::string matched = matchingFamilyPart(display, target);
-            if (matched.empty()) continue;
-            const std::string rest = matched.substr(target.size());
-            const bool isBold = rest.find("bold") != std::string::npos ||
-                                rest.find("粗") != std::string::npos;
-            const bool isLight = rest.find("light") != std::string::npos ||
-                                 rest.find("细") != std::string::npos;
-            const bool isItalic = rest.find("italic") != std::string::npos ||
-                                  rest.find("oblique") != std::string::npos;
-            if (isItalic) continue;
-            if (isLight && lightFile.empty()) lightFile = data;
-            else if (isBold && boldFile.empty()) boldFile = data;
-            else if (!isBold && !isLight && regularFile.empty()) regularFile = data;
-        }
-        RegCloseKey(key);
-    };
-
-    readHive(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
-    readHive(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
+        const std::string matched = matchingFamilyPart(display, target);
+        if (matched.empty()) continue;
+        const std::string rest = matched.substr(target.size());
+        const bool isBold = rest.find("bold") != std::string::npos ||
+                            rest.find("粗") != std::string::npos;
+        const bool isLight = rest.find("light") != std::string::npos ||
+                             rest.find("细") != std::string::npos;
+        const bool isItalic = rest.find("italic") != std::string::npos ||
+                              rest.find("oblique") != std::string::npos;
+        if (isItalic) continue;
+        if (isLight && lightFile.empty()) lightFile = entry.data;
+        else if (isBold && boldFile.empty()) boldFile = entry.data;
+        else if (!isBold && !isLight && regularFile.empty()) regularFile = entry.data;
+    }
 
     std::string file;
     if (weight >= 700 && !boldFile.empty()) file = boldFile;
@@ -1027,7 +1082,28 @@ std::string resolveFontFileForFamily(const std::string& family, int weight) {
                            std::isalpha(static_cast<unsigned char>(file[0])) && file[1] == ':') ||
                           (file.size() >= 2 && file[0] == '\\' && file[1] == '\\') ||
                           (file.size() >= 1 && file[0] == '/');
-    return absolute ? file : "C:/Windows/Fonts/" + file;
+    const std::string full = absolute ? file : "C:/Windows/Fonts/" + file;
+    // Bitmap fonts resolve but cannot be rendered; treating them as "not found" makes
+    // the picker say so instead of silently keeping the old font.
+    return isRenderableFontFile(full) ? full : std::string();
+}
+
+// Every row of the font list is drawn *in that font*. A list of family names all
+// rendered in the current UI font tells the user nothing about what they are picking -
+// the name of a typeface is not the typeface.
+//
+// Handing TextBuilder a path instead of a family name is how the framework is asked for
+// a specific file (see TextPrimitive::Impl::resolveFontPath: anything containing a dot is
+// treated as a path). The registry lookup behind resolveFontFileForFamily is far too
+// expensive to run per row per frame, so results are cached, and only the rows that are
+// actually on screen are ever resolved.
+const std::string& fontPreviewFile(const std::string& family, int weight) {
+    static std::unordered_map<std::string, std::string> cache;
+    const std::string key = family + "|" + std::to_string(weight);
+    const auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+    const auto inserted = cache.emplace(key, resolveFontFileForFamily(family, weight));
+    return inserted.first->second;
 }
 #else
 // No system font enumeration off Windows; the picker shows a short fixed list.
@@ -1051,7 +1127,17 @@ const AccentPreset kAccentPresets[] = {
     {"橙", 0.96f, 0.55f, 0.15f},
     {"红", 0.91f, 0.31f, 0.38f},
     {"紫", 0.55f, 0.35f, 0.85f},
+    // Twelve instead of six: the second row of choices are all distinguishable from the
+    // first at a glance, and "I want a calmer blue" or "something warmer" now has an
+    // answer that is not a colour picker.
+    {"靛", 0.29f, 0.33f, 0.78f},
+    {"天蓝", 0.13f, 0.68f, 0.90f},
+    {"薄荷", 0.24f, 0.72f, 0.62f},
+    {"橄榄", 0.55f, 0.62f, 0.22f},
+    {"玫瑰", 0.93f, 0.45f, 0.60f},
+    {"石墨", 0.42f, 0.46f, 0.54f},
 };
+constexpr int kAccentPresetCount = static_cast<int>(sizeof(kAccentPresets) / sizeof(kAccentPresets[0]));
 
 void applyTheme() {
     if (settings.darkMode) {
@@ -1346,8 +1432,24 @@ void openSettingsDialog() {
             },
             [](const app::async::Result<FontListResult>& result) {
                 if (result.ok) {
-                    state.fontList = result.value.names;
-                    state.fontListHasChinese = result.value.hasChinese;
+                    // Offer only what can actually be rendered. GDI lists bitmap fonts too
+                    // (MS Sans Serif, Courier, Small Fonts ...), and picking one of those
+                    // used to save fine and change nothing on screen.
+                    std::vector<std::string> names;
+                    std::vector<char> hasChinese;
+                    names.reserve(result.value.names.size());
+                    hasChinese.reserve(result.value.names.size());
+                    for (std::size_t i = 0; i < result.value.names.size(); ++i) {
+                        if (resolveFontFileForFamily(result.value.names[i], settings.fontWeight).empty()) {
+                            continue;
+                        }
+                        names.push_back(result.value.names[i]);
+                        hasChinese.push_back(i < result.value.hasChinese.size()
+                                                 ? result.value.hasChinese[i]
+                                                 : static_cast<char>(1));
+                    }
+                    state.fontList = std::move(names);
+                    state.fontListHasChinese = std::move(hasChinese);
                 }
             });
     }
@@ -6165,9 +6267,44 @@ void composeRowMenu(eui::Ui& ui, float w, float h) {
 
 // A compact dropdown-like field with a popup that only exists while open
 // (avoids the always-present transparent popup layer that disturbs neighbors).
+//
+// The popup now eases in and out instead of appearing and vanishing between two frames.
+// The animation lives here rather than in a generic popup component because the popup is
+// built inline: a per-id progress plus a steady-clock delta is enough, and while it is
+// moving it asks for the next frame itself (app::requestUpdate), so nothing keeps
+// repainting once the popup has settled.
+namespace {
+struct DropdownAnim {
+    float t = 0.0f;   // 0 = closed, 1 = fully open
+    double lastMs = 0.0;
+};
+DropdownAnim& dropdownAnimFor(const std::string& id) {
+    static std::unordered_map<std::string, DropdownAnim> anims;
+    return anims[id];
+}
+double steadyMs() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+}  // namespace
+
 void composeOptionField(eui::Ui& ui, const std::string& id, float x, float y, float w,
                         const std::vector<std::string>& items, int selected, bool open,
                         std::function<void(int)> onSelect, std::function<void()> onToggle) {
+    constexpr float kAnimSeconds = 0.14f;
+    DropdownAnim& anim = dropdownAnimFor(id);
+    const double now = steadyMs();
+    const double elapsed = anim.lastMs > 0.0 ? (now - anim.lastMs) / 1000.0 : 0.016;
+    anim.lastMs = now;
+    const float target = open ? 1.0f : 0.0f;
+    const float step = static_cast<float>(std::min(0.05, elapsed) / kAnimSeconds);
+    anim.t = (target > anim.t) ? std::min(target, anim.t + step) : std::max(target, anim.t - step);
+    if (anim.t != target) app::requestUpdate();  // keep frames coming while it moves
+    const float eased = 1.0f - (1.0f - anim.t) * (1.0f - anim.t) * (1.0f - anim.t);
+    const float alpha = eased;
+    const float slide = (1.0f - eased) * 7.0f;  // lifts into place while fading in
+
     ui.rect(id + ".field")
         .x(x).y(y).size(w, 36.0f)
         .states(kSurface, kSurfaceHover, kSurfaceAct)
@@ -6191,27 +6328,28 @@ void composeOptionField(eui::Ui& ui, const std::string& id, float x, float y, fl
         .verticalAlign(eui::VerticalAlign::Center)
         .build();
 
-    if (!open) return;
+    if (anim.t <= 0.002f) return;  // fully closed
 
     const float itemH = 34.0f;
     const float popupH = itemH * static_cast<float>(items.size()) + 8.0f;
     ui.stack(id + ".popup")
-        .x(x).y(y + 40.0f).size(w, popupH)
+        .x(x).y(y + 40.0f + slide).size(w, popupH)
         .content([&] {
             ui.rect(id + ".popup.bg")
                 .size(w, popupH)
-                .color(kSurface)
+                .color(eui::Color{kSurface.r, kSurface.g, kSurface.b, alpha})
                 .radius(8.0f)
-                .border(1.0f, kBorder)
+                .border(1.0f, eui::Color{kBorder.r, kBorder.g, kBorder.b, kBorder.a * alpha})
                 .build();
             for (int i = 0; i < static_cast<int>(items.size()); ++i) {
                 const float iy = 4.0f + static_cast<float>(i) * itemH;
                 const bool active = (i == selected);
                 ui.rect(id + ".popup.item." + std::to_string(i))
                     .x(4.0f).y(iy).size(w - 8.0f, itemH)
-                    .states(active ? kAccentSoft : kClear,
-                            active ? kAccentSoft : kSurfaceHover,
-                            kSurfaceAct)
+                    .states(active ? eui::Color{kAccentSoft.r, kAccentSoft.g, kAccentSoft.b, kAccentSoft.a * alpha} : kClear,
+                            active ? eui::Color{kAccentSoft.r, kAccentSoft.g, kAccentSoft.b, kAccentSoft.a * alpha}
+                                   : eui::Color{kSurfaceHover.r, kSurfaceHover.g, kSurfaceHover.b, alpha},
+                            eui::Color{kSurfaceAct.r, kSurfaceAct.g, kSurfaceAct.b, alpha})
                     .radius(6.0f)
                     .onClick([onSelect, i] { onSelect(i); })
                     .build();
@@ -6219,7 +6357,10 @@ void composeOptionField(eui::Ui& ui, const std::string& id, float x, float y, fl
                     .x(16.0f).y(iy).size(w - 32.0f, itemH)
                     .text(items[i])
                     .fontSize(14.0f).lineHeight(14.0f)
-                    .color(active ? kInk : kMuted)
+                    .color([&] {
+                        const eui::Color base = active ? kInk : kMuted;
+                        return eui::Color{base.r, base.g, base.b, base.a * alpha};
+                    }())
                     .verticalAlign(eui::VerticalAlign::Center)
                     .build();
             }
@@ -6594,7 +6735,7 @@ void composeCommandOutputDialog(eui::Ui& ui, float w, float h) {
 void composeSettingsDialog(eui::Ui& ui, float w, float h) {
     // Responsive panel size so the settings stay fully visible on small windows.
     const float pw = std::min(560.0f, std::max(360.0f, w - 48.0f));
-    const float ph = std::min(520.0f, std::max(380.0f, h - 48.0f));
+    const float ph = std::min(560.0f, std::max(380.0f, h - 48.0f));
 
     components::dialog(ui, "settings.dialog")
         .screen(w, h)
@@ -6630,26 +6771,31 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .build();
 
             ui.text("settings.accent.label")
-                .x(200.0f).y(52.0f).size(60.0f, 28.0f)
+                .x(24.0f).y(100.0f).size(60.0f, 30.0f)
                 .text("主题色")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
-            for (int i = 0; i < 6; ++i) {
-                const AccentPreset& p = kAccentPresets[i];
-                const float sx = 262.0f + static_cast<float>(i) * 30.0f;
-                const bool active = std::fabs(settings.accentR - p.r) < 0.01f &&
-                                    std::fabs(settings.accentG - p.g) < 0.01f &&
-                                    std::fabs(settings.accentB - p.b) < 0.01f;
-                ui.rect("settings.accent." + std::to_string(i))
-                    .x(sx).y(52.0f).size(24.0f, 24.0f)
-                    .color(eui::Color{p.r, p.g, p.b, 1.0f})
-                    .radius(12.0f)
-                    .border(active ? 2.0f : 0.0f, active ? kInk : kClear)
-                    .onClick([r = p.r, g = p.g, b = p.b] { setAccentColor(r, g, b); })
-                    .build();
-            }
+              for (int i = 0; i < kAccentPresetCount; ++i) {
+                  const AccentPreset& p = kAccentPresets[i];
+                  // Two rows of six. One row of twelve ran past the dialog's right edge
+                  // (the card is ~460 logical px wide, and the swatches start at 262).
+                  // One row of twelve, aligned with the dropdown controls at x=90.
+                  
+                  const float sx = 90.0f + static_cast<float>(i) * 24.0f;
+                  const float sy = 101.0f;
+                  const bool active = std::fabs(settings.accentR - p.r) < 0.01f &&
+                                      std::fabs(settings.accentG - p.g) < 0.01f &&
+                                      std::fabs(settings.accentB - p.b) < 0.01f;
+                  ui.rect("settings.accent." + std::to_string(i))
+                      .x(sx).y(sy).size(20.0f, 20.0f)
+                      .color(eui::Color{p.r, p.g, p.b, 1.0f})
+                      .radius(10.0f)
+                      .border(active ? 2.0f : 0.0f, active ? kInk : kClear)
+                      .onClick([r = p.r, g = p.g, b = p.b] { setAccentColor(r, g, b); })
+                      .build();
+              }
 
             // Font label + scrollable font list (composed first so the dropdown
             // popups below render on top of it).
@@ -6659,7 +6805,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             // independently, and the label ended up drawn underneath the filter
             // checkbox - same x range, overlapping y.)
             ui.text("settings.font.label")
-                .x(24.0f).y(152.0f).size(46.0f, 34.0f)
+                .x(24.0f).y(200.0f).size(60.0f, 36.0f)
                 .text("字体")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
@@ -6717,7 +6863,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             }
 
             ui.stack("settings.font.search.wrap")
-                .x(pw - 24.0f - 190.0f).y(152.0f).size(190.0f, 34.0f)
+                .x(pw - 24.0f - 190.0f).y(200.0f).size(190.0f, 36.0f)
                 .content([&] {
                     components::input(ui, "settings.font.search")
                         .theme(themeTokens())
@@ -6730,7 +6876,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
             ui.stack("settings.font.cjk.wrap")
-                .x(76.0f).y(152.0f).size(210.0f, 34.0f)
+                .x(90.0f).y(200.0f).size(210.0f, 36.0f)
                 .content([&] {
                     components::checkbox(ui, "settings.font.cjk")
                         .size(210.0f, 34.0f)
@@ -6743,10 +6889,10 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
 
-            const float fontListH = std::max(60.0f, ph - 228.0f);
+            const float fontListH = std::max(60.0f, ph - 284.0f);
             if (state.fontList.empty()) {
                 ui.text("settings.font.loading")
-                    .x(24.0f).y(196.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(252.0f).size(pw - 48.0f, fontListH)
                     .text("正在加载字体…")
                     .fontSize(14.0f).lineHeight(14.0f)
                     .color(kMuted)
@@ -6755,7 +6901,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .build();
             } else {
                 ui.text("settings.font.count")
-                    .x(24.0f).y(188.0f).size(pw - 48.0f, 18.0f)
+                    .x(24.0f).y(244.0f).size(pw - 48.0f, 18.0f)
                     .text(visibleFonts.size() == state.fontList.size()
                               ? ("共 " + std::to_string(state.fontList.size()) + " 个字体")
                               : ("匹配 " + std::to_string(visibleFonts.size()) + " / " +
@@ -6767,7 +6913,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .horizontalAlign(eui::HorizontalAlign::Right)
                     .build();
                 ui.stack("settings.font.wrap")
-                    .x(24.0f).y(210.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(266.0f).size(pw - 48.0f, fontListH)
                     .content([&] {
                         ui.rect("settings.font.wrap.bg")
                             .size(pw - 48.0f, fontListH)
@@ -6817,6 +6963,9 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                             body.text(id + ".label")
                                                 .x(10.0f).y(0.0f).size(cw - 20.0f, rowH)
                                                 .text(name)
+                                                // Rendered in the family it names, so the
+                                                // list shows what each choice looks like.
+                                                .fontFamily(fontPreviewFile(name, settings.fontWeight))
                                                 .fontSize(14.0f).lineHeight(14.0f)
                                                 .color(selected ? kInk : kMuted)
                                                 .verticalAlign(eui::VerticalAlign::Center)
@@ -6838,14 +6987,14 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             const float groupW = labelW + labelGap + dropW + rowGap;
 
             ui.text("settings.weight.label")
-                .x(24.0f).y(112.0f).size(labelW, 36.0f)
+                .x(24.0f).y(160.0f).size(labelW, 36.0f)
                 .text("字重")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.weight",
-                               24.0f + labelW + labelGap, 108.0f, dropW,
+                               24.0f + labelW + labelGap, 156.0f, dropW,
                                {"细体", "常规", "粗体"},
                                settings.fontWeight <= 300 ? 0 : (settings.fontWeight >= 700 ? 2 : 1),
                                state.weightDropdownOpen,
@@ -6857,35 +7006,40 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
 
             const float fsX = 24.0f + groupW;
             ui.text("settings.fontsize.label")
-                .x(fsX).y(112.0f).size(labelW, 36.0f)
+                .x(fsX).y(160.0f).size(labelW, 36.0f)
                 .text("字号")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.fontsize",
-                               fsX + labelW + labelGap, 108.0f, dropW,
+                               fsX + labelW + labelGap, 156.0f, dropW,
                                {"小", "默认", "大", "特大"},
-                               settings.fontSizeScale <= 0.95f ? 0 :
-                               (settings.fontSizeScale >= 1.25f ? 3 :
-                                (settings.fontSizeScale >= 1.12f ? 2 : 1)),
+                               // The whole ladder moved up one step: what used to be 特大
+                               // (1.3) is what the default should look like, so 默认 is now
+                               // 1.3 and the sizes below/above follow. Comparing against a
+                               // stored value therefore keeps every existing setting at the
+                               // same *size* - 1.3 simply reads as 默认 now.
+                               settings.fontSizeScale <= 1.22f ? 0 :
+                               (settings.fontSizeScale >= 1.52f ? 3 :
+                                (settings.fontSizeScale >= 1.37f ? 2 : 1)),
                                state.fontSizeDropdownOpen,
                                [](int idx) {
-                                   selectFontScale(idx == 0 ? 0.9f : (idx == 2 ? 1.15f : (idx == 3 ? 1.3f : 1.0f)));
+                                   selectFontScale(idx == 0 ? 1.15f : (idx == 2 ? 1.45f : (idx == 3 ? 1.6f : 1.3f)));
                                    state.fontSizeDropdownOpen = false;
                                },
                                [] { state.fontSizeDropdownOpen = !state.fontSizeDropdownOpen; });
 
             const float scaleX = 24.0f + groupW * 2.0f;
             ui.text("settings.scale.label")
-                .x(scaleX).y(112.0f).size(labelW, 36.0f)
+                .x(scaleX).y(160.0f).size(labelW, 36.0f)
                 .text("界面大小")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.scale",
-                               scaleX + labelW + labelGap, 108.0f, dropW,
+                               scaleX + labelW + labelGap, 156.0f, dropW,
                                {"80%", "100%", "125%", "150%"},
                                settings.uiScale <= 0.85f ? 0 :
                                (settings.uiScale >= 1.4f ? 3 :
