@@ -14,6 +14,8 @@
 //
 // FAKE_PHONE_ROOT is the directory that plays the part of the phone's filesystem.
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -245,9 +247,27 @@ static int runFakeAdb(std::vector<std::string> args) {
         return 0;
     }
     if (command == "logcat") {
-        // Three stand-in lines; `-c`/`--clear` prints nothing, like the real thing.
+        // `-c`/`--clear` prints nothing, like the real thing.
         for (std::size_t j = i; j < args.size(); ++j) {
             if (args[j] == "-c" || args[j] == "--clear") return 0;
+        }
+        // Opt-in continuous stream (FAKE_LOGCAT_STREAM=1). It exists so the app's reader
+        // loop, its line cap and its stop path can be exercised against a stream that does
+        // not end on its own - three fixed lines could never reproduce "the app stays slow
+        // after closing logcat". Off by default because the test suite runs this command
+        // and expects it to return.
+        if (std::getenv("FAKE_LOGCAT_STREAM") != nullptr) {
+            long long counter = 0;
+            for (;;) {
+                const int level = static_cast<int>(counter % 3);
+                const char* tag = level == 0 ? "I" : (level == 1 ? "W" : "E");
+                std::printf("01-01 12:%02d:%02d.%03d  1234  5678 %s FakeTag : fake logcat line %lld\n",
+                            static_cast<int>((counter / 600) % 60),
+                            static_cast<int>((counter / 10) % 60),
+                            static_cast<int>((counter * 100) % 1000), tag, counter);
+                std::fflush(stdout);
+                ++counter;
+            }
         }
         std::printf("01-01 12:00:00.000  1234  5678 I FakeTag : fake logcat line 1\n");
         std::printf("01-01 12:00:00.100  1234  5678 W FakeTag : fake logcat line 2\n");

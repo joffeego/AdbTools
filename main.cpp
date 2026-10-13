@@ -447,6 +447,10 @@ struct AppState {
     float commandMenuY = 0.0f;
 
     bool bookmarkManageOpen = false;
+    // The "add" row in the manage dialog: a path and an optional alias, committed by the
+    // 添加 button or Enter. Kept in state so a half-typed path survives a rebuild.
+    std::string bookmarkNewPath;
+    std::string bookmarkNewAlias;
     bool commandManageOpen = false;
     bool commandOutputOpen = false;
     std::string commandOutputTitle;
@@ -1626,6 +1630,23 @@ std::string sanitizeAlias(const std::string& raw) {
         alias += c;
     }
     return core::trim(alias);
+}
+
+// Commit the manage dialog's "add" row. The path is normalised the way the rest of the
+// app writes paths (forward slashes, no trailing separator) and the alias falls back to
+// the last segment, so the shortcut is usable even when only a path was typed.
+void addBookmarkFromInputs() {
+    std::string path = core::trim(state.bookmarkNewPath);
+    if (path.empty()) return;
+    for (char& c : path) {
+        if (c == '\\') c = '/';
+    }
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
+    const std::string alias = sanitizeAlias(state.bookmarkNewAlias);
+    addBookmark(alias.empty() ? suggestedAlias(path) : alias, path);
+    state.bookmarkNewPath.clear();
+    state.bookmarkNewAlias.clear();
+    app::requestUpdate();
 }
 
 void promptBookmarkAlias(int index) {
@@ -4692,6 +4713,11 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
             movePathSuggestion(1);
         } else if (ev.key == eui::InputKey::Up) {
             movePathSuggestion(-1);
+        } else if (ev.key == eui::InputKey::Tab) {
+            // Tab reaches the completion list: the first press selects its first entry
+            // (the one the user is most likely after), further presses walk down it, and
+            // Enter commits whichever is selected.
+            movePathSuggestion(1);
         }
         return;
     }
@@ -5446,9 +5472,16 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
                 .x(x + w - 244.0f + slideX).y(y + 4.0f + slideY).size(228.0f, 32.0f)
                 .zIndex(20)
             .content([&] {
+                // The field stops 8px short of the X. It used to be 192 wide with the X
+                // starting at 196: the button sat right on the field's rounded edge, its
+                // hover background touched the input's border and a long filter text ran
+                // under the glyph - the two read as one overlapping blob.
+                constexpr float kCloseSize = 32.0f;
+                constexpr float kCloseRight = 4.0f;
+                const float closeX = 228.0f - kCloseRight - kCloseSize;
                 components::input(ui, "list.search.input")
                     .theme(themeTokens())
-                    .size(192.0f, 32.0f)
+                    .size(closeX - 8.0f, 32.0f)
                     .fontSize(13.0f)
                     .fontFamily("")
                     .placeholder("搜索文件…")
@@ -5460,9 +5493,9 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
                     })
                     .build();
                 ui.rect("list.search.close")
-                    .x(196.0f).y(0.0f).size(32.0f, 32.0f)
+                    .x(closeX).y(0.0f).size(kCloseSize, kCloseSize)
                     .states(kClear, kSurfaceHover, kSurfaceAct)
-                    .radius(6.0f)
+                    .radius(kCloseSize * 0.5f)  // round, so it reads as its own control
                     .onClick([] {
                         state.fileFilter.clear();
                         state.searchOpen = false;
@@ -5471,7 +5504,7 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
                     })
                     .build();
                 ui.text("list.search.close.icon")
-                    .x(196.0f).y(0.0f).size(32.0f, 32.0f)
+                    .x(closeX).y(0.0f).size(kCloseSize, kCloseSize)
                     .icon(0xF00D)
                     .fontSize(12.0f).lineHeight(12.0f)
                     .color(kMuted)
@@ -5935,6 +5968,16 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                         state.pathInput = v;
                         updatePathSuggestions();
                     })
+                    // Clicking anywhere else puts the breadcrumb back. The typed text is
+                    // deliberately kept: blur fires on press, before the click lands, so
+                    // clicking OK/Cancel must still see what was typed - the Cancel button
+                    // clears it, and the next edit re-seeds it from the current path.
+                    .onFocus([](bool focused) {
+                        if (focused) return;
+                        state.pathSuggestions.clear();
+                        state.pathSuggestionIndex = -1;
+                        state.pathEditing = false;
+                    })
                     .onEnter([] {
                         // Enter takes the highlighted suggestion when the arrows picked
                         // one, otherwise it commits exactly what was typed. A picked path
@@ -6241,7 +6284,7 @@ void composeTransferCard(eui::Ui& ui, float w, float h) {
             ui.text("transfer.card.hint")
                 .x(16.0f).y(54.0f).size(cw - 32.0f, 16.0f)
                 .text(ratio >= 1.0f ? "即将开始拖拽…" : "取到本地后即可拖到资源管理器")
-                .fontSize(11.5f).lineHeight(11.5f).color(kMuted)
+                .fontSize(12.0f).lineHeight(12.0f).color(kMuted)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
         })
@@ -6535,10 +6578,10 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
         .screen(w, h)
         .open(state.bookmarkManageOpen)
         .theme(themeTokens())
-        .size(460.0f, 420.0f)
+        .size(500.0f, 500.0f)
         .zIndex(1300)
         .content([&] {
-            const float pw = 460.0f, ph = 420.0f;
+            const float pw = 500.0f, ph = 500.0f;
             ui.text("bookmark.manage.title")
                 .x(24.0f).y(16.0f).size(pw - 48.0f, 30.0f)
                 .text("管理快捷路径")
@@ -6557,7 +6600,7 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                     .build();
             } else {
                 components::scrollView(ui, "bookmark.manage.list")
-                    .x(24.0f).y(60.0f).size(pw - 48.0f, ph - 60.0f - 56.0f)
+                    .x(24.0f).y(60.0f).size(pw - 48.0f, ph - 60.0f - 152.0f)
                     .theme(themeTokens())
                     .scrollbarWidth(8.0f).scrollbarGap(2.0f)
                     // The alias limit is part of the key: changing it has to
@@ -6586,7 +6629,7 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                                     // tells two bookmarks apart.
                                     body.text(id + ".path").x(10.0f).y(21.0f).size(textW, 15.0f)
                                         .text(core::shortenColumnsHead(b.path, pathColumns))
-                                        .fontSize(11.0f).lineHeight(11.0f).color(kMuted).build();
+                                        .fontSize(12.0f).lineHeight(12.0f).color(kMuted).build();
                                     body.rect(id + ".ren").x(cw - 104.0f).y(7.0f).size(46.0f, 26.0f)
                                         .states(kSurfaceHover, kSurfaceAct, kBorder)
                                         .radius(6.0f)
@@ -6613,6 +6656,49 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                     })
                     .build();
             }
+
+            // Add a shortcut without leaving this dialog: a path, an optional alias, and
+            // one button. Previously a path could only be saved from the folder itself
+            // (right-click → 添加当前路径), which meant "manage" could not actually add.
+            ui.text("bookmark.manage.new.label")
+                .x(24.0f).y(ph - 152.0f).size(60.0f, 36.0f)
+                .text("新增")
+                .fontSize(12.5f).lineHeight(12.5f)
+                .color(kMuted)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
+            ui.stack("bookmark.manage.new.path.wrap")
+                .x(90.0f).y(ph - 152.0f).size(248.0f, 36.0f)
+                .content([&] {
+                    components::input(ui, "bookmark.manage.new.path")
+                        .theme(themeTokens())
+                        .size(248.0f, 36.0f)
+                        .fontSize(13.0f)
+                        .fontFamily("")
+                        .placeholder("路径，如 /sdcard/DCIM")
+                        .value(state.bookmarkNewPath)
+                        .onChange([](const std::string& v) { state.bookmarkNewPath = v; })
+                        .onEnter([] { addBookmarkFromInputs(); })
+                        .build();
+                })
+                .build();
+            ui.stack("bookmark.manage.new.alias.wrap")
+                .x(346.0f).y(ph - 152.0f).size(84.0f, 36.0f)
+                .content([&] {
+                    components::input(ui, "bookmark.manage.new.alias")
+                        .theme(themeTokens())
+                        .size(84.0f, 36.0f)
+                        .fontSize(13.0f)
+                        .fontFamily("")
+                        .placeholder("别名")
+                        .value(state.bookmarkNewAlias)
+                        .onChange([](const std::string& v) { state.bookmarkNewAlias = v; })
+                        .onEnter([] { addBookmarkFromInputs(); })
+                        .build();
+                })
+                .build();
+            toolButton(ui, "bookmark.manage.new.add", 438.0f, ph - 152.0f, 38.0f, 36.0f,
+                       0xF067, "", true, true, [] { addBookmarkFromInputs(); });
 
             // The alias limit sits next to the labels it governs rather than in
             // 设置: it affects nothing else, and this is where they are visible.
@@ -6641,7 +6727,7 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
             ui.text("bookmark.manage.alias.hint")
                 .x(256.0f).y(ph - 56.0f).size(76.0f, 40.0f)
                 .text("中文算 2 个")
-                .fontSize(10.0f).lineHeight(10.0f)
+                .fontSize(12.0f).lineHeight(12.0f)
                 .color(kMuted)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
@@ -6754,9 +6840,9 @@ void composeCommandManageDialog(eui::Ui& ui, float w, float h) {
                                         .text(c.name).fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
                                     body.text(id + ".cmd").x(10.0f).y(21.0f).size(cw - 170.0f, 14.0f)
                                         .text(core::shortenColumns(c.command, columnsFitting(cw - 170.0f, 11.0f, kColumnEm)))
-                                        .fontSize(11.0f).lineHeight(11.0f).color(kMuted).build();
+                                        .fontSize(12.0f).lineHeight(12.0f).color(kMuted).build();
                                     body.text(id + ".type").x(cw - 160.0f).y(9.0f).size(100.0f, 18.0f)
-                                        .text(c.shell ? "adb shell" : "cmd").fontSize(11.0f).lineHeight(11.0f)
+                                        .text(c.shell ? "adb shell" : "cmd").fontSize(12.0f).lineHeight(12.0f)
                                         .color(c.shell ? kAccent : kAmber).horizontalAlign(eui::HorizontalAlign::Center).build();
                                     body.rect(id + ".del").x(cw - 54.0f).y(6.0f).size(46.0f, 26.0f)
                                         .states(kRose, eui::mixColor(kRose, kWhite, 0.12f), eui::mixColor(kRose, {0.0f, 0.0f, 0.0f, 1.0f}, 0.16f))
@@ -6872,6 +6958,11 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .text("主题色")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
+                // Right-aligned: the labels are 2, 3 and 4 characters wide, so
+                // left-aligning them gave every row a different gap to its control
+                // (105px, 87px, 30px on the same line). A form wants one label column
+                // with one right edge.
+                .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
               for (int i = 0; i < kAccentPresetCount; ++i) {
@@ -6881,7 +6972,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                   // One row of twelve, aligned with the dropdown controls at x=90.
                   
                   const float sx = 90.0f + static_cast<float>(i) * 24.0f;
-                  const float sy = 101.0f;
+                  const float sy = 105.0f;  // centred on the label box (100 + 30/2 - 20/2)
                   const bool active = std::fabs(settings.accentR - p.r) < 0.01f &&
                                       std::fabs(settings.accentG - p.g) < 0.01f &&
                                       std::fabs(settings.accentB - p.b) < 0.01f;
@@ -6906,6 +6997,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .text("下载目录")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             ui.stack("settings.downloaddir.wrap")
@@ -6956,6 +7048,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .text("字体")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
 
@@ -7053,7 +7146,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                               ? ("共 " + std::to_string(state.fontList.size()) + " 个字体")
                               : ("匹配 " + std::to_string(visibleFonts.size()) + " / " +
                                  std::to_string(state.fontList.size()) + " 个字体"))
-                    .fontSize(11.5f).lineHeight(11.5f)
+                    .fontSize(12.0f).lineHeight(12.0f)
                     .color(kMuted)
                     // Right-aligned so it sits under the search box it is describing; at
                     // the left edge it had the entire dialog width empty beside it.
@@ -7134,10 +7227,11 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             const float groupW = labelW + labelGap + dropW + rowGap;
 
             ui.text("settings.weight.label")
-                .x(24.0f).y(160.0f).size(labelW, 36.0f)
+                .x(24.0f).y(156.0f).size(labelW, 36.0f)
                 .text("字重")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.weight",
@@ -7153,10 +7247,11 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
 
             const float fsX = 24.0f + groupW;
             ui.text("settings.fontsize.label")
-                .x(fsX).y(160.0f).size(labelW, 36.0f)
+                .x(fsX).y(156.0f).size(labelW, 36.0f)
                 .text("字号")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.fontsize",
@@ -7179,10 +7274,11 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
 
             const float scaleX = 24.0f + groupW * 2.0f;
             ui.text("settings.scale.label")
-                .x(scaleX).y(160.0f).size(labelW, 36.0f)
+                .x(scaleX).y(156.0f).size(labelW, 36.0f)
                 .text("界面大小")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.scale",
@@ -7482,7 +7578,7 @@ void composeSetupDialog(eui::Ui& ui, float w, float h) {
             ui.text("setup.note")
                 .x(rowX).y(248.0f).size(rowW, 16.0f)
                 .text("也可以点「稍后再说」，之后在标题栏最左侧的更新按钮里单独安装。")
-                .fontSize(11.5f).lineHeight(11.5f)
+                .fontSize(12.0f).lineHeight(12.0f)
                 .color(kMuted)
                 .build();
 
@@ -7521,7 +7617,7 @@ void composeSetupDialog(eui::Ui& ui, float w, float h) {
                 .text(busy ? (state.updateStatus.empty() ? "正在处理…" : state.updateStatus)
                            : (anyMissing ? "缺少的组件下载完成后会立刻可用，不用重启。"
                                          : "adb 与 scrcpy 都已就绪。"))
-                .fontSize(11.5f).lineHeight(11.5f)
+                .fontSize(12.0f).lineHeight(12.0f)
                 .color(kMuted)
                 .build();
 
@@ -7608,7 +7704,7 @@ void composeExternalEditDialog(eui::Ui& ui, float w, float h) {
                 ui.text("extedit.row.status." + std::to_string(i))
                     .x(36.0f).y(rowY + 19.0f).size(pw - 48.0f - 200.0f, 18.0f)
                     .text(edit.status + "   " + edit.remote)
-                    .fontSize(11.0f).lineHeight(11.0f)
+                    .fontSize(12.0f).lineHeight(12.0f)
                     .color(edit.pendingPush ? kAccent : kMuted)
                     .build();
 
@@ -7759,7 +7855,11 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
                 .color(streaming ? kGreen : kMuted)
                 .verticalAlign(eui::VerticalAlign::Center).build();
             toolButton(ui, "logcat.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
-                       0xF00D, "", false, true, [] { state.logcatOpen = false; });
+                       0xF00D, "", false, true, [] {
+                           state.logcatOpen = false;
+                           stopLogcat();
+                           logcatRegexClear();
+                       });
 
             // Filter (case-insensitive regex).
             const float actionW = 104.0f;
@@ -7850,7 +7950,7 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
                         // first when something went wrong.
                         body.text("logcat.line." + std::to_string(i))
                             .x(4.0f).y(static_cast<float>(i) * 18.0f).size(cw - 8.0f, 18.0f)
-                            .text(shown[i]).fontSize(11.0f).lineHeight(11.0f)
+                            .text(shown[i]).fontSize(12.0f).lineHeight(12.0f)
                             .fontFamily("Consolas")
                             .color(logcatLevelColor(shown[i])).build();
                     }
@@ -8303,6 +8403,17 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeCommandMenu(ui, W, H);
             composeConfirmDialog(ui, W, H);
             composePromptDialog(ui, W, H);
+            // The logcat stream belongs to the dialog being open - not to whichever code
+            // path happened to close it. The X button and Escape both set the flag
+            // directly, and DialogBuilder::onOpenChange only fires when the *dialog*
+            // closes itself, so neither path ever called stopLogcat(). The reader thread
+            // then kept draining a flooding pipe at full speed and kept asking for a
+            // repaint every 30ms, which pinned a whole core and made the entire UI feel
+            // slow long after logcat was closed. Deriving it from the state covers every
+            // close path, including ones added later.
+            if (!state.logcatOpen && g_logcatRunning.load()) {
+                stopLogcat();
+            }
             // Click-away layer for the settings dropdowns: while one is open, a
             // full-window transparent rect sits under the dialog (zIndex below the
             // dialog's 1300, above the rest of the UI) and closes it. Without this the
