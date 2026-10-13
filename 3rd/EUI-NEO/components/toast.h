@@ -120,15 +120,19 @@ public:
                     .color(style_.text)
                     .build();
 
+                // Centred in the space under the title instead of pinned to its top. With
+                // the fixed 88px card and a one-line message the old layout left all the
+                // slack at the bottom, so the text read as sitting below the card's middle.
                 ui_.text(id_ + ".message")
                     .x(textX)
                     .y(metrics_.control.control)
-                    .size(textWidth, std::max(0.0f, height - 50.0f))
+                    .size(textWidth, std::max(0.0f, height - metrics_.control.control - metrics_.spacing.section))
                     .text(message_)
                     .fontSize(metrics_.typography.label)
                     .lineHeight(metrics_.typography.label + metrics_.typography.lineGap)
                     .maxWidth(textWidth)
                     .wrap(true)
+                    .verticalAlign(core::VerticalAlign::Center)
                     .color(style_.mutedText)
                     .build();
 

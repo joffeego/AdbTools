@@ -139,7 +139,12 @@ public:
 
 private:
     static float textWidth(const std::string& value, float fontSize) {
-        return core::TextPrimitive::measureTextWidth(value, {}, fontSize, 400);
+        // Measured at the size the text is actually drawn at. The renderer multiplies
+          // fontSize by the user's 字号 scale, so measuring the raw size made every box
+          // that is sized from text (checkbox/radio/switch hover highlights, button
+          // padding) too small as soon as the scale was above 1 - the highlight stopped
+          // covering the label.
+          return core::TextPrimitive::measureTextWidth(value, {}, fontSize * core::runtimeFontScale(), 400);
     }
 
     core::dsl::Ui& ui_;

@@ -177,8 +177,18 @@ constexpr float kWideColumnEm = 0.72f;
 // glyphs still overshoots it. Every alias is additionally capped by the user's
 // own length setting, and the menu reserves 24px of margin on the right, which
 // absorbs the difference in every realistic case.
+// Row pitches for the list-style dialogs (logcat, command output, font list). They are
+// functions, not constants: the user's 字号 can change while the app runs, and a pitch
+// captured once would leave every later line drawn into a box it no longer fits - which
+// is what "a line looks cut off by an invisible border" was.
+float logLinePitch() { return 20.0f * ::core::runtimeFontScale(); }
+float commandLinePitch() { return 24.0f * ::core::runtimeFontScale(); }
+float fontRowPitch() { return 28.0f * ::core::runtimeFontScale(); }
 int columnsFitting(float pixels, float fontSize, float perColumnEm) {
-    const float perColumn = fontSize * perColumnEm;
+    // The renderer draws at fontSize * 字号, so an estimate built from the raw size
+    // over-reports how much fits - at 字号 1.6 the device name ran past the selector's
+    // right edge. Scaling here fixes every caller at once.
+    const float perColumn = fontSize * ::core::runtimeFontScale() * perColumnEm;
     if (perColumn <= 0.0f) return 0;
     const int columns = static_cast<int>(pixels / perColumn);
     return columns < 0 ? 0 : columns;
@@ -532,6 +542,11 @@ struct AppState {
 
     // scrcpy screen mirroring (embedded window)
     bool scrcpyOpen = false;
+    // Screen recording started from the mirror window: `adb shell screenrecord` writes an
+    // mp4 on the device, stopping it sends SIGINT so the file is finalised, and the result
+    // is pulled into the download folder and handed to the system player.
+    bool mirrorRecording = false;
+    std::string mirrorRecordRemote;
     float logicalW = 1600.0f;
     float logicalH = 1000.0f;
 
@@ -3120,6 +3135,9 @@ void closeMirrorWindow() {
     state.scrcpyOpen = false;
 }
 
+// Defined further down, next to openWithDefaultProgram they use.
+void startMirrorRecording();
+void stopMirrorRecording();
 void composeMirrorWindow(eui::Ui& ui, const eui::Screen& screen) {
     const float W = screen.width;
     const float H = screen.height;
@@ -3141,11 +3159,31 @@ void composeMirrorWindow(eui::Ui& ui, const eui::Screen& screen) {
             // Theme-aware background + title bar (follows dark/light + accent).
             ui.rect("mirror.bg").size(W, H).color(kBackground).build();
             ui.rect("mirror.titlebar.bg").size(W, kTitleBarHeight).color(kTitleBar).build();
-            ui.rect("mirror.titlebar.drag").size(W - 46.0f, kTitleBarHeight).color(kClear)
+            ui.rect("mirror.titlebar.drag").size(W - 92.0f, kTitleBarHeight).color(kClear)
                 .onPress([](const eui::PointerEvent&, const eui::Rect&) { mirrorTitlePress(); })
                 .build();
             ui.text("mirror.titlebar.title").x(14.0f).y(0.0f).size(W - 60.0f, kTitleBarHeight)
                 .text("投屏").fontSize(13.0f).lineHeight(13.0f).color(kInk)
+                .verticalAlign(eui::VerticalAlign::Center).build();
+            // Record the device screen. One button, two states: a red dot when idle and a
+            // stop square while recording, with an accent-tinted background so the state is
+            // obvious at a glance. Stopping pulls the file and plays it.
+            ui.rect("mirror.titlebar.record.hit").x(W - 92.0f).y(0.0f).size(46.0f, kTitleBarHeight)
+                .states(state.mirrorRecording ? kAccentSoft : kClear, kSurfaceHover, kSurfaceAct)
+                .onClick([] {
+                    if (state.mirrorRecording) {
+                        stopMirrorRecording();
+                    } else {
+                        startMirrorRecording();
+                    }
+                })
+                .build();
+            ui.text("mirror.titlebar.record.icon").x(W - 92.0f).y(0.0f).size(46.0f, kTitleBarHeight)
+                .icon(state.mirrorRecording ? 0xF04D : 0xF111)
+                .fontSize(state.mirrorRecording ? 12.0f : 13.0f)
+                .lineHeight(13.0f)
+                .color(state.mirrorRecording ? kInk : kRose)
+                .horizontalAlign(eui::HorizontalAlign::Center)
                 .verticalAlign(eui::VerticalAlign::Center).build();
             ui.rect("mirror.titlebar.close.hit").x(W - 46.0f).y(0.0f).size(46.0f, kTitleBarHeight)
                 .states(kClear, kCloseHover, kClosePressed)
@@ -4214,6 +4252,95 @@ std::string localPathForRemote(const std::string& serial, const std::string& rem
 // Hands the file to whatever the user has associated with it. Returns false when
 // Windows has no program for that type, so the caller can say so instead of
 // silently doing nothing.
+bool openWithDefaultProgram(const std::string& localPath, std::string& err);
+
+// --- screen recording (mirror window) ----------------------------------------
+// Start: `adb shell screenrecord` on the device, spawned detached because it runs until it
+// is interrupted. Stop: SIGINT (pkill -INT) so screenrecord finalises the mp4 - killing it
+// outright leaves a file no player can open - then pull it into the download folder, clean
+// up the device copy and hand the local file to the system player.
+void startMirrorRecording() {
+    if (state.selectedDevice.empty()) {
+        toast("未选择设备", "请先连接并选择设备。");
+        return;
+    }
+    if (state.mirrorRecording) return;
+    if (state.adbPath.empty()) {
+        toast("未找到 adb", "无法开始录屏。");
+        return;
+    }
+    const long long ts = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    state.mirrorRecordRemote = "/sdcard/adbtools-record-" + std::to_string(ts) + ".mp4";
+    state.mirrorRecording = true;
+    const std::string adb = state.adbPath;
+    const std::string serial = state.selectedDevice;
+    const std::string remote = state.mirrorRecordRemote;
+#ifdef _WIN32
+    const std::wstring cmd = core::quoteWinArg(core::toWide(adb)) + L" -s " +
+                             core::quoteWinArg(core::toWide(serial)) +
+                             L" shell screenrecord --time-limit 300 " +
+                             core::quoteWinArg(core::toWide(remote));
+    std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
+    mutableCmd.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                       nullptr, nullptr, &si, &pi)) {
+        // No handle is kept: the process ends when the device-side recorder does.
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+#endif
+    toast("开始录屏", "再次点击红色方块停止，结束后会自动保存并播放。");
+    app::requestUpdate();
+}
+
+void stopMirrorRecording() {
+    if (!state.mirrorRecording) return;
+    state.mirrorRecording = false;
+    const std::string adb = state.adbPath;
+    const std::string serial = state.selectedDevice;
+    const std::string remote = state.mirrorRecordRemote;
+    const std::string dir = state.downloadDir;
+    const std::string base = remote.substr(remote.find_last_of('/') + 1);
+    const std::string local = dir + "\\" + base;
+    state.busy = true;
+    state.progress = -1.0f;
+    state.progressLabel = "正在保存录屏…";
+    app::async::runOnce(
+        uniqueAsyncKey("mirror.record.stop"),
+        [adb, serial, remote, local, dir]() -> app::async::Result<std::string> {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            // SIGINT lets screenrecord write the moov atom; without it the mp4 is broken.
+            runProcess(adb, {"-s", serial, "shell", "pkill", "-INT", "screenrecord"}, 15000);
+            std::this_thread::sleep_for(std::chrono::milliseconds(900));
+            ProcessResult pulled = runProcess(adb, core::pullArgs(serial, remote, local), 180000);
+            if (pulled.exitCode != 0) {
+                return app::async::failure<std::string>(
+                    core::trim(pulled.out).empty() ? "拉取录屏文件失败" : core::trim(pulled.out));
+            }
+            runProcess(adb, {"-s", serial, "shell", "rm", "-f", remote}, 15000);
+            return app::async::success(local);
+        },
+        [](const app::async::Result<std::string>& result) {
+            state.busy = false;
+            state.progress = 0.0f;
+            if (!result.ok) {
+                toast("录屏失败", result.error);
+                return;
+            }
+            std::string err;
+            if (openWithDefaultProgram(result.value, err)) {
+                toast("录屏已保存并播放", result.value);
+            } else {
+                toast("录屏已保存", result.value + "（" + err + "）");
+            }
+        });
+}
+
 bool openWithDefaultProgram(const std::string& localPath, std::string& err) {
 #ifdef _WIN32
     const std::wstring wide = core::toWide(localPath);
@@ -6057,16 +6184,21 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                 .clip()
                 .content([&] {
                     const std::vector<std::string> parts = core::splitPath(state.currentPath);
-                    const float fontSize = 13.0f;
-                    const float sepW = 16.0f;
+                    // One size for crumbs and separators: the 11pt separator used to sit
+                    // on a visibly different line from the 13pt labels.
+                    const float fontSize = 15.0f;
+                    const float sepW = 22.0f;
                     float cursorX = 6.0f;
 
                     auto addSegment = [&](const std::string& id, const std::string& label,
                                           const std::string& path, bool isLast) {
                         const float labelW = eui::measureTextWidth(label, {}, fontSize * ::core::runtimeFontScale()) + 24.0f;
+                        // Same box as the other crumbs (y=3, h-6). The last one used to
+                        // span the full bar height, which put its text a couple of pixels
+                        // below the rest of the path.
                         if (isLast) {
                             ui.text(id)
-                                .x(cursorX).y(0.0f).size(labelW, h)
+                                .x(cursorX).y(3.0f).size(labelW, h - 6.0f)
                                 .text(label)
                                 .fontSize(fontSize).lineHeight(fontSize)
                                 .color(kInk)
@@ -6099,7 +6231,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                             ui.text(id + ".sep")
                                 .x(cursorX).y(0.0f).size(sepW, h)
                                 .text(">")
-                                .fontSize(11.0f).lineHeight(11.0f)
+                                .fontSize(fontSize).lineHeight(fontSize)
                                 .color(kMuted)
                                 .horizontalAlign(eui::HorizontalAlign::Center)
                                 .verticalAlign(eui::VerticalAlign::Center)
@@ -6938,15 +7070,28 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                        });
 
             // Theme row: dark mode toggle + accent color swatches.
+            // The switch sits in the same control column as every other row (x=90) and
+            // its label is right-aligned in the same label column. Previously the switch
+            // started at x=24 with its text inside it, so the top of the dialog was
+            // shifted left while the rows below it were not - the page looked weighted
+            // to one side.
+            ui.text("settings.dark.label")
+                .x(24.0f).y(52.0f).size(60.0f, 28.0f)
+                .text("深色模式")
+                .fontSize(13.0f).lineHeight(13.0f)
+                .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
             ui.stack("settings.dark.wrap")
-                .x(24.0f).y(52.0f)
+                .x(90.0f).y(52.0f)
                 .content([&] {
                     components::toggleSwitch(ui, "settings.dark")
                         .theme(themeTokens())
-                        .size(150.0f, 28.0f)
+                        .size(120.0f, 28.0f)
                         .trackSize(40.0f, 22.0f)
                         .fontSize(13.0f)
-                        .text("深色模式")
+                        .text("")
                         .checked(settings.darkMode)
                         .onChange([](bool v) { setDarkMode(v); })
                         .build();
@@ -6972,7 +7117,10 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                   // One row of twelve, aligned with the dropdown controls at x=90.
                   
                   const float sx = 90.0f + static_cast<float>(i) * 24.0f;
-                  const float sy = 105.0f;  // centred on the label box (100 + 30/2 - 20/2)
+                  // 106, not 105: at 150% DPI a logical 105 lands on a half device pixel and the
+                    // circle's top row gets clipped - which read as a faint horizontal line
+                    // across the top of every swatch.
+                    const float sy = 106.0f;
                   const bool active = std::fabs(settings.accentR - p.r) < 0.01f &&
                                       std::fabs(settings.accentG - p.g) < 0.01f &&
                                       std::fabs(settings.accentB - p.b) < 0.01f;
@@ -7119,7 +7267,9 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .x(90.0f).y(248.0f).size(210.0f, 36.0f)
                 .content([&] {
                     components::checkbox(ui, "settings.font.cjk")
-                        .size(210.0f, 34.0f)
+                        // Same height as the wrapper, so the component's own vertical
+                        // centring lines up exactly with the label box beside it.
+                        .size(210.0f, 36.0f)
                         .text("只显示支持中文的字体")
                         .fontSize(12.5f)
                         .theme(themeTokens())
@@ -7818,10 +7968,28 @@ void composeDeviceInfoDialog(eui::Ui& ui, float w, float h) {
                     std::istringstream iss(state.deviceInfoText);
                     std::string line;
                     int i = 0;
+                    // Row pitch and font size follow the user's 字号. The pitch used to be
+                    // a fixed 20px while the text scaled, so at 字号 1.6 a line was drawn
+                    // into a box it no longer fitted and got cut off at the top.
+                    const float infoPitch = 22.0f * ::core::runtimeFontScale();
+                    const float lineW = cw - 8.0f;
+                    // Long values (a getprop line, a mount table entry) used to be drawn as
+                    // one row and simply ran past the dialog edge, so the tail was cut with
+                    // no ellipsis and no wrap. Measuring the line and giving it as many rows
+                    // as it needs keeps every character readable.
+                    float y = 0.0f;
                     while (std::getline(iss, line) && i < 200) {
+                        const float measured =
+                            eui::measureTextWidth(line, {}, 13.0f * ::core::runtimeFontScale());
+                        const int rows = std::max(
+                            1, static_cast<int>(std::ceil(measured / std::max(1.0f, lineW))));
+                        const float boxH = infoPitch * static_cast<float>(rows);
                         body.text("device.info.line." + std::to_string(i))
-                            .x(4.0f).y(static_cast<float>(i) * 20.0f).size(cw - 8.0f, 20.0f)
-                            .text(line).fontSize(12.0f).lineHeight(12.0f).color(kInk).build();
+                            .x(4.0f).y(y).size(lineW, boxH)
+                            .text(line).fontSize(13.0f).lineHeight(infoPitch * 0.8f)
+                            .maxWidth(lineW).wrap(true)
+                            .color(kInk).build();
+                        y += boxH;
                         ++i;
                     }
                 })
@@ -7949,7 +8117,7 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
                         // (E red, W amber, everything else ink) is what the eye looks for
                         // first when something went wrong.
                         body.text("logcat.line." + std::to_string(i))
-                            .x(4.0f).y(static_cast<float>(i) * 18.0f).size(cw - 8.0f, 18.0f)
+                            .x(4.0f).y(static_cast<float>(i) * logLinePitch()).size(cw - 8.0f, logLinePitch())
                             .text(shown[i]).fontSize(12.0f).lineHeight(12.0f)
                             .fontFamily("Consolas")
                             .color(logcatLevelColor(shown[i])).build();
@@ -7985,7 +8153,7 @@ void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
             // while somebody is actually searching.
             const int matchCount = static_cast<int>(state.textPreviewMatches.size());
             float inputY = 48.0f;
-            float inputH = ph - 48.0f - 56.0f;
+            float inputH = ph - 48.0f - 72.0f;   // 12px of air above the buttons
             if (state.textPreviewSearchOpen) {
                 ui.stack("text.preview.find.wrap")
                     .x(24.0f).y(44.0f).size(pw - 48.0f, 32.0f)
@@ -8027,7 +8195,7 @@ void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
                 toolButton(ui, "text.preview.find.close", 558.0f, 44.0f, 34.0f, 32.0f,
                            0xF00D, "", false, true, [] { closeTextPreviewSearch(); });
                 inputY = 88.0f;
-                inputH = ph - 88.0f - 56.0f;
+                inputH = ph - 88.0f - 72.0f;
             }
 
             ui.stack("text.preview.input.wrap")
@@ -8132,7 +8300,7 @@ void composePropertiesDialog(eui::Ui& ui, float w, float h) {
                     int i = 0;
                     while (std::getline(iss, line) && i < 40) {
                         body.text("file.properties.line." + std::to_string(i))
-                            .x(4.0f).y(static_cast<float>(i) * 22.0f).size(cw - 8.0f, 22.0f)
+                            .x(4.0f).y(static_cast<float>(i) * logLinePitch()).size(cw - 8.0f, logLinePitch())
                             .text(line).fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
                         ++i;
                     }
@@ -8246,7 +8414,7 @@ void composeHelpDialog(eui::Ui& ui, float w, float h) {
                     };
                     for (int i = 0; i < 11; ++i) {
                         body.text("help.line." + std::to_string(i))
-                            .x(4.0f).y(static_cast<float>(i) * 26.0f).size(cw - 8.0f, 26.0f)
+                            .x(4.0f).y(static_cast<float>(i) * fontRowPitch()).size(cw - 8.0f, fontRowPitch())
                             .text(lines[i]).fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
                     }
                 })

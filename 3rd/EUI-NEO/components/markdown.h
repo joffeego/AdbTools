@@ -278,11 +278,15 @@ inline float measureMarkdownTextWidth(const std::string& text,
                                       const std::string& fontFamily,
                                       float fontSize,
                                       int fontWeight) {
-    const float measured = core::TextPrimitive::measureTextWidth(text, fontFamily, fontSize, fontWeight);
+    // Scale-aware, like the checkbox/radio/switch helpers: the renderer draws at
+    // fontSize * 字号, so measuring the raw size under-reports and every box sized from
+    // the measurement (table columns, inline code padding) comes out narrow.
+    const float drawnSize = fontSize * core::runtimeFontScale();
+    const float measured = core::TextPrimitive::measureTextWidth(text, fontFamily, drawnSize, fontWeight);
     if (measured > 0.0f) {
         return measured;
     }
-    return static_cast<float>(text.size()) * std::max(1.0f, fontSize * 0.56f);
+    return static_cast<float>(text.size()) * std::max(1.0f, drawnSize * 0.56f);
 }
 
 inline std::string codeBlockDisplayText(const MarkdownBlock& block) {
