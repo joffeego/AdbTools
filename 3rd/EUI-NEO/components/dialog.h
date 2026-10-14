@@ -107,7 +107,9 @@ public:
         const float buttonWidth = std::max(96.0f, std::min(150.0f, (contentWidth - buttonGap) * 0.5f));
         const float buttonRowWidth = buttonWidth * 2.0f + buttonGap;
         const float visible = open_ ? 1.0f : 0.0f;
-        const float panelScale = open_ ? 1.0f : 0.965f;
+        // 0.94 rather than 0.965: there is no backdrop blur to lean on, so the scale carries
+        // the "material arriving" reading on its own.
+        const float panelScale = open_ ? 1.0f : 0.94f;
         const float panelOffsetY = open_ ? 0.0f : 14.0f;
         const std::function<void()> requestClose = closeCallback();
         const std::function<void()> onPrimary = onPrimary_;

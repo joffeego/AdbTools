@@ -106,7 +106,10 @@ constexpr eui::Color kWhite        {1.0f, 1.0f, 1.0f, 1.0f};
 constexpr eui::Color kCloseHover   {0.769f, 0.169f, 0.110f, 1.0f};
 constexpr eui::Color kClosePressed {0.580f, 0.100f, 0.070f, 1.0f};
 
-constexpr float kTitleBarHeight = 36.0f;
+// 32, like a macOS title bar. It was raised to 44 when the window controls were 44x44
+// squares; they are 12px dots now, and a tall bar around small dots read as empty space
+// above the toolbar. The toolbar below keeps its 44x44 buttons.
+constexpr float kTitleBarHeight = 32.0f;
 constexpr float kMirrorWindowWidth = 320.0f;
 constexpr float kMirrorWindowHeight = 640.0f;
 
@@ -322,7 +325,11 @@ struct AppSettings {
     std::string fontFile = "C:/Windows/Fonts/msyh.ttc";
     int fontWeight = 400;
     float uiScale = 1.0f;
+    // Resolved theme (what the UI actually uses) ...
     bool darkMode = true;
+    // ... and the user's choice behind it: 0 = 深色, 1 = 浅色, 2 = 跟随系统.
+    // -1 = not present in the settings file yet, derived from darkMode on load.
+    int themeMode = -1;
     float accentR = 0.25f;
     float accentG = 0.545f;
     float accentB = 0.945f;
@@ -879,6 +886,7 @@ void saveSettings() {
         {"fontWeight", std::to_string(settings.fontWeight)},
         {"uiScale", std::to_string(settings.uiScale)},
         {"darkMode", settings.darkMode ? "1" : "0"},
+        {"themeMode", std::to_string(settings.themeMode)},
         {"fontScale", std::to_string(settings.fontSizeScale)},
         {"downloadDir", settings.downloadDir},
         {"accent", std::to_string(settings.accentR) + "," + std::to_string(settings.accentG) + "," +
@@ -1173,26 +1181,106 @@ const AccentPreset kAccentPresets[] = {
 };
 constexpr int kAccentPresetCount = static_cast<int>(sizeof(kAccentPresets) / sizeof(kAccentPresets[0]));
 
-void applyTheme() {
-    if (settings.darkMode) {
-        kBackground   = {0.078f, 0.086f, 0.110f, 1.0f};
-        kSurface      = {0.125f, 0.137f, 0.169f, 1.0f};
-        kSurfaceHover = {0.176f, 0.196f, 0.239f, 1.0f};
-        kSurfaceAct   = {0.224f, 0.247f, 0.298f, 1.0f};
-        kInk          = {0.922f, 0.941f, 0.965f, 1.0f};
-        kMuted        = {0.545f, 0.600f, 0.675f, 1.0f};
-        kBorder       = {0.235f, 0.267f, 0.329f, 1.0f};
-        kTitleBar     = {0.102f, 0.114f, 0.145f, 1.0f};
-    } else {
-        kBackground   = {0.945f, 0.949f, 0.957f, 1.0f};
-        kSurface      = {1.0f, 1.0f, 1.0f, 1.0f};
-        kSurfaceHover = {0.900f, 0.906f, 0.918f, 1.0f};
-        kSurfaceAct   = {0.840f, 0.850f, 0.865f, 1.0f};
-        kInk          = {0.070f, 0.090f, 0.120f, 1.0f};
-        kMuted        = {0.420f, 0.450f, 0.490f, 1.0f};
-        kBorder       = {0.780f, 0.795f, 0.815f, 1.0f};
-        kTitleBar     = {0.910f, 0.920f, 0.938f, 1.0f};
+bool uiAnimationsEnabled();   // defined further down; used by the theme fade
+
+// The theme globals, as an array so they can be interpolated as a set.
+eui::Color* themeSlots(int index) {
+    switch (index) {
+        case 0: return &kBackground;
+        case 1: return &kSurface;
+        case 2: return &kSurfaceHover;
+        case 3: return &kSurfaceAct;
+        case 4: return &kInk;
+        case 5: return &kMuted;
+        case 6: return &kBorder;
+        default: return &kTitleBar;
     }
+}
+constexpr int kThemeSlotCount = 8;
+
+// The target palette for a given mode, without touching the globals.
+void themePalette(bool dark, eui::Color out[kThemeSlotCount]) {
+    if (dark) {
+        out[0] = {0.078f, 0.086f, 0.110f, 1.0f};
+        out[1] = {0.125f, 0.137f, 0.169f, 1.0f};
+        out[2] = {0.176f, 0.196f, 0.239f, 1.0f};
+        out[3] = {0.224f, 0.247f, 0.298f, 1.0f};
+        out[4] = {0.922f, 0.941f, 0.965f, 1.0f};
+        out[5] = {0.545f, 0.600f, 0.675f, 1.0f};
+        out[6] = {0.235f, 0.267f, 0.329f, 1.0f};
+        out[7] = {0.102f, 0.114f, 0.145f, 1.0f};
+    } else {
+        out[0] = {0.945f, 0.949f, 0.957f, 1.0f};
+        out[1] = {1.0f, 1.0f, 1.0f, 1.0f};
+        out[2] = {0.900f, 0.906f, 0.918f, 1.0f};
+        out[3] = {0.840f, 0.850f, 0.865f, 1.0f};
+        out[4] = {0.070f, 0.090f, 0.120f, 1.0f};
+        out[5] = {0.420f, 0.450f, 0.490f, 1.0f};
+        out[6] = {0.780f, 0.795f, 0.815f, 1.0f};
+        out[7] = {0.910f, 0.920f, 0.938f, 1.0f};
+    }
+}
+
+// Cross-fade for a theme change. Flipping the globals in one frame reads as a hard cut;
+// interpolating them makes every element that draws from the tokens fade across together.
+struct ThemeFade {
+    bool active = false;
+    float t = 1.0f;
+    double lastMs = 0.0;
+    eui::Color from[kThemeSlotCount];
+    eui::Color to[kThemeSlotCount];
+};
+ThemeFade g_themeFade;
+// False until the first palette has been applied. Gating the fade on g_themeFade.t instead
+// was a bug: t starts at 1, so the first switch took the instant path and left t at 1 -
+// every later switch did too, and the fade never ran.
+bool g_themeInitialized = false;
+
+void beginThemeFade(bool dark) {
+    if (!uiAnimationsEnabled() || !g_themeInitialized) {
+        // Nothing to fade from (first paint) or the OS asked for less motion.
+        themePalette(dark, g_themeFade.to);
+        for (int i = 0; i < kThemeSlotCount; ++i) *themeSlots(i) = g_themeFade.to[i];
+        g_themeFade.t = 1.0f;
+        g_themeFade.active = false;
+        g_themeInitialized = true;
+        return;
+    }
+    for (int i = 0; i < kThemeSlotCount; ++i) g_themeFade.from[i] = *themeSlots(i);
+    themePalette(dark, g_themeFade.to);
+    g_themeFade.t = 0.0f;
+    g_themeFade.active = true;
+    g_themeFade.lastMs = 0.0;
+}
+
+void updateThemeFade() {
+    if (!g_themeFade.active) return;
+    // 0.22s: long enough to read as a fade, short enough not to feel like waiting.
+    constexpr float kThemeFadeSeconds = 0.22f;
+    const double nowMs = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+    const double elapsed = g_themeFade.lastMs > 0.0 ? (nowMs - g_themeFade.lastMs) / 1000.0 : 0.016;
+    g_themeFade.lastMs = nowMs;
+    g_themeFade.t = std::min(1.0f, g_themeFade.t + static_cast<float>(elapsed) / kThemeFadeSeconds);
+    // Ease-in-out so the change has no visible start/stop.
+    const float e = g_themeFade.t * g_themeFade.t * (3.0f - 2.0f * g_themeFade.t);
+    for (int i = 0; i < kThemeSlotCount; ++i) {
+        *themeSlots(i) = eui::mixColor(g_themeFade.from[i], g_themeFade.to[i], e);
+    }
+    kAccentSoft = eui::mixColor(kAccent, kBackground, 0.72f);
+    app::requestUpdate();
+    if (g_themeFade.t >= 1.0f) {
+        g_themeFade.active = false;
+        for (int i = 0; i < kThemeSlotCount; ++i) *themeSlots(i) = g_themeFade.to[i];
+    }
+}
+
+void applyTheme() {
+    g_themeInitialized = true;
+    eui::Color palette[kThemeSlotCount];
+    themePalette(settings.darkMode, palette);
+    for (int i = 0; i < kThemeSlotCount; ++i) *themeSlots(i) = palette[i];
     kAccent = {settings.accentR, settings.accentG, settings.accentB, 1.0f};
     kAccentSoft = eui::mixColor(kAccent, kBackground, 0.72f);
     // Theme globals changed: also repaint the separate mirror (投屏) window.
@@ -1374,9 +1462,26 @@ void applyMinWindowSize() {
 #endif
 }
 
-void setDarkMode(bool dark) {
+// Resolve the three-way choice into the boolean the theme engine wants.
+void applyThemeMode() {
+    bool dark = (settings.themeMode != 1);   // 0 = dark, 1 = light
+    if (settings.themeMode == 2) dark = eui::platform::systemPrefersDark();
     settings.darkMode = dark;
-    applyTheme();
+    beginThemeFade(dark);   // cross-fades instead of cutting
+}
+
+void setThemeMode(int mode) {
+    settings.themeMode = std::clamp(mode, 0, 2);
+    applyThemeMode();
+    saveSettings();
+}
+
+// Kept for the other callers (menu, keyboard shortcut): they mean an explicit choice,
+// never "follow system".
+void setDarkMode(bool dark) {
+    settings.themeMode = dark ? 0 : 1;
+    settings.darkMode = dark;
+    beginThemeFade(dark);
     saveSettings();
 }
 
@@ -1411,6 +1516,7 @@ void loadSettings() {
         else if (key == "fontWeight") settings.fontWeight = std::atoi(value.c_str());
         else if (key == "uiScale") settings.uiScale = static_cast<float>(std::atof(value.c_str()));
         else if (key == "darkMode") settings.darkMode = (std::atoi(value.c_str()) != 0);
+        else if (key == "themeMode") settings.themeMode = std::atoi(value.c_str());
         else if (key == "fontScale") settings.fontSizeScale = static_cast<float>(std::atof(value.c_str()));
         else if (key == "downloadDir") settings.downloadDir = value;
         else if (key == "accent") {
@@ -1452,6 +1558,15 @@ void loadSettings() {
         // the menu drawing labels of an absurd length.
         settings.bookmarkAliasColumns = kAliasColumnsDefault;
     }
+
+    // A settings file written before the three-way theme option has no themeMode: take the
+    // old boolean as an explicit 深色 / 浅色 choice rather than silently switching the user
+    // to "follow system".
+    if (settings.themeMode < 0) {
+        settings.themeMode = settings.darkMode ? 0 : 1;
+    }
+    // Resolve now, so "follow system" is honoured from the first frame.
+    applyThemeMode();
 }
 
 void openSettingsDialog() {
@@ -3164,7 +3279,7 @@ void composeMirrorWindow(eui::Ui& ui, const eui::Screen& screen) {
             // Theme-aware background + title bar (follows dark/light + accent).
             ui.rect("mirror.bg").size(W, H).color(kBackground).build();
             ui.rect("mirror.titlebar.bg").size(W, kTitleBarHeight).color(kTitleBar).build();
-            ui.rect("mirror.titlebar.drag").size(W - 92.0f, kTitleBarHeight).color(kClear)
+            ui.rect("mirror.titlebar.drag").size(W - 88.0f, kTitleBarHeight).color(kClear)
                 .onPress([](const eui::PointerEvent&, const eui::Rect&) { mirrorTitlePress(); })
                 .build();
             ui.text("mirror.titlebar.title").x(14.0f).y(0.0f).size(W - 60.0f, kTitleBarHeight)
@@ -3173,7 +3288,7 @@ void composeMirrorWindow(eui::Ui& ui, const eui::Screen& screen) {
             // Record the device screen. One button, two states: a red dot when idle and a
             // stop square while recording, with an accent-tinted background so the state is
             // obvious at a glance. Stopping pulls the file and plays it.
-            ui.rect("mirror.titlebar.record.hit").x(W - 92.0f).y(0.0f).size(46.0f, kTitleBarHeight)
+            ui.rect("mirror.titlebar.record.hit").x(W - 88.0f).y(0.0f).size(44.0f, kTitleBarHeight)
                 .states(state.mirrorRecording ? kAccentSoft : kClear, kSurfaceHover, kSurfaceAct)
                 .onClick([] {
                     if (state.mirrorRecording) {
@@ -3183,19 +3298,19 @@ void composeMirrorWindow(eui::Ui& ui, const eui::Screen& screen) {
                     }
                 })
                 .build();
-            ui.text("mirror.titlebar.record.icon").x(W - 92.0f).y(0.0f).size(46.0f, kTitleBarHeight)
+            ui.text("mirror.titlebar.record.icon").x(W - 88.0f).y(0.0f).size(44.0f, kTitleBarHeight)
                 .icon(state.mirrorRecording ? 0xF04D : 0xF111)
                 .fontSize(state.mirrorRecording ? 12.0f : 13.0f)
                 .lineHeight(13.0f)
                 .color(state.mirrorRecording ? kInk : kRose)
                 .horizontalAlign(eui::HorizontalAlign::Center)
                 .verticalAlign(eui::VerticalAlign::Center).build();
-            ui.rect("mirror.titlebar.close.hit").x(W - 46.0f).y(0.0f).size(46.0f, kTitleBarHeight)
+            ui.rect("mirror.titlebar.close.hit").x(W - 44.0f).y(0.0f).size(44.0f, kTitleBarHeight)
                 .states(kClear, kCloseHover, kClosePressed)
                 .onClick([] { closeMirrorWindow(); })
                 .build();
-            ui.text("mirror.titlebar.close.icon").x(W - 46.0f).y(0.0f).size(46.0f, kTitleBarHeight)
-                .icon(0xF00D).fontSize(12.0f).lineHeight(12.0f).color(kInk)
+            ui.text("mirror.titlebar.close.icon").x(W - 44.0f).y(0.0f).size(44.0f, kTitleBarHeight)
+                .icon(0xF00D).fontSize(13.0f).lineHeight(13.0f).color(kInk)
                 .horizontalAlign(eui::HorizontalAlign::Center)
                 .verticalAlign(eui::VerticalAlign::Center).build();
 
@@ -5290,11 +5405,14 @@ Columns columns(float contentWidth) {
 
 void toolButton(eui::Ui& ui, const std::string& id, float x, float y, float w, float h,
                 unsigned int icon, const std::string& label, bool primary, bool enabled,
-                std::function<void()> onClick, float iconSize = 13.0f, float fontSize = 13.0f) {
-    eui::Color base = primary ? kAccent : kSurface;
-    eui::Color hover = primary ? eui::mixColor(kAccent, kWhite, 0.14f) : kSurfaceHover;
-    eui::Color pressed = primary ? eui::mixColor(kAccent, {0.0f, 0.0f, 0.0f, 1.0f}, 0.16f) : kSurfaceAct;
-    eui::Color textCol = primary ? kWhite : kInk;
+                std::function<void()> onClick, float iconSize = 16.0f, float fontSize = 13.0f) {
+    // A disabled primary keeps the plain surface look: leaving it accent-coloured made the
+    // most prominent button in the toolbar the one that could not be used.
+    const bool primaryLook = primary && enabled;
+    eui::Color base = primaryLook ? kAccent : kSurface;
+    eui::Color hover = primaryLook ? eui::mixColor(kAccent, kWhite, 0.14f) : kSurfaceHover;
+    eui::Color pressed = primaryLook ? eui::mixColor(kAccent, {0.0f, 0.0f, 0.0f, 1.0f}, 0.16f) : kSurfaceAct;
+    eui::Color textCol = primaryLook ? kWhite : kInk;
 
     ui.stack(id + ".wrap")
         .x(x).y(y).size(w, h)
@@ -5307,9 +5425,9 @@ void toolButton(eui::Ui& ui, const std::string& id, float x, float y, float w, f
                 .text(label)
                 .colors(base, hover, pressed)
                 .textColor(textCol)
-                .iconColor(primary ? textCol : kAccent)
+                .iconColor(primaryLook ? textCol : kAccent)
                 .radius(8.0f)
-                .border(1.0f, primary ? eui::mixColor(kAccent, kWhite, 0.25f) : kBorder)
+                .border(1.0f, primaryLook ? eui::mixColor(kAccent, kWhite, 0.25f) : kBorder)
                 .shadow(0.0f, 0.0f, 0.0f, kClear)
                 .transition(0.16f)
                 .disabled(!enabled)
@@ -5347,7 +5465,9 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
     eui::Color pressed = selected ? kAccentSoft : kSurfaceAct;
 
     unsigned int icon = e.isDir ? 0xF07B : (e.isLink ? 0xF0C1 : 0xF15B);
-    eui::Color iconColor = e.isDir ? kAmber : (e.isLink ? kAccent : kMuted);
+    // Folders follow the accent (theme) colour, like every other icon in the app. This used
+        // to be a hard-coded amber, which fought with the accent whenever the user changed it.
+        eui::Color iconColor = e.isDir ? kAccent : (e.isLink ? kAccent : kMuted);
 
     std::string displayName = e.name;
     if (e.isLink && !e.linkTarget.empty()) displayName += " \xE2\x86\x92 " + e.linkTarget;
@@ -5491,6 +5611,13 @@ void composeHeader(eui::Ui& ui, float x, float y, float w, float h) {
         .build();
 }
 
+// Whether the OS wants animations (Windows: "Show animations in Windows"). Cached: reading
+// it is a SystemParametersInfo call, and a change needs a restart to be picked up anyway.
+bool uiAnimationsEnabled() {
+    static const bool enabled = eui::platform::animationsEnabled();
+    return enabled;
+}
+
 void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
     ui.rect("list.bg")
         .x(x).y(y).size(w, h)
@@ -5529,9 +5656,35 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
     }
 
     if (state.devices.empty()) {
-        centeredMessage(ui, "list.nodev", x, y, w, h - 44.0f,
-                        "未连接设备。\n请开启 USB 调试并连接设备后刷新。");
-        toolButton(ui, "list.refreshdev", x + w * 0.5f - 80.0f, y + h - 48.0f, 160.0f, 36.0f,
+        // One group, centred: icon, title, hint and the button. The button used to be
+        // pinned to the panel's bottom edge - hundreds of pixels away from the sentence it
+        // belongs to - so the empty state read as two unrelated pieces.
+        constexpr float kGroupH = 152.0f;
+        const float groupY = y + (h - kGroupH) * 0.5f;
+        ui.text("list.nodev.icon")
+            .x(x).y(groupY).size(w, 32.0f)
+            .icon(0xF10B).fontSize(26.0f).lineHeight(26.0f)
+            .color(kMuted)
+            .horizontalAlign(eui::HorizontalAlign::Center)
+            .verticalAlign(eui::VerticalAlign::Center)
+            .build();
+        ui.text("list.nodev.title")
+            .x(x).y(groupY + 40.0f).size(w, 22.0f)
+            .text("未连接设备")
+            .fontSize(16.0f).lineHeight(16.0f)
+            .color(kInk)
+            .horizontalAlign(eui::HorizontalAlign::Center)
+            .verticalAlign(eui::VerticalAlign::Center)
+            .build();
+        ui.text("list.nodev.hint")
+            .x(x + 24.0f).y(groupY + 66.0f).size(std::max(0.0f, w - 48.0f), 20.0f)
+            .text("请开启 USB 调试并连接设备后刷新")
+            .fontSize(13.0f).lineHeight(13.0f)
+            .color(kMuted)
+            .horizontalAlign(eui::HorizontalAlign::Center)
+            .verticalAlign(eui::VerticalAlign::Center)
+            .build();
+        toolButton(ui, "list.refreshdev", x + w * 0.5f - 90.0f, groupY + 106.0f, 180.0f, 38.0f,
                    0xF021, "刷新设备", true, true, [] { refreshDevices(); });
         return;
     }
@@ -5582,7 +5735,7 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
     // down into place rather than appearing between two frames; the animation asks for
     // the next frame itself and stops once it has settled.
     {
-        constexpr float kSearchAnimSeconds = 0.16f;
+        const float kSearchAnimSeconds = uiAnimationsEnabled() ? 0.16f : 0.0f;
         static float searchAnimT = 0.0f;
         static double searchAnimLastMs = 0.0;
         const double nowMs = std::chrono::duration<double, std::milli>(
@@ -5650,7 +5803,25 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
 }
 
 void composeTitleBar(eui::Ui& ui, float W, float h) {
-    const float btnW = 46.0f;
+    // Title-bar controls, in two groups.
+    //
+    // Right: the window controls as macOS-style dots (12px, #FF5F57 / #FEBC2E / #28C840).
+    // The order and the semantics stay Windows (left to right: minimise, maximise, close)
+    // so muscle memory still works - only the look is macOS.
+    // Left of them: update / help / settings at 30x30 instead of 44x44. Once the window
+    // controls became small dots, 44px squares next to them looked like three more window
+    // buttons; 30px keeps them clearly secondary.
+    constexpr float kUtilW = 26.0f;
+    constexpr float kUtilGap = 4.0f;
+    constexpr float kDotSize = 12.0f;
+    constexpr float kDotPitch = 20.0f;
+    const float utilY = (h - kUtilW) * 0.5f;
+    const float dotY = (h - kDotSize) * 0.5f;
+    const float dotsW = kDotPitch * 2.0f + kDotSize;
+    const float utilBlockW = kUtilW * 3.0f + kUtilGap * 2.0f;
+    const float rightMargin = 14.0f;
+    const float dotsX = W - rightMargin - dotsW;
+    const float utilX = dotsX - 16.0f - utilBlockW;
     const bool maximized = app::isWindowMaximized();
 
     ui.rect("titlebar.bg")
@@ -5658,110 +5829,107 @@ void composeTitleBar(eui::Ui& ui, float W, float h) {
         .color(kTitleBar)
         .build();
 
-    // Draggable region (covers everything except the window control buttons).
+    // Draggable region (everything that is not a title-bar button).
     ui.rect("titlebar.drag")
-        .size(W - btnW * 6.0f, h)
+        .size(std::max(0.0f, utilX - 10.0f), h)
         .color(kClear)
         .onPress([](const eui::PointerEvent&, const eui::Rect&) { onTitleBarPress(); })
         .build();
 
     ui.text("titlebar.title")
-        .x(14.0f).y(0.0f).size(W - btnW * 6.0f - 28.0f, h)
+        .x(14.0f).y(0.0f).size(std::max(0.0f, utilX - 34.0f), h)
         .text(std::string("ADB 文件浏览器  v") + kAppVersion)
         .fontSize(13.0f).lineHeight(13.0f)
         .color(kMuted)
         .verticalAlign(eui::VerticalAlign::Center)
         .build();
 
-    // Update checker
-    ui.rect("titlebar.update.hit")
-        .x(W - btnW * 6.0f).y(0.0f).size(btnW, h)
-        .states(kClear, kSurfaceHover, kSurfaceAct)
-        .onClick([] { openUpdateDialog(); })
-        .build();
-    ui.text("titlebar.update.icon")
-        .x(W - btnW * 6.0f).y(0.0f).size(btnW, h)
-        .icon(0xF019)
-        .fontSize(14.0f).lineHeight(14.0f)
-        .color(kInk)
-        .horizontalAlign(eui::HorizontalAlign::Center)
-        .verticalAlign(eui::VerticalAlign::Center)
-        .build();
+    // Update / help / settings.
+    // Per-icon sizes: at one shared size the measured ink heights came out 18 / 19 / 21px
+    // (the gear is drawn taller than the download arrow), which reads as icons that are not
+    // on one line. These sizes equalise the ink to ~21px.
+    const unsigned int utilIcons[3] = {0xF019, 0xF059, 0xF013};
+    const float utilGlyphSizes[3] = {11.5f, 11.0f, 10.0f};
+    const char* utilIds[3] = {"titlebar.update", "titlebar.help", "titlebar.settings"};
+    for (int i = 0; i < 3; ++i) {
+        const float ux = utilX + static_cast<float>(i) * (kUtilW + kUtilGap);
+        ui.rect(std::string(utilIds[i]) + ".hit")
+            .x(ux).y(utilY).size(kUtilW, kUtilW)
+            .states(kClear, kSurfaceHover, kSurfaceAct)
+            .radius(7.0f)
+            .onClick([i] {
+                if (i == 0) {
+                    openUpdateDialog();
+                } else if (i == 1) {
+                    state.helpOpen = true;
+                } else {
+                    openSettingsDialog();
+                }
+            })
+            .build();
+        ui.text(std::string(utilIds[i]) + ".icon")
+            .x(ux).y(utilY).size(kUtilW, kUtilW)
+            .icon(utilIcons[i])
+            .fontSize(utilGlyphSizes[i]).lineHeight(utilGlyphSizes[i])
+            .color(kMuted)
+            .horizontalAlign(eui::HorizontalAlign::Center)
+            .verticalAlign(eui::VerticalAlign::Center)
+            .build();
+    }
 
-    // Help
-    ui.rect("titlebar.help.hit")
-        .x(W - btnW * 5.0f).y(0.0f).size(btnW, h)
-        .states(kClear, kSurfaceHover, kSurfaceAct)
-        .onClick([] { state.helpOpen = true; })
-        .build();
-    ui.text("titlebar.help.icon")
-        .x(W - btnW * 5.0f).y(0.0f).size(btnW, h)
-        .icon(0xF059)
-        .fontSize(14.0f).lineHeight(14.0f)
-        .color(kInk)
-        .horizontalAlign(eui::HorizontalAlign::Center)
-        .verticalAlign(eui::VerticalAlign::Center)
-        .build();
-
-    // Settings
-    ui.rect("titlebar.settings.hit")
-        .x(W - btnW * 4.0f).y(0.0f).size(btnW, h)
-        .states(kClear, kSurfaceHover, kSurfaceAct)
-        .onClick([] { openSettingsDialog(); })
-        .build();
-    ui.text("titlebar.settings.icon")
-        .x(W - btnW * 4.0f).y(0.0f).size(btnW, h)
-        .icon(0xF013)
-        .fontSize(14.0f).lineHeight(14.0f)
-        .color(kInk)
-        .horizontalAlign(eui::HorizontalAlign::Center)
-        .verticalAlign(eui::VerticalAlign::Center)
-        .build();
-
-    // Minimize
-    ui.rect("titlebar.min.hit")
-        .x(W - btnW * 3.0f).y(0.0f).size(btnW, h)
-        .states(kClear, kSurfaceHover, kSurfaceAct)
-        .onClick([] { app::minimizeWindow(); })
-        .build();
-    ui.text("titlebar.min.icon")
-        .x(W - btnW * 3.0f).y(0.0f).size(btnW, h)
-        .icon(0xF2D1)
-        .fontSize(12.0f).lineHeight(12.0f)
-        .color(kInk)
-        .horizontalAlign(eui::HorizontalAlign::Center)
-        .verticalAlign(eui::VerticalAlign::Center)
-        .build();
-
-    // Maximize / Restore
-    ui.rect("titlebar.max.hit")
-        .x(W - btnW * 2.0f).y(0.0f).size(btnW, h)
-        .states(kClear, kSurfaceHover, kSurfaceAct)
-        .onClick([] { app::toggleMaximizeWindow(); })
-        .build();
-    ui.text("titlebar.max.icon")
-        .x(W - btnW * 2.0f).y(0.0f).size(btnW, h)
-        .icon(maximized ? 0xF2D2 : 0xF2D0)
-        .fontSize(12.0f).lineHeight(12.0f)
-        .color(kInk)
-        .horizontalAlign(eui::HorizontalAlign::Center)
-        .verticalAlign(eui::VerticalAlign::Center)
-        .build();
-
-    // Close
-    ui.rect("titlebar.close.hit")
-        .x(W - btnW).y(0.0f).size(btnW, h)
-        .states(kClear, kCloseHover, kClosePressed)
-        .onClick([] { stopLogcat(); saveWindowState(); app::closeWindow(); })
-        .build();
-    ui.text("titlebar.close.icon")
-        .x(W - btnW).y(0.0f).size(btnW, h)
-        .icon(0xF00D)
-        .fontSize(13.0f).lineHeight(13.0f)
-        .color(kInk)
-        .horizontalAlign(eui::HorizontalAlign::Center)
-        .verticalAlign(eui::VerticalAlign::Center)
-        .build();
+    // Window controls: minimise (yellow), maximise (green), close (red).
+    struct DotSpec {
+        const char* id;
+        float r, g, b;
+        unsigned int glyph;
+        float glyphSize;
+        std::function<void()> action;
+    };
+    // All three sit on exactly the same baseline. The green one can read as slightly low
+    // because its higher luminance leaves its lower edge with the least contrast against a
+    // dark bar - measured, the three are pixel-identical (same rows), which is also how
+    // macOS draws them, so no optical offset is applied.
+    const DotSpec dots[3] = {
+        {"titlebar.min", 0.996f, 0.737f, 0.180f, 0xF068, 7.0f, [] { app::minimizeWindow(); }},
+        {"titlebar.max", 0.157f, 0.784f, 0.251f, 0xF065, 6.5f,
+         [] { app::toggleMaximizeWindow(); }},
+        {"titlebar.close", 1.000f, 0.373f, 0.341f, 0xF00D, 7.0f,
+         [] { stopLogcat(); saveWindowState(); app::closeWindow(); }},
+    };
+    for (const DotSpec& d : dots) {
+        const float dx = dotsX + static_cast<float>(&d - dots) * kDotPitch;
+        // A 22px hit area around a 12px dot: the dot is the visual, the hit area is what a
+        // mouse can actually land on.
+        const float hitInset = (kDotSize - 22.0f) * 0.5f;
+        // kTitleBar, not kClear: the framework does not hit-test an element whose state
+        // colours are all fully transparent, so a kClear hit area swallows nothing and the
+        // dots were unclickable. Painting the bar colour is visually identical here.
+        ui.rect(std::string(d.id) + ".hit")
+            .x(dx + hitInset).y(dotY + hitInset).size(22.0f, 22.0f)
+            .states(kTitleBar, kTitleBar, kTitleBar)
+            .onClick(d.action)
+            .build();
+        // The handler goes on the dot as well as on the hit area: the dot is drawn on top
+        // and is itself hit-testable, so without this it swallowed every click.
+        ui.rect(std::string(d.id) + ".dot")
+            .x(dx).y(dotY).size(kDotSize, kDotSize)
+            .onClick(d.action)
+            .states(eui::Color{d.r, d.g, d.b, 1.0f},
+                    eui::mixColor(eui::Color{d.r, d.g, d.b, 1.0f}, eui::Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.12f),
+                    eui::mixColor(eui::Color{d.r, d.g, d.b, 1.0f}, eui::Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.24f))
+            .radius(kDotSize * 0.5f)
+            .build();
+        // The glyph only appears while the pointer is over that dot, like macOS.
+        ui.text(std::string(d.id) + ".glyph")
+            .x(dx).y(dotY).size(kDotSize, kDotSize)
+            .icon(d.glyph)
+            .fontSize(d.glyphSize).lineHeight(d.glyphSize)
+            .color(eui::Color{0.0f, 0.0f, 0.0f, 0.55f})
+            .horizontalAlign(eui::HorizontalAlign::Center)
+            .verticalAlign(eui::VerticalAlign::Center)
+            .hoverOpacityFrom(std::string(d.id) + ".hit")
+            .build();
+    }
 }
 
 // A small hover label that appears below an element (never covering it).
@@ -5810,15 +5978,17 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
     // Instead of guessing a minimum, the buttons now shrink until both groups fit, and
     // only if even the smallest size does not fit does the device selector give up width
     // as well. Everything stays reachable; nothing is hidden behind an overflow menu.
-    constexpr float kButtonSizes[] = {44.0f, 40.0f, 36.0f, 32.0f};
+    // The first entry is the ceiling the animated button height is clamped to, so it has to
+// follow topBarH - otherwise the row grows but the buttons stay pinned at the old size.
+constexpr float kButtonSizes[] = {60.0f, 54.0f, 48.0f, 42.0f};
     // 9 tool icons on the left, 5 file actions on the right. Getting these counts wrong
     // is not cosmetic: the first version said 15 + 5, which over-reserved six buttons and
     // left a ~220px dead gap between the two groups.
     constexpr int kToolIcons = 9;
     constexpr int kFileActions = 5;
-    const float gap = 6.0f;          // the constant the placement code below uses
+    const float gap = 5.0f;          // 5, not 6: the device row wants every pixel it can get
     const auto neededWidth = [&](float buttonH, float selectorW) {
-        return selectorW + (kToolIcons + kFileActions) * (buttonH + gap) + 24.0f;
+        return selectorW + (kToolIcons + kFileActions) * (buttonH + gap) + 16.0f;
     };
     // Continuous, animated button size. The ladder used to snap between 44/40/36/32 as the
     // window narrowed, so the icons visibly jumped a step at a time - which reads as
@@ -5826,8 +5996,13 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
     // (computed continuously) and the drawn size eases toward it over ~140ms.
     float devW = 200.0f;
     float targetH = kButtonSizes[3];
+    // No device: the selector only has to hold "无设备", so it gives the toolbar back the
+    // 60px it was wasting on empty space.
+    // 160, not 140: the label box is (devW - 74) wide, and 140 left only 66px for
+    // "无设备" at the user's 字号 - it came out as "无设…".
+    const float selectorFullW = state.selectedDevice.empty() ? 160.0f : 200.0f;
     float targetDevW = 150.0f;
-    for (float selectorW : {200.0f, 150.0f}) {
+    for (float selectorW : {selectorFullW, 150.0f}) {
         // Solve neededWidth(h, selectorW) <= w for h, then clamp into the ladder's range.
         const float fits = (w - 24.0f - selectorW) /
                                static_cast<float>(kToolIcons + kFileActions) - gap;
@@ -5838,7 +6013,10 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
         if (neededWidth(targetH, selectorW) <= w || selectorW == 150.0f) break;
     }
     {
-        constexpr float kToolbarAnimSeconds = 0.14f;
+        // Reduced motion: snap straight to the target instead of easing there. The toolbar
+        // resizes on every window-width change, which is exactly the kind of continuous
+        // motion the OS setting is meant to quiet down.
+        const float kToolbarAnimSeconds = uiAnimationsEnabled() ? 0.14f : 0.0f;
         const double nowMs = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count();
@@ -5906,7 +6084,7 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
 
     // Refresh-devices button.
     toolButton(ui, "topbar.refreshdev", x + devW + 6.0f, y, h, h, 0xF021, "", false, true,
-               [] { refreshDevices(); });
+               [] { refreshDevices(); }, 16.0f);
     composeHoverTip(ui, "topbar.refreshdev.tip", "topbar.refreshdev.bg",
                     "刷新设备", x + devW + 6.0f + h * 0.5f, y + h + 4.0f);
 
@@ -5916,14 +6094,14 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
                    state.commandMenuOpen = true;
                    state.commandMenuX = cmdX;
                    state.commandMenuY = y + h + 4.0f;
-               });
+               }, 16.0f);
     composeHoverTip(ui, "topbar.command.tip", "topbar.command.bg",
                     "常用命令", cmdX + h * 0.5f, y + h + 4.0f);
 
     // Device tools + view options.
     const float ssX = cmdX + h + 6.0f;
     toolButton(ui, "topbar.screenshot", ssX, y, h, h, 0xF030, "", false, !state.selectedDevice.empty(),
-               [] { doScreenshot(); });
+               [] { doScreenshot(); }, 16.0f);
     composeHoverTip(ui, "topbar.screenshot.tip", "topbar.screenshot.bg", "截图", ssX + h * 0.5f, y + h + 4.0f);
     const float apkX = ssX + h + 6.0f;
     // 0xF49E is fa-box-open as it exists in the Free Solid font. The codepoint used
@@ -5933,11 +6111,11 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
     // with a third. tests/test_icons.cpp now checks every codepoint used here
     // against the shipped font file, so this cannot slip through again.
     toolButton(ui, "topbar.install", apkX, y, h, h, 0xF49E, "", false, !state.selectedDevice.empty(),
-               [] { doInstallApk(); });
+               [] { doInstallApk(); }, 16.0f);
     composeHoverTip(ui, "topbar.install.tip", "topbar.install.bg", "安装 APK", apkX + h * 0.5f, y + h + 4.0f);
     const float infoX = apkX + h + 6.0f;
     toolButton(ui, "topbar.info", infoX, y, h, h, 0xF05A, "", false, !state.selectedDevice.empty(),
-               [] { openDeviceInfo(); });
+               [] { openDeviceInfo(); }, 16.0f);
     composeHoverTip(ui, "topbar.info.tip", "topbar.info.bg", "设备信息", infoX + h * 0.5f, y + h + 4.0f);
     const float logcatX = infoX + h + 6.0f;
     // Thin separators so fifteen equally sized icons read as groups (devices / tools /
@@ -5950,16 +6128,16 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
     };
     groupSeparator(logcatX);
     toolButton(ui, "topbar.logcat", logcatX, y, h, h, 0xF15C, "", false, !state.selectedDevice.empty(),
-               [] { openLogcat(); });
+               [] { openLogcat(); }, 16.0f);
     composeHoverTip(ui, "topbar.logcat.tip", "topbar.logcat.bg", "logcat", logcatX + h * 0.5f, y + h + 4.0f);
     const float hiddenX = logcatX + h + 6.0f;
     toolButton(ui, "topbar.hidden", hiddenX, y, h, h, state.showHidden ? 0xF06E : 0xF070, "", false, true,
-               [] { state.showHidden = !state.showHidden; refreshListing(); saveSettings(); });
+               [] { state.showHidden = !state.showHidden; refreshListing(); saveSettings(); }, 16.0f);
     composeHoverTip(ui, "topbar.hidden.tip", "topbar.hidden.bg",
                     state.showHidden ? "隐藏文件已显示" : "显示隐藏文件", hiddenX + h * 0.5f, y + h + 4.0f);
     const float mirrorX = hiddenX + h + 6.0f;
     toolButton(ui, "topbar.mirror", mirrorX, y, h, h, 0xF108, "", false, !state.selectedDevice.empty(),
-               [] { openMirror(); });
+               [] { openMirror(); }, 16.0f);
     composeHoverTip(ui, "topbar.mirror.tip", "topbar.mirror.bg", "投屏", mirrorX + h * 0.5f, y + h + 4.0f);
 
     // Files opened in an external editor; highlighted while something is unsynced.
@@ -5975,25 +6153,30 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
             : ("外部编辑：" + std::to_string(state.externalEdits.size()) + " 个文件" +
                (extPending > 0 ? "，" + std::to_string(extPending) + " 个待同步" : ""));
     toolButton(ui, "topbar.extedit", extX, y, h, h, 0xF044, "", extPending > 0, true,
-               [] { state.externalEditListOpen = true; });
+               [] { state.externalEditListOpen = true; }, 16.0f);
     composeHoverTip(ui, "topbar.extedit.tip", "topbar.extedit.bg", extTip, extX + h * 0.5f, y + h + 4.0f);
 
     // Right-aligned file actions (always icon-only, described by tooltips).
     const bool canAct = !state.selectedEntry.empty();
+      // Upload and "new folder" act on the current directory, so they need a device - not a
+      // selection. Binding them to canAct greyed them out in a perfectly writable folder.
+      const bool hasDevice = !state.selectedDevice.empty();
     float rightX = x + w;
     auto place = [&](const std::string& id, unsigned int icon, bool primary, bool enabled,
                      std::function<void()> cb, const std::string& tip) {
-        rightX -= 44.0f;
-        toolButton(ui, id, rightX, y, 44.0f, h, icon, "", primary, enabled, std::move(cb));
-        composeHoverTip(ui, id + ".tip", id + ".bg", tip, rightX + 22.0f, y + h + 4.0f);
+        rightX -= h;   // h x h: square like the tool icons, and it stays square while the
+                       // toolbar animates on a narrow window (it used to be a fixed 44 wide,
+                       // so it became 44x41 and stopped being 1:1).
+        toolButton(ui, id, rightX, y, h, h, icon, "", primary, enabled, std::move(cb), 16.0f);
+        composeHoverTip(ui, id + ".tip", id + ".bg", tip, rightX + h * 0.5f, y + h + 4.0f);
         rightX -= 6.0f;
     };
 
     place("topbar.delete", 0xF1F8, false, canAct, [] { confirmDelete(); }, "删除");
     place("topbar.rename", 0xF303, false, canAct, [] { promptRename(); }, "重命名");
     place("topbar.download", 0xF019, false, canAct, [] { doPull(); }, "下载");
-    place("topbar.newfolder", 0xF65E, false, true, [] { promptNewFolder(); }, "新建文件夹");
-    place("topbar.upload", 0xF093, true, true, [] { doPush(); }, "上传");
+    place("topbar.newfolder", 0xF65E, false, hasDevice, [] { promptNewFolder(); }, "新建文件夹");
+    place("topbar.upload", 0xF093, true, hasDevice, [] { doPush(); }, "上传");
 }
 
 // Query directory name suggestions that match the path being typed.
@@ -6088,18 +6271,18 @@ void cancelPathEdit() {
 void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
     const float navW = h;
     const float step = navW + 8.0f;
-    toolButton(ui, "path.back", x, y, navW, h, 0xF053, "", false, !state.pathBack.empty(), [] { goBack(); });
-    toolButton(ui, "path.forward", x + step, y, navW, h, 0xF054, "", false, !state.pathForward.empty(), [] { goForward(); });
-    toolButton(ui, "path.up", x + step * 2.0f, y, navW, h, 0xF062, "", false, true, [] { goUp(); });
+    toolButton(ui, "path.back", x, y, navW, h, 0xF053, "", false, !state.pathBack.empty(), [] { goBack(); }, 16.0f);
+    toolButton(ui, "path.forward", x + step, y, navW, h, 0xF054, "", false, !state.pathForward.empty(), [] { goForward(); }, 16.0f);
+    toolButton(ui, "path.up", x + step * 2.0f, y, navW, h, 0xF062, "", false, true, [] { goUp(); }, 16.0f);
     toolButton(ui, "path.refresh", x + step * 3.0f, y, navW, h, 0xF021, "", false, true,
-               [] { refreshListing(true); });
+               [] { refreshListing(true); }, 16.0f);
     const float bookX = x + step * 4.0f;
     toolButton(ui, "path.bookmark", bookX, y, navW, h, 0xF005, "", false, true,
                [bookX, y, h] {
                    state.bookmarkMenuOpen = true;
                    state.bookmarkMenuX = bookX;
                    state.bookmarkMenuY = y + h + 4.0f;
-               });
+               }, 16.0f);
     composeHoverTip(ui, "path.bookmark.tip", "path.bookmark.bg",
                     "快捷路径", bookX + h * 0.5f, y + h + 4.0f);
 
@@ -6222,12 +6405,12 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                     auto addSegment = [&](const std::string& id, const std::string& label,
                                           const std::string& path, bool isLast) {
                         const float labelW = eui::measureTextWidth(label, {}, fontSize * ::core::runtimeFontScale()) + 24.0f;
-                        // Same box as the other crumbs (y=3, h-6). The last one used to
-                        // span the full bar height, which put its text a couple of pixels
-                        // below the rest of the path.
+                        // Same box as the other crumbs. Measured on screen: this one still
+                        // sat 3 device px below the rest of the path, so it gets the same
+                        // two logical pixels of lift the separators needed.
                         if (isLast) {
                             ui.text(id)
-                                .x(cursorX).y(3.0f).size(labelW, h - 6.0f)
+                                .x(cursorX).y(-1.0f).size(labelW, h - 2.0f)
                                 .text(label)
                                 .fontSize(fontSize).lineHeight(fontSize)
                                 .color(kInk)
@@ -6236,7 +6419,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                                 .build();
                         } else {
                             ui.stack(id)
-                                .x(cursorX).y(3.0f).size(labelW, h - 6.0f)
+                                .x(cursorX).y(1.0f).size(labelW, h - 2.0f)
                                 .content([&] {
                                     ui.rect(id + ".bg")
                                         .size(labelW, h - 6.0f)
@@ -6257,11 +6440,11 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                         }
                         cursorX += labelW;
                         if (!isLast) {
-                            // Nudged down: text now centres on the font em box, and a
-                            // small glyph like ">" then sits visibly above the words it
-                            // separates. Optically it belongs on the x-height.
+                            // Measured on screen: with em-box centring the ">" glyph's ink
+                            // lands ~7 device px below the labels' line, so it is nudged up
+                            // (y = -3 logical) to sit on the same baseline.
                             ui.text(id + ".sep")
-                                .x(cursorX).y(2.0f).size(sepW, h)
+                                .x(cursorX).y(-3.0f).size(sepW, h)
                                 .text(">")
                                 .fontSize(fontSize).lineHeight(fontSize)
                                 .color(kMuted)
@@ -6290,7 +6473,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
               const float searchBtnW = editW;
               const float searchBtnX = crumbW - editW * 2.0f - 8.0f;
               ui.rect("breadcrumb.search.hit")
-                  .x(searchBtnX).y(3.0f).size(searchBtnW, h - 6.0f)
+                  .x(searchBtnX).y(1.0f).size(searchBtnW, h - 2.0f)
                   .states(state.searchOpen ? kAccentSoft : kClear, kSurfaceHover, kSurfaceAct)
                   .radius(6.0f)
                   .onClick([] {
@@ -6303,23 +6486,23 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                   })
                   .build();
               ui.text("breadcrumb.search.icon")
-                  .x(searchBtnX).y(3.0f).size(searchBtnW, h - 6.0f)
+                  .x(searchBtnX).y(1.0f).size(searchBtnW, h - 2.0f)
                   .icon(0xF002)
-                  .fontSize(13.0f).lineHeight(13.0f)
+                  .fontSize(16.0f).lineHeight(16.0f)
                   .color(state.searchOpen ? kAccent : kMuted)
                   .horizontalAlign(eui::HorizontalAlign::Center)
                   .verticalAlign(eui::VerticalAlign::Center)
                   .build();
               ui.rect("breadcrumb.edit.hit")
-                .x(crumbW - editW - 4.0f).y(3.0f).size(editW, h - 6.0f)
+                .x(crumbW - editW - 4.0f).y(1.0f).size(editW, h - 2.0f)
                 .states(kClear, kSurfaceHover, kSurfaceAct)
                 .radius(6.0f)
                 .onClick([] { state.pathInput = state.currentPath; state.pathSuggestions.clear(); state.pathEditing = true; app::requestFocus("path.edit.input.hit"); })
                 .build();
             ui.text("breadcrumb.edit.icon")
-                .x(crumbW - editW - 4.0f).y(3.0f).size(editW, h - 6.0f)
+                .x(crumbW - editW - 4.0f).y(1.0f).size(editW, h - 2.0f)
                 .icon(0xF303)
-                .fontSize(13.0f).lineHeight(13.0f)
+                .fontSize(16.0f).lineHeight(16.0f)
                 .color(kMuted)
                 .horizontalAlign(eui::HorizontalAlign::Center)
                 .verticalAlign(eui::VerticalAlign::Center)
@@ -6597,7 +6780,9 @@ void composeOptionField(eui::Ui& ui, const std::string& id, float x, float y, fl
     const double elapsed = anim.lastMs > 0.0 ? (now - anim.lastMs) / 1000.0 : 0.016;
     anim.lastMs = now;
     const float target = open ? 1.0f : 0.0f;
-    const float step = static_cast<float>(std::min(0.05, elapsed) / kAnimSeconds);
+    const float step = uiAnimationsEnabled()
+                            ? static_cast<float>(std::min(0.05, elapsed) / kAnimSeconds)
+                            : 1.0f;   // reduced motion: reach the target in one frame
     anim.t = (target > anim.t) ? std::min(target, anim.t + step) : std::max(target, anim.t - step);
     if (anim.t != target) app::requestUpdate();  // keep frames coming while it moves
     const float eased = 1.0f - (1.0f - anim.t) * (1.0f - anim.t) * (1.0f - anim.t);
@@ -6749,7 +6934,7 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
             ui.text("bookmark.manage.title")
                 .x(24.0f).y(16.0f).size(pw - 48.0f, 30.0f)
                 .text("管理快捷路径")
-                .fontSize(18.0f).lineHeight(18.0f)
+                .fontSize(16.0f).lineHeight(16.0f)
                 .color(kInk)
                 .build();
 
@@ -6896,8 +7081,8 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
 
-            toolButton(ui, "bookmark.manage.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
-                       0xF00D, "", false, true, [] { state.bookmarkManageOpen = false; });
+            toolButton(ui, "bookmark.manage.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.bookmarkManageOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.bookmarkManageOpen = v; })
         .build();
@@ -6915,11 +7100,11 @@ void composeCommandManageDialog(eui::Ui& ui, float w, float h) {
             ui.text("command.manage.title")
                 .x(24.0f).y(16.0f).size(pw - 160.0f, 30.0f)
                 .text("管理命令")
-                .fontSize(18.0f).lineHeight(18.0f)
+                .fontSize(16.0f).lineHeight(16.0f)
                 .color(kInk)
                 .build();
-            toolButton(ui, "command.manage.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
-                       0xF00D, "", false, true, [] { state.commandManageOpen = false; });
+            toolButton(ui, "command.manage.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.commandManageOpen = false; }, 12.0f);
 
             ui.text("command.manage.name.label").x(24.0f).y(54.0f).size(100.0f, 22.0f)
                 .text("名称").fontSize(13.0f).lineHeight(13.0f).color(kMuted).verticalAlign(eui::VerticalAlign::Center).build();
@@ -7067,8 +7252,8 @@ void composeCommandOutputDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
 
-            toolButton(ui, "command.output.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
-                       0xF00D, "", false, true, [] { state.commandOutputOpen = false; });
+            toolButton(ui, "command.output.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.commandOutputOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.commandOutputOpen = v; })
         .build();
@@ -7076,8 +7261,14 @@ void composeCommandOutputDialog(eui::Ui& ui, float w, float h) {
 
 void composeSettingsDialog(eui::Ui& ui, float w, float h) {
     // Responsive panel size so the settings stay fully visible on small windows.
-    const float pw = std::min(560.0f, std::max(360.0f, w - 48.0f));
-    const float ph = std::min(600.0f, std::max(380.0f, h - 48.0f));
+    // 580: at 500 the form column crowded the card's right edge and every row looked
+    // cramped; the extra width is what "less busy" actually needed.
+    // 720: the card was a narrow column in a 1080-wide window, so the path field and the
+    // three dropdowns were always squeezed while both sides sat empty.
+    const float pw = std::min(720.0f, std::max(360.0f, w - 48.0f));
+    // 640, not 600: three section headers add ~66px of vertical structure, and the font
+    // list should not pay for it.
+    const float ph = std::min(780.0f, std::max(380.0f, h - 48.0f));
 
     components::dialog(ui, "settings.dialog")
         .screen(w, h)
@@ -7090,48 +7281,119 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             ui.text("settings.title")
                 .x(24.0f).y(16.0f).size(pw - 160.0f, 30.0f)
                 .text("设置")
+                // Weight carries the hierarchy the size alone could not: the dialog title is
+                // the heaviest text on the page, the section titles next, the field labels
+                // stay at 400 so they read as captions rather than headings.
                 .fontSize(19.0f).lineHeight(19.0f)
+                .fontWeight(700)
                 .color(kInk)
                 .build();
-            toolButton(ui, "settings.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
+            toolButton(ui, "settings.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] {
                            state.settingsOpen = false;
                            state.weightDropdownOpen = false;
                            state.scaleDropdownOpen = false;
                            state.fontSizeDropdownOpen = false;
-                       });
+                       }, 12.0f);
 
-            // Theme row: dark mode toggle + accent color swatches.
-            // The switch sits in the same control column as every other row (x=90) and
-            // its label is right-aligned in the same label column. Previously the switch
-            // started at x=24 with its text inside it, so the top of the dialog was
-            // shifted left while the rows below it were not - the page looked weighted
-            // to one side.
-            ui.text("settings.dark.label")
-                .x(24.0f).y(52.0f).size(60.0f, 28.0f)
-                .text("深色模式")
-                .fontSize(13.0f).lineHeight(13.0f)
+            // ---- 外观 ----
+            // Toggle rows in settings are whole-row hit targets, and the control sits at the
+            // card's right margin.
+            const float kToggleRowH = 40.0f;
+
+            ui.text("settings.section.appearance")
+                .x(24.0f).y(58.0f).size(pw - 48.0f, 18.0f)
+                // 13.5, larger than the 12.5 field labels: a section title must outrank the
+                // rows it groups, and at 12 it was smaller than them.
+                .text("外观")
+                .fontSize(13.5f).lineHeight(13.5f)
+                .fontWeight(650)
+                .color(kInk)
+                .build();
+            ui.rect("settings.section.appearance.rule")
+                .x(24.0f).y(80.0f).size(pw - 48.0f, 1.0f)
+                .color(kBorder)
+                .build();
+
+            // Theme row: a three-way segmented control (dark / light / follow system) with a
+            // thumb that slides between the segments. A two-state switch cannot express
+            // "follow the system", which is what most people actually want.
+            ui.text("settings.theme.label")
+                .x(24.0f).y(92.0f).size(68.0f, kToggleRowH)
+                .text("主题")
+                .fontSize(12.5f).lineHeight(12.5f)
                 .color(kMuted)
                 .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
-            ui.stack("settings.dark.wrap")
-                .x(90.0f).y(52.0f)
-                .content([&] {
-                    components::toggleSwitch(ui, "settings.dark")
-                        .theme(themeTokens())
-                        .size(120.0f, 28.0f)
-                        .trackSize(40.0f, 22.0f)
-                        .fontSize(13.0f)
-                        .text("")
-                        .checked(settings.darkMode)
-                        .onChange([](bool v) { setDarkMode(v); })
+            {
+                constexpr float kSegW = 84.0f;
+                constexpr float kSegH = 32.0f;
+                constexpr int kSegCount = 3;
+                const char* kSegLabels[kSegCount] = {"深色", "浅色", "跟随系统"};
+                const float trackW = kSegW * static_cast<float>(kSegCount);
+                const float trackX = pw - 24.0f - trackW;
+                const float trackY = 92.0f + (kToggleRowH - kSegH) * 0.5f;
+
+                // Thumb position eases toward the active segment; instant when the OS asks
+                // for reduced motion.
+                static float segThumbT = -1.0f;
+                static double segLastMs = 0.0;
+                const int active = std::clamp(settings.themeMode, 0, kSegCount - 1);
+                if (segThumbT < 0.0f) segThumbT = static_cast<float>(active);
+                {
+                    const double nowMs = std::chrono::duration<double, std::milli>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count();
+                    const double elapsed = segLastMs > 0.0 ? (nowMs - segLastMs) / 1000.0 : 0.016;
+                    segLastMs = nowMs;
+                    const float step = uiAnimationsEnabled()
+                                           ? static_cast<float>(std::min(0.05, elapsed) / 0.16)
+                                           : 1.0f;
+                    const float target = static_cast<float>(active);
+                    segThumbT = (target > segThumbT) ? std::min(target, segThumbT + step)
+                                                     : std::max(target, segThumbT - step);
+                    if (segThumbT != target) app::requestUpdate();
+                }
+
+                ui.rect("settings.theme.track")
+                    .x(trackX).y(trackY).size(trackW, kSegH)
+                    .color(kBackground)
+                    .radius(kSegH * 0.5f)
+                    .border(1.0f, kBorder)
+                    .build();
+                ui.rect("settings.theme.thumb")
+                    .x(trackX + 2.0f + segThumbT * kSegW).y(trackY + 2.0f)
+                    .size(kSegW - 4.0f, kSegH - 4.0f)
+                    .color(kAccent)
+                    .radius((kSegH - 4.0f) * 0.5f)
+                    .build();
+                for (int i = 0; i < kSegCount; ++i) {
+                    const bool on = (i == active);
+                    ui.text("settings.theme.seg." + std::to_string(i))
+                        .x(trackX + static_cast<float>(i) * kSegW).y(trackY)
+                        .size(kSegW, kSegH)
+                        .text(kSegLabels[i])
+                        .fontSize(12.5f).lineHeight(12.5f)
+                        .fontWeight(on ? 650 : 400)
+                        .color(on ? kWhite : kMuted)
+                        .horizontalAlign(eui::HorizontalAlign::Center)
+                        .verticalAlign(eui::VerticalAlign::Center)
                         .build();
-                })
-                .build();
+                }
+                // Hit areas last, so nothing is drawn over them.
+                for (int i = 0; i < kSegCount; ++i) {
+                    ui.rect("settings.theme.hit." + std::to_string(i))
+                        .x(trackX + static_cast<float>(i) * kSegW).y(trackY)
+                        .size(kSegW, kSegH)
+                        .states(kClear, kClear, kClear)
+                        .onClick([i] { setThemeMode(i); })
+                        .build();
+                }
+            }
 
             ui.text("settings.accent.label")
-                .x(24.0f).y(100.0f).size(60.0f, 30.0f)
+                .x(24.0f).y(138.0f).size(68.0f, 32.0f)
                 .text("主题色")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(kMuted)
@@ -7148,21 +7410,40 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                   // (the card is ~460 logical px wide, and the swatches start at 262).
                   // One row of twelve, aligned with the dropdown controls at x=90.
                   
-                  const float sx = 90.0f + static_cast<float>(i) * 24.0f;
+                  // 26, not 24: a 6px gap between swatches reads as a deliberate row rather
+                  // than a solid band of colour.
+                  const float sx = 104.0f + static_cast<float>(i) * 28.0f;
                   // 106, not 105: at 150% DPI a logical 105 lands on a half device pixel and the
                     // circle's top row gets clipped - which read as a faint horizontal line
                     // across the top of every swatch.
-                    const float sy = 106.0f;
+                    const float sy = 142.0f;
                   const bool active = std::fabs(settings.accentR - p.r) < 0.01f &&
                                       std::fabs(settings.accentG - p.g) < 0.01f &&
                                       std::fabs(settings.accentB - p.b) < 0.01f;
+                  // A ring alone is easy to miss on twelve similar circles; the tick makes the
+                  // current choice unmistakable.
                   ui.rect("settings.accent." + std::to_string(i))
-                      .x(sx).y(sy).size(20.0f, 20.0f)
+                      .x(sx).y(sy).size(22.0f, 22.0f)
                       .color(eui::Color{p.r, p.g, p.b, 1.0f})
-                      .radius(10.0f)
-                      .border(active ? 2.0f : 0.0f, active ? kInk : kClear)
+                      .radius(11.0f)
+                      // No ring: the tick below already marks the choice, and two indicators on
+                      // one 22px circle read as noise.
+                      .border(0.0f, kClear)
                       .onClick([r = p.r, g = p.g, b = p.b] { setAccentColor(r, g, b); })
                       .build();
+                  if (active) {
+                      // Dark tick on bright swatches, light tick on dark ones - a fixed colour
+                      // vanished on half the palette.
+                      const float lum = 0.299f * p.r + 0.587f * p.g + 0.114f * p.b;
+                      ui.text("settings.accent." + std::to_string(i) + ".check")
+                          .x(sx).y(sy).size(22.0f, 22.0f)
+                          .icon(0xF00C)
+                          .fontSize(10.0f).lineHeight(10.0f)
+                          .color(lum > 0.55f ? eui::Color{0.1f, 0.1f, 0.12f, 1.0f} : kWhite)
+                          .horizontalAlign(eui::HorizontalAlign::Center)
+                          .verticalAlign(eui::VerticalAlign::Center)
+                          .build();
+                  }
               }
 
             // Font label + scrollable font list (composed first so the dropdown
@@ -7172,21 +7453,33 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             // layer only offers file dialogs (a folder chooser would mean picking a file
             // and taking its parent, which is worse than typing or pasting a path), and
             // this is a path people already have on the clipboard from Explorer.
+            // ---- 存储 ----
+            ui.text("settings.section.storage")
+                .x(24.0f).y(244.0f).size(pw - 48.0f, 18.0f)
+                .text("存储")
+                .fontSize(13.5f).lineHeight(13.5f)
+                .fontWeight(650)
+                .color(kInk)
+                .build();
+            ui.rect("settings.section.storage.rule")
+                .x(24.0f).y(266.0f).size(pw - 48.0f, 1.0f)
+                .color(kBorder)
+                .build();
             ui.text("settings.downloaddir.label")
-                .x(24.0f).y(200.0f).size(60.0f, 36.0f)
+                .x(24.0f).y(274.0f).size(68.0f, 34.0f)
                 .text("下载目录")
-                .fontSize(13.0f).lineHeight(13.0f)
+                .fontSize(12.5f).lineHeight(12.5f)
                 .color(kMuted)
                 .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             ui.stack("settings.downloaddir.wrap")
-                .x(90.0f).y(200.0f).size(pw - 90.0f - 24.0f, 36.0f)
+                .x(104.0f).y(274.0f).size(pw - 104.0f - 24.0f, 34.0f)
                 .content([&] {
                     // The field keeps 96px for the button, so a long path is still readable.
                     components::input(ui, "settings.downloaddir")
                         .theme(themeTokens())
-                        .size(pw - 90.0f - 24.0f - 100.0f, 36.0f)
+                        .size(pw - 104.0f - 24.0f - 100.0f, 34.0f)
                         .fontSize(12.5f)
                         .value(state.downloadDirDraft)
                         .placeholder("下载文件保存到哪个文件夹")
@@ -7206,7 +7499,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     // so a dialog-relative 480 is 390 here. Passing the dialog value put
                     // the button ~90px too far right, over the card's edge.
                     toolButton(ui, "settings.downloaddir.browse",
-                               pw - 210.0f, 0.0f, 96.0f, 36.0f,
+                               pw - 214.0f, 0.0f, 96.0f, 34.0f,
                                0xF07C, "选择…", false, true, [&] {
                                    const std::string picked =
                                        eui::platform::chooseFolder("选择下载目录");
@@ -7223,10 +7516,24 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             // filter, and the search box on the right. (They used to be placed
             // independently, and the label ended up drawn underneath the filter
             // checkbox - same x range, overlapping y.)
-            ui.text("settings.font.label")
-                .x(24.0f).y(248.0f).size(60.0f, 36.0f)
+            // ---- 字体 ----
+            ui.text("settings.section.fonts")
+                .x(24.0f).y(340.0f).size(pw - 48.0f, 18.0f)
                 .text("字体")
-                .fontSize(13.0f).lineHeight(13.0f)
+                .fontSize(13.5f).lineHeight(13.5f)
+                .fontWeight(650)
+                .color(kInk)
+                .build();
+            ui.rect("settings.section.fonts.rule")
+                .x(24.0f).y(362.0f).size(pw - 48.0f, 1.0f)
+                .color(kBorder)
+                .build();
+            ui.text("settings.font.label")
+                .x(24.0f).y(370.0f).size(68.0f, 34.0f)
+                // Four characters, because the label column is 68px wide and the text is
+                // right-aligned: a longer label overflows into the card margin.
+                .text("中文字体")
+                .fontSize(12.5f).lineHeight(12.5f)
                 .color(kMuted)
                 .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
@@ -7283,7 +7590,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
             }
 
             ui.stack("settings.font.search.wrap")
-                .x(pw - 24.0f - 190.0f).y(248.0f).size(190.0f, 36.0f)
+                .x(pw - 24.0f - 190.0f).y(370.0f).size(190.0f, 34.0f)
                 .content([&] {
                     components::input(ui, "settings.font.search")
                         .theme(themeTokens())
@@ -7295,14 +7602,17 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                         .build();
                 })
                 .build();
+            // Back in the control column, not at the right margin: this row carries two
+            // controls (the checkbox and the search box), so the "label left, switch right"
+            // rule for single-control rows does not apply here.
             ui.stack("settings.font.cjk.wrap")
-                .x(90.0f).y(248.0f).size(210.0f, 36.0f)
+                .x(104.0f).y(370.0f).size(34.0f, 34.0f)
                 .content([&] {
                     components::checkbox(ui, "settings.font.cjk")
                         // Same height as the wrapper, so the component's own vertical
                         // centring lines up exactly with the label box beside it.
-                        .size(210.0f, 36.0f)
-                        .text("只显示支持中文的字体")
+                        .size(34.0f, 34.0f)
+                        .text("")
                         .fontSize(12.5f)
                         .theme(themeTokens())
                         .checked(state.fontOnlyChinese)
@@ -7311,10 +7621,12 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
 
-            const float fontListH = std::max(60.0f, ph - 332.0f);
+            // Fills what is left: with the wider, taller card it reads as the page's last
+            // section rather than as a small stray box.
+            const float fontListH = std::max(60.0f, ph - 448.0f);
             if (state.fontList.empty()) {
                 ui.text("settings.font.loading")
-                    .x(24.0f).y(300.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(416.0f).size(pw - 48.0f, fontListH)
                     .text("正在加载字体…")
                     .fontSize(14.0f).lineHeight(14.0f)
                     .color(kMuted)
@@ -7323,19 +7635,18 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .build();
             } else {
                 ui.text("settings.font.count")
-                    .x(24.0f).y(292.0f).size(pw - 48.0f, 18.0f)
+                    // 34: aligned with the list rows' text, not with the control column - this
+                    // line describes the list below it.
+                    .x(34.0f).y(410.0f).size(pw - 58.0f, 16.0f)
                     .text(visibleFonts.size() == state.fontList.size()
                               ? ("共 " + std::to_string(state.fontList.size()) + " 个字体")
                               : ("匹配 " + std::to_string(visibleFonts.size()) + " / " +
                                  std::to_string(state.fontList.size()) + " 个字体"))
-                    .fontSize(12.0f).lineHeight(12.0f)
+                    .fontSize(11.5f).lineHeight(11.5f)
                     .color(kMuted)
-                    // Right-aligned so it sits under the search box it is describing; at
-                    // the left edge it had the entire dialog width empty beside it.
-                    .horizontalAlign(eui::HorizontalAlign::Right)
                     .build();
                 ui.stack("settings.font.wrap")
-                    .x(24.0f).y(314.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(430.0f).size(pw - 48.0f, fontListH)
                     .content([&] {
                         ui.rect("settings.font.wrap.bg")
                             .size(pw - 48.0f, fontListH)
@@ -7362,7 +7673,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                 // makes the cut read as "there is more" instead of "broken".
                                 body.rect("settings.font.tailpad")
                                     .x(0.0f).y(static_cast<float>(visibleFonts.size()) * rowH)
-                                    .size(cw, 10.0f)
+                                    .size(cw, 14.0f)
                                     .color(kClear)
                                     .build();
                                 for (std::size_t r = 0; r < visibleFonts.size(); ++r) {
@@ -7389,6 +7700,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                                 // list shows what each choice looks like.
                                                 .fontFamily(fontPreviewFile(name, settings.fontWeight))
                                                 .fontSize(14.0f).lineHeight(14.0f)
+                                                .fontWeight(selected ? 650 : 400)
                                                 .color(selected ? kInk : kMuted)
                                                 .verticalAlign(eui::VerticalAlign::Center)
                                                 .build();
@@ -7401,23 +7713,34 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .build();
             }
 
-            // Weight + font size + scale dropdowns (side by side).
+            // Weight + font size + scale dropdowns, one row, now with a left label like every
+            // other row ("显示 字重 [.] 字号 [.] 界面大小 [.]") instead of three label+control
+            // pairs that broke the form's label column.
             const float labelW = 60.0f;
-            const float rowGap = 10.0f;
+            const float rowGap = 18.0f;   // 18: this row carries three label+control pairs
             const float labelGap = 6.0f;
-            const float dropW = (pw - 24.0f * 2.0f - (labelW + labelGap) * 3.0f - rowGap * 2.0f) / 3.0f;
+            const float ctrlX = 104.0f;   // the shared control column
+            const float dropW = (pw - ctrlX - 24.0f - (labelW + labelGap) * 3.0f - rowGap * 2.0f) / 3.0f;
             const float groupW = labelW + labelGap + dropW + rowGap;
 
+            ui.text("settings.display.label")
+                .x(24.0f).y(186.0f).size(68.0f, 34.0f)
+                .text("显示")
+                .fontSize(12.5f).lineHeight(12.5f)
+                .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
             ui.text("settings.weight.label")
-                .x(24.0f).y(156.0f).size(labelW, 36.0f)
+                .x(ctrlX).y(186.0f).size(labelW, 36.0f)
                 .text("字重")
-                .fontSize(13.0f).lineHeight(13.0f)
+                .fontSize(12.5f).lineHeight(12.5f)
                 .color(kMuted)
                 .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.weight",
-                               24.0f + labelW + labelGap, 156.0f, dropW,
+                               ctrlX + labelW + labelGap, 186.0f, dropW,
                                {"细体", "常规", "粗体"},
                                settings.fontWeight <= 300 ? 0 : (settings.fontWeight >= 700 ? 2 : 1),
                                state.weightDropdownOpen,
@@ -7427,17 +7750,17 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                },
                                [] { state.weightDropdownOpen = !state.weightDropdownOpen; });
 
-            const float fsX = 24.0f + groupW;
+            const float fsX = ctrlX + groupW;
             ui.text("settings.fontsize.label")
-                .x(fsX).y(156.0f).size(labelW, 36.0f)
+                .x(fsX).y(186.0f).size(labelW, 36.0f)
                 .text("字号")
-                .fontSize(13.0f).lineHeight(13.0f)
+                .fontSize(12.5f).lineHeight(12.5f)
                 .color(kMuted)
                 .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.fontsize",
-                               fsX + labelW + labelGap, 156.0f, dropW,
+                               fsX + labelW + labelGap, 186.0f, dropW,
                                {"小", "默认", "大", "特大"},
                                // The whole ladder moved up one step: what used to be 特大
                                // (1.3) is what the default should look like, so 默认 is now
@@ -7454,17 +7777,17 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                },
                                [] { state.fontSizeDropdownOpen = !state.fontSizeDropdownOpen; });
 
-            const float scaleX = 24.0f + groupW * 2.0f;
+            const float scaleX = ctrlX + groupW * 2.0f;
             ui.text("settings.scale.label")
-                .x(scaleX).y(156.0f).size(labelW, 36.0f)
+                .x(scaleX).y(186.0f).size(labelW, 36.0f)
                 .text("界面大小")
-                .fontSize(13.0f).lineHeight(13.0f)
+                .fontSize(12.5f).lineHeight(12.5f)
                 .color(kMuted)
                 .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
             composeOptionField(ui, "settings.scale",
-                               scaleX + labelW + labelGap, 156.0f, dropW,
+                               scaleX + labelW + labelGap, 186.0f, dropW,
                                {"80%", "100%", "125%", "150%"},
                                settings.uiScale <= 0.85f ? 0 :
                                (settings.uiScale >= 1.4f ? 3 :
@@ -7481,7 +7804,11 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
 }
 
 void composeUpdateDialog(eui::Ui& ui, float w, float h) {
-    const float pw = std::min(560.0f, std::max(360.0f, w - 48.0f));
+    // 580: at 500 the form column crowded the card's right edge and every row looked
+    // cramped; the extra width is what "less busy" actually needed.
+    // 720: the card was a narrow column in a 1080-wide window, so the path field and the
+    // three dropdowns were always squeezed while both sides sat empty.
+    const float pw = std::min(720.0f, std::max(360.0f, w - 48.0f));
     const float ph = 440.0f;
 
     const std::string adbCur = g_update.adbCurrent.empty() ? "未安装" : g_update.adbCurrent;
@@ -7527,8 +7854,8 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(19.0f).lineHeight(19.0f)
                 .color(kInk)
                 .build();
-            toolButton(ui, "update.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
-                       0xF00D, "", false, true, [] { state.updateOpen = false; });
+            toolButton(ui, "update.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.updateOpen = false; }, 12.0f);
 
             // --- This app section ---
             ui.text("update.app.title")
@@ -7615,7 +7942,9 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
             ui.text("update.status")
                 .x(150.0f).y(352.0f).size(pw - 174.0f, 36.0f)
                 .text(state.updateStatus.empty() ? "点击“检查更新”查看可用的新版本。" : state.updateStatus)
-                .fontSize(12.0f).lineHeight(12.0f)
+                // 17, not 12: this line wraps, and leading equal to the font size makes two
+                // wrapped lines read as one dense block.
+                .fontSize(12.0f).lineHeight(17.0f)
                 .color(kMuted)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .wrap(true)
@@ -7683,7 +8012,11 @@ void composeSetupDialog(eui::Ui& ui, float w, float h) {
     const bool anyMissing = !adbPresent || !scrcpyPresent;
     const bool busy = state.updateChecking || state.updateWorking;
 
-    const float pw = std::min(560.0f, std::max(360.0f, w - 48.0f));
+    // 580: at 500 the form column crowded the card's right edge and every row looked
+    // cramped; the extra width is what "less busy" actually needed.
+    // 720: the card was a narrow column in a 1080-wide window, so the path field and the
+    // three dropdowns were always squeezed while both sides sat empty.
+    const float pw = std::min(720.0f, std::max(360.0f, w - 48.0f));
     const float ph = 372.0f;
     const float rowX = 24.0f;
     const float rowW = pw - 48.0f;
@@ -7778,7 +8111,7 @@ void composeSetupDialog(eui::Ui& ui, float w, float h) {
                            }
                        });
             toolButton(ui, "setup.close", rowX + 158.0f, 274.0f, 110.0f, 36.0f,
-                       0xF00D, anyMissing ? "稍后再说" : "关闭", false, true, [] { closeSetupDialog(); });
+                       0xF00D, anyMissing ? "稍后再说" : "关闭", false, true, [] { closeSetupDialog(); }, 12.0f);
 
             ui.stack("setup.dontask.wrap")
                 .x(rowX + 286.0f).y(274.0f).size(rowW - 286.0f, 36.0f)
@@ -7899,8 +8232,8 @@ void composeExternalEditDialog(eui::Ui& ui, float w, float h) {
                            [index] { stopExternalEdit(index); });
             }
 
-            toolButton(ui, "extedit.close", 24.0f, ph - 48.0f, 44.0f, 34.0f,
-                       0xF00D, "", false, true, [] { state.externalEditListOpen = false; });
+            toolButton(ui, "extedit.close", 24.0f, ph - 42.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.externalEditListOpen = false; }, 12.0f);
             toolButton(ui, "extedit.syncall", 142.0f, ph - 48.0f, 110.0f, 34.0f,
                        0xF021, "全部同步", false, pending > 0, [] {
                            for (std::size_t i = 0; i < state.externalEdits.size(); ++i) {
@@ -8026,8 +8359,8 @@ void composeDeviceInfoDialog(eui::Ui& ui, float w, float h) {
                     }
                 })
                 .build();
-            toolButton(ui, "device.info.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
-                       0xF00D, "", false, true, [] { state.deviceInfoOpen = false; });
+            toolButton(ui, "device.info.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.deviceInfoOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.deviceInfoOpen = v; })
         .build();
@@ -8047,19 +8380,19 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
             ui.text("logcat.title")
                 .x(24.0f).y(16.0f).size(160.0f, 28.0f)
                 .text("logcat（实时）")
-                .fontSize(16.0f).lineHeight(16.0f).color(kInk).build();
+                .fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
             ui.text("logcat.status")
                 .x(150.0f).y(16.0f).size(120.0f, 28.0f)
                 .text(streaming ? "\xE2\x97\x8F 运行中" : "\xE2\x97\x8B 已停止")
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(streaming ? kGreen : kMuted)
                 .verticalAlign(eui::VerticalAlign::Center).build();
-            toolButton(ui, "logcat.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
+            toolButton(ui, "logcat.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] {
                            state.logcatOpen = false;
                            stopLogcat();
                            logcatRegexClear();
-                       });
+                       }, 12.0f);
 
             // Filter (case-insensitive regex).
             const float actionW = 104.0f;
@@ -8224,8 +8557,8 @@ void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
                            0xF060, "", false, matchCount > 0, [] { stepTextPreviewMatch(-1); });
                 toolButton(ui, "text.preview.find.next", 520.0f, 44.0f, 34.0f, 32.0f,
                            0xF061, "", false, matchCount > 0, [] { stepTextPreviewMatch(1); });
-                toolButton(ui, "text.preview.find.close", 558.0f, 44.0f, 34.0f, 32.0f,
-                           0xF00D, "", false, true, [] { closeTextPreviewSearch(); });
+                toolButton(ui, "text.preview.find.close", 558.0f, 44.0f, 28.0f, 26.0f,
+                           0xF00D, "", false, true, [] { closeTextPreviewSearch(); }, 12.0f);
                 inputY = 88.0f;
                 inputH = ph - 88.0f - 72.0f;
             }
@@ -8267,8 +8600,8 @@ void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
                        });
             toolButton(ui, "text.preview.save", pw - 24.0f - 200.0f, ph - 56.0f, 92.0f, 40.0f,
                        0xF0C7, "保存", true, true, [] { saveTextPreview(); });
-            toolButton(ui, "text.preview.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
-                       0xF00D, "", false, true, [] { state.textPreviewOpen = false; });
+            toolButton(ui, "text.preview.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.textPreviewOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.textPreviewOpen = v; })
         .build();
@@ -8287,8 +8620,8 @@ void composeImagePreviewDialog(eui::Ui& ui, float w, float h) {
                 .x(24.0f).y(16.0f).size(pw - 140.0f, 28.0f)
                 .text(state.imagePreviewRemote)
                 .fontSize(15.0f).lineHeight(15.0f).color(kInk).build();
-            toolButton(ui, "image.preview.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
-                       0xF00D, "", false, true, [] { state.imagePreviewOpen = false; });
+            toolButton(ui, "image.preview.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.imagePreviewOpen = false; }, 12.0f);
             ui.rect("image.preview.bg")
                 .x(24.0f).y(56.0f).size(pw - 48.0f, ph - 72.0f)
                 .color(kBackground).radius(10.0f).border(1.0f, kBorder).build();
@@ -8338,8 +8671,8 @@ void composePropertiesDialog(eui::Ui& ui, float w, float h) {
                     }
                 })
                 .build();
-            toolButton(ui, "file.properties.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
-                       0xF00D, "", false, true, [] { state.propertiesOpen = false; });
+            toolButton(ui, "file.properties.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.propertiesOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.propertiesOpen = v; })
         .build();
@@ -8368,8 +8701,8 @@ void composeAppManageDialog(eui::Ui& ui, float w, float h) {
                 }).build();
             toolButton(ui, "app.manage.refresh", pw - 24.0f - 200.0f, 12.0f, 92.0f, 36.0f,
                        0xF021, "刷新", false, true, [] { fetchAppList(); });
-            toolButton(ui, "app.manage.close", pw - 24.0f - 44.0f, 12.0f, 44.0f, 36.0f,
-                       0xF00D, "", false, true, [] { state.appManageOpen = false; });
+            toolButton(ui, "app.manage.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.appManageOpen = false; }, 12.0f);
 
             const float listH = ph - 56.0f - 56.0f;
             ui.rect("app.manage.list.bg")
@@ -8451,8 +8784,8 @@ void composeHelpDialog(eui::Ui& ui, float w, float h) {
                     }
                 })
                 .build();
-            toolButton(ui, "help.close", pw - 24.0f - 44.0f, ph - 56.0f, 44.0f, 40.0f,
-                       0xF00D, "", false, true, [] { state.helpOpen = false; });
+            toolButton(ui, "help.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+                       0xF00D, "", false, true, [] { state.helpOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.helpOpen = v; })
         .build();
@@ -8497,6 +8830,9 @@ const DslAppConfig& dslAppConfig() {
 }
 
 void compose(eui::Ui& ui, const eui::Screen& screen) {
+    // Advance a theme cross-fade before anything reads the colour tokens this frame.
+    updateThemeFade();
+
     if (!state.initialized) {
         state.initialized = true;
         state.adbPath = findAdb();
@@ -8545,13 +8881,25 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
     const float contentW = std::max(0.0f, W - margin * 2.0f);
     const float x = margin;
 
-    const float topY = kTitleBarHeight + 10.0f;
-    const float topBarH = 44.0f;
+    // 4, not 10: with a 44px title bar the extra 10px read as a gap between two rows that
+    // belong together.
+    const float topY = kTitleBarHeight + 4.0f;
+    // 48: at 44 the 18pt icons left only ~10px of padding per side, which read as the
+    // border being too tight around the glyph. 48 gives ~14px.
+    // 52: only the device row grows - the address row below stays at 40, which is the size
+    // the user settled on. 16pt icons leave ~16px of padding per side here.
+    const float topBarH = 60.0f;
     const float gap = 10.0f;
-    const float pathY = topY + topBarH + gap;
-    // Same height as the action row above: 44 vs 40 used to read as two different
-    // toolbars stacked on top of each other.
-    const float pathBarH = topBarH;
+    // 2, not the standard 10: the device row and the address row are one block, and the
+    // standard gap made them read as two unrelated bars.
+    // -2: the two rows already touch at 0px; this pulls the address row 2px up so its
+    // white controls meet the device row with no seam. Both are white rounded rects, so the
+    // overlap reads as contact, not as a collision.
+    const float barGap = -2.0f;
+    const float pathY = topY + topBarH + barGap;
+    // 40: a sub-bar below the device row (44), but not so small that the controls read as
+    // cramped. 36 turned out too small in use.
+    const float pathBarH = 40.0f;   // restored: the user never asked for this row to grow
     const float headerY = pathY + pathBarH + gap;
     const float headerH = 24.0f;
     const float listY = headerY + headerH + 4.0f;
@@ -8572,6 +8920,32 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeBreadcrumb(ui, x, pathY, contentW, pathBarH);
             composeHeader(ui, x + 6.0f, headerY, contentW - 12.0f, headerH);
             composeFileList(ui, x, listY, contentW, listH);
+
+            // Scroll edge effect: rows are cut off flat where the list meets the header above
+            // and the status bar below. A short gradient of the list's own background makes
+            // the cut read as "content continues underneath" instead of a hard slice.
+            // Only when the list actually overflows: with three entries and a tall window
+            // there is nothing to scroll, and a fade would just dim the first row.
+            const bool listOverflows =
+                static_cast<float>(state.entries.size()) * kRowHeight > listH;
+            if (listOverflows && listH > 80.0f) {
+                constexpr int kFadeSteps = 6;
+                constexpr float kFadeStep = 2.0f;
+                constexpr float kFadeMaxAlpha = 0.85f;
+                for (int i = 0; i < kFadeSteps; ++i) {
+                    const float a = kFadeMaxAlpha * (1.0f - static_cast<float>(i) / kFadeSteps);
+                    ui.rect("list.fade.top." + std::to_string(i))
+                        .x(x).y(listY + static_cast<float>(i) * kFadeStep)
+                        .size(contentW, kFadeStep)
+                        .color(eui::Color{kBackground.r, kBackground.g, kBackground.b, a})
+                        .build();
+                    ui.rect("list.fade.bottom." + std::to_string(i))
+                        .x(x).y(listY + listH - static_cast<float>(i + 1) * kFadeStep)
+                        .size(contentW, kFadeStep)
+                        .color(eui::Color{kBackground.r, kBackground.g, kBackground.b, a})
+                        .build();
+                }
+            }
             composeStatusBar(ui, x, statusY, contentW, statusH);
 
             composeToast(ui, W, H);

@@ -47,6 +47,15 @@ std::vector<std::string> chooseFiles(const FileDialogOptions& options = {});
 // GetOpenFileNameW, which cannot select a folder - Windows needs IFileOpenDialog with
 // FOS_PICKFOLDERS for that. Returns an empty string when the user cancels.
 std::string chooseFolder(const std::string& prompt = {});
+
+// Whether the OS asks for animations. Windows has a "Show animations in Windows"
+// switch (SPI_GETCLIENTAREAANIMATION); every other platform reports true. UI code
+// should degrade to instant/cross-fade transitions when this is false.
+bool animationsEnabled();
+
+// Whether the OS itself is in dark mode (Windows: AppsUseLightTheme). Used by the
+// "follow system" theme option.
+bool systemPrefersDark();
 bool initializeTray(const TrayOptions& options);
 bool isTrayInitialized();
 void pollTray(bool blocking = false);

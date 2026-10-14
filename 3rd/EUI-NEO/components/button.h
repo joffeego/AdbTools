@@ -126,7 +126,9 @@ public:
         // icon - in the app manager the disabled "卸载" looked as clickable as the
         // primary button next to it (measured: identical RGB(64,139,241)). Dimming both
         // the label and the icon here fixes every button in the app at once.
-        const float effectiveOpacity = disabled_ ? std::min(style_.opacity, 0.4f) : style_.opacity;
+        // 0.55, not 0.4: at 0.4 a disabled icon on a light background is close to
+        // invisible, which reads as "missing" rather than "not available yet".
+        const float effectiveOpacity = disabled_ ? std::min(style_.opacity, 0.55f) : style_.opacity;
         textColor.a *= effectiveOpacity;
         iconColor.a *= effectiveOpacity;
         const std::function<void()> onPress = onPress_;

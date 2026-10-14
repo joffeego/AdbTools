@@ -696,6 +696,34 @@ std::string chooseFile(const FileDialogOptions& options) {
 // Folder picker. GetOpenFileNameW (what openFileDialog uses) cannot do this at all, so
 // Windows needs the shell's modern dialog with FOS_PICKFOLDERS - the same one Explorer
 // shows for "选择文件夹".
+bool systemPrefersDark() {
+#if defined(_WIN32)
+    DWORD value = 1;   // Windows defaults to light
+    DWORD size = sizeof(value);
+    if (::RegGetValueW(HKEY_CURRENT_USER,
+                       L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                       L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) ==
+        ERROR_SUCCESS) {
+        return value == 0;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+bool animationsEnabled() {
+#if defined(_WIN32)
+    BOOL enabled = TRUE;
+    if (::SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &enabled, 0)) {
+        return enabled != FALSE;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
 std::string chooseFolder(const std::string& prompt) {
 #if defined(_WIN32)
     // The UI thread may never have started OLE (the drag-out path does it lazily), and

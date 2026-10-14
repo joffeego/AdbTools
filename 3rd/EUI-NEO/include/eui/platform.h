@@ -8,6 +8,8 @@ using core::platform::FileDialogOptions;
 using core::platform::FileDialogResult;
 using core::platform::FileDialogStatus;
 using core::platform::TrayOptions;
+using core::platform::animationsEnabled;
+using core::platform::systemPrefersDark;
 using core::platform::chooseFile;
 using core::platform::chooseFiles;
 using core::platform::chooseFolder;
