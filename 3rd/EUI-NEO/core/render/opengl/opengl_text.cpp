@@ -112,11 +112,11 @@ bool ensureTextRenderResources(TextRenderResources& resources) {
         "    if (vColored > 0.5) {\n"
         "        vec4 sampleColor = texture(uColorAtlas, vUv);\n"
         "        if (sampleColor.a <= 0.0) discard;\n"
-        "        FragColor = sampleColor * uColor.a;\n"
+        "        FragColor = vec4(sampleColor.rgb * sampleColor.a * uColor.a, sampleColor.a * uColor.a);\n"
         "    } else {\n"
         "        float alpha = texture(uGrayAtlas, vUv).r;\n"
         "        if (alpha <= 0.0) discard;\n"
-        "        FragColor = vec4(uColor.rgb, uColor.a * alpha);\n"
+        "        float outAlpha = uColor.a * alpha;\n        FragColor = vec4(uColor.rgb * outAlpha, outAlpha);\n"
         "    }\n"
         "}\n";
 

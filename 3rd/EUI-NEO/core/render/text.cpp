@@ -1732,19 +1732,18 @@ void TextPrimitive::Impl::rebuildVertices() {
         close(transformMatrix_.ty, std::round(transformMatrix_.ty));
     float blockYOffset = 0.0f;
     if (style_.verticalAlign == VerticalAlign::Center) {
-        float inkTop = std::numeric_limits<float>::max();
-        float inkBottom = std::numeric_limits<float>::lowest();
-        for (size_t lineIndex = 0; lineIndex < lines_.size(); ++lineIndex) {
-            const Line& line = lines_[lineIndex];
-            if (!line.hasInk) {
-                continue;
+        // Centre on the font's em box, not on the ink that happens to be in this string.
+        // Centring the ink means a string with descenders (p/g/q/y/j) has a lower ink
+        // bottom, so centring that box pushed its baseline up: the same font size then
+        // drew "sdcard" and "app-ephemeral" on visibly different lines - impossible to
+        // miss in a breadcrumb, where both appear side by side.
+        const float lineBox = ascent_ - descent_;
+        if (lineBox > 0.0f) {
+            const float lineCount = static_cast<float>(lines_.size());
+            blockYOffset = -lineBox * 0.5f;
+            if (lineCount > 1.0f) {
+                blockYOffset -= (lineCount - 1.0f) * lineHeight * 0.5f;
             }
-            const float lineY = static_cast<float>(lineIndex) * lineHeight;
-            inkTop = std::min(inkTop, lineY + line.inkTop);
-            inkBottom = std::max(inkBottom, lineY + line.inkBottom);
-        }
-        if (inkTop <= inkBottom) {
-            blockYOffset = -(inkTop + inkBottom) * 0.5f;
         } else {
             blockYOffset = -measuredSize_.y * 0.5f;
         }

@@ -787,10 +787,17 @@ int eui_app_run() {
 
     // Render a frame directly from the resize callback so live resizing stays
     // responsive while the OS modal size-move loop blocks the main loop.
+    //
+    // NOT throttled, deliberately: measuring the real cost showed a full repaint is ~45ms
+    // of CPU but only ~11ms of wall time (the rasteriser is threaded, and a resize burst
+    // was observed using ~5 cores). Limiting this to one paint per 70ms therefore bought
+    // nothing and made the content advance in visible steps, which is worse than the
+    // frame cost it was meant to avoid.
     windowState.renderDuringResize = [&] {
         if (renderingFrame) {
             return;
         }
+
         int fbw = 0;
         int fbh = 0;
         glfwGetFramebufferSize(window, &fbw, &fbh);

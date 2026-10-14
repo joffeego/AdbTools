@@ -184,6 +184,11 @@ constexpr float kWideColumnEm = 0.72f;
 float logLinePitch() { return 20.0f * ::core::runtimeFontScale(); }
 float commandLinePitch() { return 24.0f * ::core::runtimeFontScale(); }
 float fontRowPitch() { return 28.0f * ::core::runtimeFontScale(); }
+// Toolbar animation state: the button size and the device selector's width ease toward
+// their targets so resizing the window does not make the icons jump between steps.
+float g_toolbarButtonH = 44.0f;
+float g_toolbarDevW = 200.0f;
+double g_toolbarAnimLastMs = 0.0;
 int columnsFitting(float pixels, float fontSize, float perColumnEm) {
     // The renderer draws at fontSize * 字号, so an estimate built from the raw size
     // over-reports how much fits - at 字号 1.6 the device name ran past the selector's
@@ -5815,20 +5820,44 @@ void composeTopBar(eui::Ui& ui, float x, float y, float w, float hFull) {
     const auto neededWidth = [&](float buttonH, float selectorW) {
         return selectorW + (kToolIcons + kFileActions) * (buttonH + gap) + 24.0f;
     };
+    // Continuous, animated button size. The ladder used to snap between 44/40/36/32 as the
+    // window narrowed, so the icons visibly jumped a step at a time - which reads as
+    // stutter rather than as resizing. Now the target is the largest size that still fits
+    // (computed continuously) and the drawn size eases toward it over ~140ms.
     float devW = 200.0f;
-    float h = kButtonSizes[3];
+    float targetH = kButtonSizes[3];
+    float targetDevW = 150.0f;
     for (float selectorW : {200.0f, 150.0f}) {
-        bool found = false;
-        for (float candidate : kButtonSizes) {
-            if (neededWidth(candidate, selectorW) <= w) {
-                devW = selectorW;
-                h = candidate;
-                found = true;
-                break;
-            }
-        }
-        if (found) break;
+        // Solve neededWidth(h, selectorW) <= w for h, then clamp into the ladder's range.
+        const float fits = (w - 24.0f - selectorW) /
+                               static_cast<float>(kToolIcons + kFileActions) - gap;
+        targetH = neededWidth(kButtonSizes[3], selectorW) <= w
+                      ? kButtonSizes[3]
+                      : std::clamp(fits, kButtonSizes[3], kButtonSizes[0]);
+        targetDevW = selectorW;
+        if (neededWidth(targetH, selectorW) <= w || selectorW == 150.0f) break;
     }
+    {
+        constexpr float kToolbarAnimSeconds = 0.14f;
+        const double nowMs = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+        const double elapsed =
+            g_toolbarAnimLastMs > 0.0 ? (nowMs - g_toolbarAnimLastMs) / 1000.0 : 0.016;
+        g_toolbarAnimLastMs = nowMs;
+        const float step = static_cast<float>(std::min(0.05, elapsed) / kToolbarAnimSeconds);
+        const float maxStep = step * 40.0f;   // px per frame at the animation's speed
+        g_toolbarButtonH +=
+            std::clamp(targetH - g_toolbarButtonH, -maxStep, maxStep);
+        g_toolbarDevW += std::clamp(targetDevW - g_toolbarDevW, -maxStep, maxStep);
+        if (std::fabs(targetH - g_toolbarButtonH) < 0.05f) g_toolbarButtonH = targetH;
+        if (std::fabs(targetDevW - g_toolbarDevW) < 0.5f) g_toolbarDevW = targetDevW;
+        if (g_toolbarButtonH != targetH || g_toolbarDevW != targetDevW) {
+            app::requestUpdate();
+        }
+    }
+    const float h = g_toolbarButtonH;
+    devW = g_toolbarDevW;
 
     // Device selector (opens a context menu).
     std::string deviceLabel = state.selectedDevice.empty() ? "无设备" : state.selectedDevice;
@@ -6228,8 +6257,11 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                         }
                         cursorX += labelW;
                         if (!isLast) {
+                            // Nudged down: text now centres on the font em box, and a
+                            // small glyph like ">" then sits visibly above the words it
+                            // separates. Optically it belongs on the x-height.
                             ui.text(id + ".sep")
-                                .x(cursorX).y(0.0f).size(sepW, h)
+                                .x(cursorX).y(2.0f).size(sepW, h)
                                 .text(">")
                                 .fontSize(fontSize).lineHeight(fontSize)
                                 .color(kMuted)

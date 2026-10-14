@@ -239,12 +239,12 @@ bool ensurePrimitiveResources() {
         "            float edgeFalloff = smoothstep(-blur - spreadBias, 0.0, distanceToEdge);\n"
         "            float innerAlpha = edgeFalloff * sideMask;\n"
         "            if (innerAlpha <= 0.0) discard;\n"
-        "            FragColor = vec4(uShadowColor.rgb, uShadowColor.a * innerAlpha * shapeAlpha * uOpacity);\n"
+        "            float outAlpha = uShadowColor.a * innerAlpha * shapeAlpha * uOpacity;\n            FragColor = vec4(uShadowColor.rgb * outAlpha, outAlpha);\n"
         "            return;\n"
         "        }\n"
         "        float shadowAlpha = 1.0 - smoothstep(-blur, blur, distanceToEdge);\n"
         "        if (shadowAlpha <= 0.0) discard;\n"
-        "        FragColor = vec4(uShadowColor.rgb, uShadowColor.a * shadowAlpha * uOpacity);\n"
+        "        float outAlpha = uShadowColor.a * shadowAlpha * uOpacity;\n        FragColor = vec4(uShadowColor.rgb * outAlpha, outAlpha);\n"
         "        return;\n"
         "    }\n"
         "    float edgeWidth = max(fwidth(distanceToEdge), 0.75);\n"
@@ -262,7 +262,7 @@ bool ensurePrimitiveResources() {
         "    }\n"
         "    float borderAlpha = uBorderWidth > 0.0 ? smoothstep(-uBorderWidth - edgeWidth, -uBorderWidth + edgeWidth, distanceToEdge) : 0.0;\n"
         "    vec4 color = mix(fill, uBorderColor, borderAlpha);\n"
-        "    FragColor = vec4(color.rgb, color.a * shapeAlpha * uOpacity);\n"
+        "    float outAlpha = color.a * shapeAlpha * uOpacity;\n    FragColor = vec4(color.rgb * outAlpha, outAlpha);\n"
         "}\n";
 
     GLuint vertexShader = compileShader(GL_VERTEX_SHADER, vertexSource);
@@ -409,12 +409,12 @@ bool ensureRoundedRectBatchResources() {
         "            float edgeFalloff = smoothstep(-shadowBlur - spreadBias, 0.0, distanceToEdge);\n"
         "            float innerAlpha = edgeFalloff * sideMask;\n"
         "            if (innerAlpha <= 0.0) discard;\n"
-        "            FragColor = vec4(vFillColor.rgb, vFillColor.a * innerAlpha * shapeAlpha * opacity);\n"
+        "            float outAlpha = vFillColor.a * innerAlpha * shapeAlpha * opacity;\n            FragColor = vec4(vFillColor.rgb * outAlpha, outAlpha);\n"
         "            return;\n"
         "        }\n"
         "        float shadowAlpha = 1.0 - smoothstep(-shadowBlur, shadowBlur, distanceToEdge);\n"
         "        if (shadowAlpha <= 0.0) discard;\n"
-        "        FragColor = vec4(vFillColor.rgb, vFillColor.a * shadowAlpha * opacity);\n"
+        "        float outAlpha = vFillColor.a * shadowAlpha * opacity;\n        FragColor = vec4(vFillColor.rgb * outAlpha, outAlpha);\n"
         "        return;\n"
         "    }\n"
         "    float edgeWidth = max(fwidth(distanceToEdge), 0.75);\n"
@@ -426,7 +426,7 @@ bool ensureRoundedRectBatchResources() {
         "    vec4 fill = useGradient ? mix(vGradientStart, vGradientEnd, gradientAmount) : vFillColor;\n"
         "    float borderAlpha = borderWidth > 0.0 ? smoothstep(-borderWidth - edgeWidth, -borderWidth + edgeWidth, distanceToEdge) : 0.0;\n"
         "    vec4 color = mix(fill, vBorderColor, borderAlpha);\n"
-        "    FragColor = vec4(color.rgb, color.a * shapeAlpha * opacity);\n"
+        "    float outAlpha = color.a * shapeAlpha * opacity;\n    FragColor = vec4(color.rgb * outAlpha, outAlpha);\n"
         "}\n";
 
     GLuint vertexShader = compileShader(GL_VERTEX_SHADER, vertexSource);
@@ -543,7 +543,7 @@ bool ensurePolygonResources() {
         "    float edgeWidth = max(fwidth(signedDistance), 0.75);\n"
         "    float shapeAlpha = 1.0 - smoothstep(-edgeWidth, edgeWidth, signedDistance);\n"
         "    if (shapeAlpha <= 0.0) discard;\n"
-        "    FragColor = vec4(uFillColor.rgb, uFillColor.a * shapeAlpha * uOpacity);\n"
+        "    float outAlpha = uFillColor.a * shapeAlpha * uOpacity;\n    FragColor = vec4(uFillColor.rgb * outAlpha, outAlpha);\n"
         "}\n";
 
     GLuint vertexShader = compileShader(GL_VERTEX_SHADER, vertexSource);
