@@ -38,7 +38,18 @@ constexpr const char* kDefaultUiFontFile = "JingNanJunJunTi-JinNanJunJunTi-Bold-
 constexpr const char* kDefaultIconFontFile = "Font Awesome 7 Free-Solid-900.otf";
 constexpr int kGrayAtlasSize = 4096;
 constexpr int kColorAtlasSize = 2048;
-constexpr FT_Int32 kGlyphLoadFlags = FT_LOAD_DEFAULT | FT_LOAD_COLOR | FT_LOAD_NO_SVG | FT_LOAD_TARGET_LIGHT;
+// FT_LOAD_TARGET_NORMAL, not LIGHT.
+//
+// LIGHT is the "slight hinting" mode: it deliberately does NOT grid-fit stems horizontally,
+// so a vertical stem lands on a fractional pixel and the rasterizer spreads it over two
+// columns of grey. That is the right trade for subpixel-positioned text on macOS, but this is
+// a Windows UI drawn at small sizes, where every glyph ends up slightly soft - which matches
+// the report that text looks blurry everywhere rather than on one screen.
+//
+// NORMAL grid-fits the outline to the pixel grid before rasterizing, so stems land on whole
+// pixels. Together with the glyph snapping in rebuildVertices (quad origin rounded to the
+// device pixel grid) that makes the bitmap and the quad line up 1:1.
+constexpr FT_Int32 kGlyphLoadFlags = FT_LOAD_DEFAULT | FT_LOAD_COLOR | FT_LOAD_NO_SVG | FT_LOAD_TARGET_NORMAL;
 
 struct FontFace {
     std::string path;
@@ -1723,13 +1734,26 @@ void TextPrimitive::Impl::rebuildVertices() {
     const auto close = [](float left, float right) {
         return std::fabs(left - right) <= 0.0001f;
     };
-    const bool pixelAlignedMatrix = hasTransformMatrix_ &&
-        close(transformMatrix_.m00, 1.0f) && close(transformMatrix_.m01, 0.0f) &&
-        close(transformMatrix_.m10, 0.0f) && close(transformMatrix_.m11, 1.0f) &&
-        close(transformMatrix_.px, 0.0f) && close(transformMatrix_.py, 0.0f) &&
-        close(transformMatrix_.pw, 1.0f) &&
-        close(transformMatrix_.tx, std::round(transformMatrix_.tx)) &&
-        close(transformMatrix_.ty, std::round(transformMatrix_.ty));
+    // Whether a glyph may be snapped to the integer device-pixel grid: true when the
+    // placement is a pure translation (no rotation, no scale, no visual scale).
+    //
+    // This used to also require the translation itself to be integral, which at 150% DPI is
+    // almost never the case: a logical x of 24.3 becomes physical 36.45, the test failed, and
+    // every glyph was then drawn at a fractional position. Glyph bitmaps are rasterized at the
+    // full physical size, so drawing them off-grid makes the texture filter (GL_LINEAR)
+    // resample each one - text came out soft everywhere, worst where the fractional part was
+    // closest to 0.5. Snapping is what makes the quad and the bitmap line up 1:1.
+    const bool translationOnly =
+        (hasTransformMatrix_ &&
+         close(transformMatrix_.m00, 1.0f) && close(transformMatrix_.m01, 0.0f) &&
+         close(transformMatrix_.m10, 0.0f) && close(transformMatrix_.m11, 1.0f) &&
+         close(transformMatrix_.px, 0.0f) && close(transformMatrix_.py, 0.0f) &&
+         close(transformMatrix_.pw, 1.0f)) ||
+        (!hasTransformMatrix_ &&
+         std::fabs(transform_.rotate) <= 0.0001f &&
+         std::fabs(transform_.scale.x - 1.0f) <= 0.0001f &&
+         std::fabs(transform_.scale.y - 1.0f) <= 0.0001f);
+    const bool canSnapToPixelGrid = translationOnly && close(visualScale_, 1.0f);
     float blockYOffset = 0.0f;
     if (style_.verticalAlign == VerticalAlign::Center) {
         // Centre on the font's em box, not on the ink that happens to be in this string.
@@ -1816,8 +1840,8 @@ void TextPrimitive::Impl::rebuildVertices() {
                 p3 = scalePoint(p3);
             }
 
-            if (!glyph.colored && pixelAlignedMatrix) {
-                const float offsetX = std::round(p0.x) - p0.x;
+
+            if (!glyph.colored && canSnapToPixelGrid) {                const float offsetX = std::round(p0.x) - p0.x;
                 const float offsetY = std::round(p0.y) - p0.y;
                 p0 = {p0.x + offsetX, p0.y + offsetY};
                 p1 = {p1.x + offsetX, p1.y + offsetY};

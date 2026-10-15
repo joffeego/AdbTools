@@ -116,6 +116,12 @@ bool ensureTextRenderResources(TextRenderResources& resources) {
         "    } else {\n"
         "        float alpha = texture(uGrayAtlas, vUv).r;\n"
         "        if (alpha <= 0.0) discard;\n"
+        // Coverage gamma (what GDI calls gamma correction / stem darkening). Greyscale\n"
+        // antialiasing blends in sRGB, where a half-covered stem reads as much fainter\n"
+        // than half a stem - which is why un-darkened AA text looks thin and soft next to\n"
+        // a GDI/DirectWrite-rendered label of the same size. Raising the coverage to a\n"
+        // power below 1 restores the missing weight without touching the glyph shapes.\n"
+        "        alpha = pow(alpha, 0.80);\n"
         "        FragColor = vec4(uColor.rgb, uColor.a * alpha);\n"
         "    }\n"
         "}\n";
