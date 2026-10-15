@@ -5982,13 +5982,14 @@ bool uiAnimationsEnabled() {
 
 void composeFileList(eui::Ui& ui, float x, float y, float w, float h, float pathRowY,
                      float pathRightControlsX) {
-    // 4, not 10: the list content is clipped by a square scroll area, so a large corner
-    // radius left the content square corners sticking out past the card rounding - visible
-    // as sharp traces at the four corners whenever a row sat exactly on an edge.
+    // Rounded corners. These were briefly flattened to 4 to chase "sharp traces at the
+    // corners" - the real cause was the square scroll-fade bands painting over the rounding,
+    // and with those gone the rounding is safe: the rows are inset 6px inside the card, so
+    // their square clip never reaches the corner arcs.
     ui.rect("list.bg")
         .x(x).y(y).size(w, h)
         .color(kSurface)
-        .radius(4.0f)
+        .radius(10.0f)
         .border(1.0f, kBorder)
         .build();
 
@@ -9577,37 +9578,10 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeHeader(ui, x + 6.0f, headerY, contentW - 12.0f, headerH);
             composeFileList(ui, x, listY, contentW, listH, pathY, pathRightControlsX);
 
-            // Scroll edge effect: rows are cut off flat where the list meets the header above
-            // and the status bar below. A short gradient of the list's own background makes
-            // the cut read as "content continues underneath" instead of a hard slice.
-            // Only when the list actually overflows: with three entries and a tall window
-            // there is nothing to scroll, and a fade would just dim the first row.
-            const bool listOverflows =
-                static_cast<float>(state.entries.size()) * kRowHeight > listH;
-            if (listOverflows && listH > 80.0f) {
-                constexpr int kFadeSteps = 6;
-                constexpr float kFadeStep = 2.0f;
-                constexpr float kFadeMaxAlpha = 0.85f;
-                for (int i = 0; i < kFadeSteps; ++i) {
-                    const float a = kFadeMaxAlpha * (1.0f - static_cast<float>(i) / kFadeSteps);
-                    // Inset by the card corner radius. These bands are square; drawn full width
-                    // they covered the rounded corners, which is what made the corners look
-                    // cut. Outside the inset there is no card to fade, so this leaves no seam.
-                    constexpr float kListRadius = 4.0f;
-                    const float fadeX = x + kListRadius;
-                    const float fadeW = std::max(0.0f, contentW - kListRadius * 2.0f);
-                    ui.rect("list.fade.top." + std::to_string(i))
-                        .x(fadeX).y(listY + static_cast<float>(i) * kFadeStep)
-                        .size(fadeW, kFadeStep)
-                        .color(eui::Color{kBackground.r, kBackground.g, kBackground.b, a})
-                        .build();
-                    ui.rect("list.fade.bottom." + std::to_string(i))
-                        .x(fadeX).y(listY + listH - static_cast<float>(i + 1) * kFadeStep)
-                        .size(fadeW, kFadeStep)
-                        .color(eui::Color{kBackground.r, kBackground.g, kBackground.b, a})
-                        .build();
-                }
-            }
+            // The list used to paint a six-step gradient over its top and bottom edges to
+            // suggest "more rows underneath". It read as a shadow smeared across the card and
+            // it fought the corner rounding (the bands are square, the card is not), so it is
+            // gone: the scrollbar already says there is more to scroll.
             composeStatusBar(ui, x, statusY, contentW, statusH);
 
             composeToast(ui, W, H);
