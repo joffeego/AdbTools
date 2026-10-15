@@ -159,9 +159,21 @@ inline runtime::DependentVisualState Runtime::dependentVisualStateForElement(
         : visualDirtyRectForElement(element, dpiScale, inheritedTransform);
     state.rect = inflateRect(visualBounds, dependentVisualPadding());
 
-    if (!element.hoverOpacitySourceId.empty()) {
+    if (!element.hoverOpacitySourceId.empty() || !element.hoverOpacityExtraIds.empty()) {
         float hover = 0.0f;
-        if (instances_.hoverBlend(element.hoverOpacitySourceId, hover)) {
+        bool hovered = false;
+        if (!element.hoverOpacitySourceId.empty()) {
+            hovered = instances_.hoverBlend(element.hoverOpacitySourceId, hover);
+        }
+        // Any extra source being hovered counts too (the macOS traffic-light cluster).
+        for (const std::string& extra : element.hoverOpacityExtraIds) {
+            float value = 0.0f;
+            if (instances_.hoverBlend(extra, value)) {
+                hover = hovered ? std::max(hover, value) : value;
+                hovered = true;
+            }
+        }
+        if (hovered) {
             hover = std::clamp(hover, 0.0f, 1.0f);
             state.opacity *= lerpValue(element.hoverHiddenOpacity, element.hoverVisibleOpacity, hover);
         } else {

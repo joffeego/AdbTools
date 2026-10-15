@@ -56,6 +56,21 @@ inline float menuHeight(std::size_t itemCount, float itemHeight, float inset) {
     return itemHeight * static_cast<float>(itemCount) + inset * 2.0f;
 }
 
+// Width for a menu that was given no explicit size: measure the widest entry instead of
+// falling back to a fixed 190pt, which clipped anything longer (a device name plus its
+// serial, a long bookmark alias). The screen clamp at the call site still caps the result.
+inline float menuAutoWidth(const std::vector<ContextMenuItem>& items,
+                           const theme::ThemeMetricTokens& metrics) {
+    const float fontSize = metrics.typography.option * core::runtimeFontScale();
+    const float padding = metrics.spacing.panel * 2.0f + metrics.control.compact;
+    float widest = 0.0f;
+    for (const ContextMenuItem& item : items) {
+        if (item.text.empty()) continue;   // separator
+        widest = std::max(widest, core::TextPrimitive::measureTextWidth(item.text, {}, fontSize, 400));
+    }
+    return std::max(widest + padding, metrics.control.control * 3.0f);
+}
+
 inline float clampMenuY(float desiredY, float height, float screenHeight) {
     return std::clamp(desiredY, 8.0f, std::max(8.0f, screenHeight - height - 8.0f));
 }
@@ -125,7 +140,10 @@ public:
 
         const float inset = metrics_.spacing.small;
         const float itemHeight = resolvedItemHeight();
-        const float width = std::min(width_, std::max(0.0f, screenWidth_ - metrics_.spacing.section));
+        // width_ == 0 means "no explicit size": fit the content (see menuAutoWidth).
+        const float requestedWidth =
+            width_ > 0.0f ? width_ : context_menu_detail::menuAutoWidth(items_, metrics_);
+        const float width = std::min(requestedWidth, std::max(0.0f, screenWidth_ - metrics_.spacing.section));
         const float xInset = metrics_.spacing.compact;
         const float height = context_menu_detail::menuHeight(items_.size(), itemHeight, inset);
         const float x = std::clamp(x_, xInset, std::max(xInset, screenWidth_ - width - xInset));
@@ -362,7 +380,7 @@ private:
     float screenHeight_ = 600.0f;
     float x_ = 0.0f;
     float y_ = 0.0f;
-    float width_ = 190.0f;
+    float width_ = 0.0f;   // 0 = size to the content (menuAutoWidth)
     float itemHeight_ = 0.0f;
     int zIndex_ = 1050;
     int activeIndex_ = -1;

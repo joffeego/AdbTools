@@ -180,6 +180,11 @@ public:
                 // Ask the layout to put this line in the upper third rather than at the
                 // bottom edge (see InputState::revealScrollPending).
                 state.revealScrollPending = true;
+                // ...and re-engage the follow-caret scroll. The wheel clears followCaret, and
+                // the layout only honours revealScrollPending while it is set - so after
+                // scrolling away, "next match" moved the selection but never brought it back
+                // on screen. An explicit jump outranks the user's scroll.
+                state.followCaret = true;
             }
         }
         const InputLayout layout = InputLayout::build(state, textWidth, textHeight, width_, inset, textY, layoutLineHeight, fontFamily_, fontSize, multiline_);

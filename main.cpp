@@ -3268,6 +3268,59 @@ static HANDLE g_scrcpyProcess = nullptr;
 static HWND g_mirrorHwnd = nullptr;
 static HWND g_scrcpyHwnd = nullptr;
 
+// Primary screen size in physical pixels (the process is per-monitor DPI aware, so these
+// are real pixels and match what GLFW uses for window sizes).
+void primaryScreenSize(int& outW, int& outH) {
+    outW = GetSystemMetrics(SM_CXSCREEN);
+    outH = GetSystemMetrics(SM_CYSCREEN);
+    if (outW <= 0) outW = 1920;
+    if (outH <= 0) outH = 1080;
+}
+
+// The mirror window opens at two thirds of the whole screen height, keeping the phone
+// aspect ratio. It used to reuse whatever size the previous session happened to save, so
+// the first run of a fresh install was 320x640 and later runs were anyone guess.
+void mirrorDefaultSize(int& outW, int& outH) {
+    int screenW = 0;
+    int screenH = 0;
+    primaryScreenSize(screenW, screenH);
+    const int devW = g_mirrorDeviceW > 0 ? g_mirrorDeviceW : 9;
+    const int devH = g_mirrorDeviceH > 0 ? g_mirrorDeviceH : 19;
+    outH = std::max(360, static_cast<int>(static_cast<float>(screenH) * (2.0f / 3.0f)));
+    outW = std::max(200, static_cast<int>(static_cast<float>(outH) *
+                                          (static_cast<float>(devW) / static_cast<float>(devH))));
+}
+
+// Applies the mirror window geometry: two thirds of the whole screen height, phone aspect
+// ratio, centred. Size AND position are both set here rather than relying on the numbers
+// passed to openWindow, whose unit convention (logical vs physical) is easy to get wrong.
+void applyMirrorGeometry(HWND hwnd) {
+    if (hwnd == nullptr) return;
+    int screenW = 0;
+    int screenH = 0;
+    primaryScreenSize(screenW, screenH);
+    int w = 0;
+    int h = 0;
+    mirrorDefaultSize(w, h);
+    const int x = (screenW - w) / 2;
+    const int y = (screenH - h) / 2;
+    SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// The mirror window is created by the framework shortly after openWindow, and scrcpyEmbedLoop
+// cannot be used for this: it waits for the scrcpy video window too, which never appears when
+// scrcpy cannot connect. This watcher only needs the mirror window itself.
+void watchMirrorWindow() {
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        HWND hwnd = FindWindowW(nullptr, L"adb_browser_mirror");
+        if (hwnd != nullptr) {
+            applyMirrorGeometry(hwnd);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
 struct FindWindowByPid {
     DWORD pid;
     HWND hwnd;
@@ -3500,13 +3553,13 @@ void openMirror() {
     core::adoptChildProcess(pi.hProcess);  // the mirror window closes with the app
     g_scrcpyProcess = pi.hProcess;
     state.scrcpyOpen = true;
-    // Mirror size is stored in logical units; convert to physical for the
-    // window (same DPI handling as the main window).
-    const float mirrorScale = windowDpiScale();
-    app::openWindow("adb_browser_mirror",
-                    static_cast<int>(settings.mirrorW * mirrorScale),
-                    static_cast<int>(settings.mirrorH * mirrorScale),
-                    composeMirrorWindow);
+    // Two thirds of the whole screen height at the phone aspect ratio, then centred (see
+    // mirrorDefaultSize / centreMirrorWindow).
+    int mirrorW = 0;
+    int mirrorH = 0;
+    mirrorDefaultSize(mirrorW, mirrorH);
+    app::openWindow("adb_browser_mirror", mirrorW, mirrorH, composeMirrorWindow);
+    std::thread([] { watchMirrorWindow(); }).detach();
     std::thread([] { scrcpyEmbedLoop(); }).detach();
 #else
     state.scrcpyOpen = true;
@@ -4047,6 +4100,26 @@ void openUpdateDialog() {
     checkForUpdates();
 }
 
+// Latest release tag from the repository Atom feed. api.github.com allows only 60
+// unauthenticated requests per hour per IP and every launch of this app spends at least one,
+// so the quota is easy to exhaust; exhausted, it answers 403 with a body that has no
+// tag_name, which was read as "no newer version". github.com serves the feed itself and is
+// not limited the same way, so it is a usable fallback for "is there a newer version?".
+std::string latestReleaseTagFromFeed(const std::string& xml) {
+    const std::size_t entry = xml.find("<entry>");
+    if (entry == std::string::npos) return {};
+    const std::size_t titleOpen = xml.find("<title>", entry);
+    if (titleOpen == std::string::npos) return {};
+    const std::size_t valueStart = titleOpen + 7;   // strlen("<title>")
+    const std::size_t titleClose = xml.find("</title>", valueStart);
+    if (titleClose == std::string::npos) return {};
+    std::string tag = core::trim(xml.substr(valueStart, titleClose - valueStart));
+    if (!tag.empty() && tag[0] == 'v') tag = tag.substr(1);
+    // Only version-looking values: an HTML error page must not become a version number.
+    if (tag.empty() || tag[0] < '0' || tag[0] > '9') return {};
+    return tag;
+}
+
 void checkForUpdates() {
     if (state.updateChecking || state.updateWorking) return;
     state.updateChecking = true;
@@ -4095,13 +4168,32 @@ void checkForUpdates() {
                 info.error = "获取 adb 最新版本失败：" + hr2.error;
             }
             // This app itself: latest release from the configured GitHub repo.
+            //
+            // Only a response that really carries a tag counts as an answer. The old code
+            // took an empty tag_name as the answer, so a rate-limited (403) response - and a
+            // 200 whose body parsed to nothing - both became "already up to date", and an
+            // available update was reported as 已是最新版本.
             info.appCurrent = kAppVersion;
             HttpResult hr3 = httpGetString(std::string("https://api.github.com/repos/") + kAppUpdateRepo + "/releases/latest", 2 * 1024 * 1024);
             if (hr3.ok) {
                 std::string tag = core::jsonStringValue(hr3.body, "tag_name");
                 if (!tag.empty() && tag[0] == 'v') tag = tag.substr(1);
                 info.appLatest = tag;
-                core::findAppReleaseAsset(hr3.body, info.appUrl, info.appRow, info.appSha256);
+            }
+            if (info.appLatest.empty()) {
+                // API unavailable or unhelpful: ask the feed instead.
+                HttpResult hrFeed = httpGetString(
+                    std::string("https://github.com/") + kAppUpdateRepo + "/releases.atom",
+                    2 * 1024 * 1024);
+                if (hrFeed.ok) info.appLatest = latestReleaseTagFromFeed(hrFeed.body);
+            }
+            if (!info.appLatest.empty()) {
+                // Assets and the SHA-256 sidecar still come from the API response when there
+                // is one. Without it the update is still reported, and the "newer release has
+                // no download package" path points the user at the Releases page.
+                if (hr3.ok) {
+                    core::findAppReleaseAsset(hr3.body, info.appUrl, info.appRow, info.appSha256);
+                }
                 // Older releases carry no asset "digest"; fall back to the
                 // ".sha256" sidecar the release workflow publishes next to each
                 // artifact (the digest lookup itself lives in core/package).
@@ -4118,7 +4210,8 @@ void checkForUpdates() {
                     }
                 }
             } else if (info.error.empty()) {
-                info.error = "获取本软件最新版本失败：" + hr3.error;
+                info.error = hr3.ok ? "获取本软件最新版本失败：返回内容里没有版本号。"
+                                    : "获取本软件最新版本失败：" + hr3.error;
             }
 #else
             if (info.error.empty()) info.error = "此平台暂不支持在线检查更新。";
@@ -5887,11 +5980,15 @@ bool uiAnimationsEnabled() {
     return enabled;
 }
 
-void composeFileList(eui::Ui& ui, float x, float y, float w, float h, float pathRowY) {
+void composeFileList(eui::Ui& ui, float x, float y, float w, float h, float pathRowY,
+                     float pathRightControlsX) {
+    // 4, not 10: the list content is clipped by a square scroll area, so a large corner
+    // radius left the content square corners sticking out past the card rounding - visible
+    // as sharp traces at the four corners whenever a row sat exactly on an edge.
     ui.rect("list.bg")
         .x(x).y(y).size(w, h)
         .color(kSurface)
-        .radius(10.0f)
+        .radius(4.0f)
         .border(1.0f, kBorder)
         .build();
 
@@ -6037,8 +6134,10 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h, float path
             ui.stack("list.search.wrap")
                 // In the path row rather than over the list: it used to sit at the top of
                 // the list rect, covering the column headers and the first row of files.
-                // 280 leaves the magnifier (which opens this field) clear on the right.
-                .x(x + w - 280.0f + slideX).y(pathRowY + 4.0f + slideY).size(228.0f, 32.0f)
+                // Anchored to the magnifier left edge (minus a gap) instead of a hand-counted
+                // offset, so the field cross can never land on top of the button again.
+                .x(pathRightControlsX - 8.0f - 228.0f + slideX)
+                .y(pathRowY + 4.0f + slideY).size(228.0f, 32.0f)
                 .zIndex(20)
             .content([&] {
                 // The field stops 8px short of the X. It used to be 192 wide with the X
@@ -6174,6 +6273,8 @@ void composeTitleBar(eui::Ui& ui, float W, float h) {
         unsigned int glyph;
         float glyphSize;
         std::function<void()> action;
+        // Draw a dash instead of the font glyph (see the minimise dot below).
+        bool dash = false;
     };
     // All three sit on exactly the same baseline. The green one can read as slightly low
     // because its higher luminance leaves its lower edge with the least contrast against a
@@ -6187,12 +6288,29 @@ void composeTitleBar(eui::Ui& ui, float W, float h) {
     // right and behaves like Windows, so the order matches where the window actually puts
     // them. Reverted: this is the owner's call, not a defect.
     const DotSpec dots[3] = {
-        {"titlebar.min", 0.996f, 0.737f, 0.180f, 0xF068, 7.0f, [] { app::minimizeWindow(); }},
+        // dash = true: the font's minus glyph does not put any ink inside the 12px dot box,
+        // so the amber dot rendered empty. macOS draws this one as a short dash anyway.
+        {"titlebar.min", 0.996f, 0.737f, 0.180f, 0xF068, 7.0f,
+         [] { app::minimizeWindow(); }, true},
         {"titlebar.max", 0.157f, 0.784f, 0.251f, 0xF065, 6.5f,
          [] { app::toggleMaximizeWindow(); }},
         {"titlebar.close", 1.000f, 0.373f, 0.341f, 0xF00D, 7.0f,
          [] { stopLogcat(); saveWindowState(); app::closeWindow(); }},
     };
+    // macOS shows all three glyphs at once, as soon as the pointer is anywhere over the
+    // cluster - not only over the dot under the cursor. Every glyph is bound to all three
+    // dots AND all three hit areas.
+    //
+    // The dot matters: an element whose hover/pressed state colours are identical to its
+    // base colour never reports hover, and the hit rect is exactly that (it paints the title
+    // bar colour in all three states so it stays invisible). Binding the glyph to the hit
+    // rect alone is why the glyphs never appeared at all on hover.
+    std::vector<std::string> dotHoverSources;
+    for (const DotSpec& d : dots) {
+        dotHoverSources.push_back(std::string(d.id) + ".dot");
+        dotHoverSources.push_back(std::string(d.id) + ".hit");
+    }
+
     for (const DotSpec& d : dots) {
         const float dx = dotsX + static_cast<float>(&d - dots) * kDotPitch;
         // A 22px hit area around a 12px dot: the dot is the visual, the hit area is what a
@@ -6216,16 +6334,26 @@ void composeTitleBar(eui::Ui& ui, float W, float h) {
                     eui::mixColor(eui::Color{d.r, d.g, d.b, 1.0f}, eui::Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.24f))
             .radius(kDotSize * 0.5f)
             .build();
-        // The glyph only appears while the pointer is over that dot, like macOS.
-        ui.text(std::string(d.id) + ".glyph")
-            .x(dx).y(dotY).size(kDotSize, kDotSize)
-            .icon(d.glyph)
-            .fontSize(d.glyphSize).lineHeight(d.glyphSize)
-            .color(eui::Color{0.0f, 0.0f, 0.0f, 0.55f})
-            .horizontalAlign(eui::HorizontalAlign::Center)
-            .verticalAlign(eui::VerticalAlign::Center)
-            .hoverOpacityFrom(std::string(d.id) + ".hit")
-            .build();
+        // Shown while any part of the cluster is hovered, like macOS.
+        if (d.dash) {
+            ui.rect(std::string(d.id) + ".dash")
+                .x(dx + kDotSize * 0.5f - 3.5f).y(dotY + kDotSize * 0.5f - 0.75f)
+                .size(7.0f, 1.5f)
+                .color(eui::Color{0.0f, 0.0f, 0.0f, 0.55f})
+                .radius(0.75f)
+                .hoverOpacityFromAny(dotHoverSources)
+                .build();
+        } else {
+            ui.text(std::string(d.id) + ".glyph")
+                .x(dx).y(dotY).size(kDotSize, kDotSize)
+                .icon(d.glyph)
+                .fontSize(d.glyphSize).lineHeight(d.glyphSize)
+                .color(eui::Color{0.0f, 0.0f, 0.0f, 0.55f})
+                .horizontalAlign(eui::HorizontalAlign::Center)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .hoverOpacityFromAny(dotHoverSources)
+                .build();
+        }
     }
 }
 
@@ -6608,7 +6736,7 @@ void cancelPathEdit() {
     state.pathInput = state.currentPath;
 }
 
-void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
+float composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
     const float navW = h;
     const float step = navW + 8.0f;
     toolButton(ui, "path.back", x, y, navW, h, 0xF053, "", false, !state.pathBack.empty(), [] { goBack(); }, 16.0f);
@@ -6670,12 +6798,15 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                         commitPathEdit(picked.empty() ? state.pathInput : picked);
                     })
                     .build();
-                toolButton(ui, "path.edit.ok", inputW + 8.0f, 0.0f, btnW, h, 0xF00C, "", true, true,
+                // 1:1 and square inside the 40pt row: these were 32 wide but the full row
+                // height, so the two glyph buttons read as tall rectangles.
+                const float editBtnY = (h - btnW) * 0.5f;
+                toolButton(ui, "path.edit.ok", inputW + 8.0f, editBtnY, btnW, btnW, 0xF00C, "", true, true,
                            [] {
                                const std::string picked = pickedPathSuggestion();
                                commitPathEdit(picked.empty() ? state.pathInput : picked);
                            });
-                toolButton(ui, "path.edit.cancel", inputW + btnW + 16.0f, 0.0f, btnW, h, 0xF00D, "", false, true,
+                toolButton(ui, "path.edit.cancel", inputW + btnW + 16.0f, editBtnY, btnW, btnW, 0xF00D, "", false, true,
                            [] { cancelPathEdit(); });
             })
             .build();
@@ -6719,11 +6850,16 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                 })
                 .build();
         }
-        return;
+        // Returns the left edge of the right-most control in this row. The list search field
+        // is drawn by composeFileList over this same row and has to stop short of it: while
+        // it was anchored to a hand-counted offset, the field cross landed on the magnifier.
+        return crumbX + inputW + btnW + 16.0f;
     }
 
     const float editW = 32.0f;
     const float segW = crumbW - editW - 6.0f;
+    // Left edge of the magnifier: the right-most control when the path is not being edited.
+    const float searchBtnLeft = crumbX + crumbW - editW * 2.0f - 8.0f;
 
     ui.stack("breadcrumb")
         .x(crumbX).y(y).size(crumbW, h)
@@ -6816,7 +6952,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
               // the path bar is the list's own toolbar, so a control that acts on the list
               // belongs there. It stays highlighted while a filter is active.
               const float searchBtnW = editW;
-              const float searchBtnX = crumbW - editW * 2.0f - 8.0f;
+              const float searchBtnX = searchBtnLeft - crumbX;
               ui.rect("breadcrumb.search.hit")
                   .x(searchBtnX).y(1.0f).size(searchBtnW, h - 2.0f)
                   .states(state.searchOpen ? kAccentSoft : kClear, kSurfaceHover, kSurfaceAct)
@@ -6854,6 +6990,8 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                 .build();
         })
         .build();
+
+    return searchBtnLeft;
 }
 
 void composeStatusBar(eui::Ui& ui, float x, float y, float w, float h) {
@@ -7677,10 +7815,13 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
     // cramped; the extra width is what "less busy" actually needed.
     // 720: the card was a narrow column in a 1080-wide window, so the path field and the
     // three dropdowns were always squeezed while both sides sat empty.
-    const float pw = std::min(720.0f, std::max(360.0f, w - 48.0f));
+    // 660 wide and h-56 tall: at 720 the card read as oversized for its content and used
+    // the whole window height. Trimmed a little while keeping the three-column display
+    // row and the 12-swatch theme row comfortable.
+    const float pw = std::min(660.0f, std::max(360.0f, w - 48.0f));
     // 640, not 600: three section headers add ~66px of vertical structure, and the font
     // list should not pay for it.
-    const float ph = std::min(780.0f, std::max(380.0f, h - 48.0f));
+    const float ph = std::min(700.0f, std::max(380.0f, h - 56.0f));
 
     components::dialog(ui, "settings.dialog")
         .screen(w, h)
@@ -7747,7 +7888,10 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 constexpr int kSegCount = 3;
                 const char* kSegLabels[kSegCount] = {"深色", "浅色", "跟随系统"};
                 const float trackW = kSegW * static_cast<float>(kSegCount);
-                const float trackX = pw - 24.0f - trackW;
+                // Left-aligned to the shared control column rather than right-anchored to the
+                // card margin, which is what put this control at 444 while the rows below
+                // started at 104 and 170.
+                const float trackX = 170.0f;
                 const float trackY = 92.0f + (kToggleRowH - kSegH) * 0.5f;
 
                 // Thumb position eases toward the active segment; instant when the OS asks
@@ -7827,7 +7971,10 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                   
                   // 26, not 24: a 6px gap between swatches reads as a deliberate row rather
                   // than a solid band of colour.
-                  const float sx = 104.0f + static_cast<float>(i) * 28.0f;
+                  // 170, the shared control column (the display row dropdowns start at the
+                  // same x). The swatches used to start at 104 while the theme track sat at
+                  // 444 and the display row at 170: three different control left edges.
+                  const float sx = 170.0f + static_cast<float>(i) * 28.0f;
                   // 106, not 105: at 150% DPI a logical 105 lands on a half device pixel and the
                     // circle's top row gets clipped - which read as a faint horizontal line
                     // across the top of every swatch.
@@ -9426,9 +9573,9 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
 
             composeTitleBar(ui, W, kTitleBarHeight);
             composeTopBar(ui, x, topY, contentW, topBarH);
-            composeBreadcrumb(ui, x, pathY, contentW, pathBarH);
+            const float pathRightControlsX = composeBreadcrumb(ui, x, pathY, contentW, pathBarH);
             composeHeader(ui, x + 6.0f, headerY, contentW - 12.0f, headerH);
-            composeFileList(ui, x, listY, contentW, listH, pathY);
+            composeFileList(ui, x, listY, contentW, listH, pathY, pathRightControlsX);
 
             // Scroll edge effect: rows are cut off flat where the list meets the header above
             // and the status bar below. A short gradient of the list's own background makes
@@ -9443,14 +9590,20 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
                 constexpr float kFadeMaxAlpha = 0.85f;
                 for (int i = 0; i < kFadeSteps; ++i) {
                     const float a = kFadeMaxAlpha * (1.0f - static_cast<float>(i) / kFadeSteps);
+                    // Inset by the card corner radius. These bands are square; drawn full width
+                    // they covered the rounded corners, which is what made the corners look
+                    // cut. Outside the inset there is no card to fade, so this leaves no seam.
+                    constexpr float kListRadius = 4.0f;
+                    const float fadeX = x + kListRadius;
+                    const float fadeW = std::max(0.0f, contentW - kListRadius * 2.0f);
                     ui.rect("list.fade.top." + std::to_string(i))
-                        .x(x).y(listY + static_cast<float>(i) * kFadeStep)
-                        .size(contentW, kFadeStep)
+                        .x(fadeX).y(listY + static_cast<float>(i) * kFadeStep)
+                        .size(fadeW, kFadeStep)
                         .color(eui::Color{kBackground.r, kBackground.g, kBackground.b, a})
                         .build();
                     ui.rect("list.fade.bottom." + std::to_string(i))
-                        .x(x).y(listY + listH - static_cast<float>(i + 1) * kFadeStep)
-                        .size(contentW, kFadeStep)
+                        .x(fadeX).y(listY + listH - static_cast<float>(i + 1) * kFadeStep)
+                        .size(fadeW, kFadeStep)
                         .color(eui::Color{kBackground.r, kBackground.g, kBackground.b, a})
                         .build();
                 }

@@ -358,9 +358,20 @@ public:
             }
         }
 
-        if (!element.hoverOpacitySourceId.empty()) {
+        if (!element.hoverOpacitySourceId.empty() || !element.hoverOpacityExtraIds.empty()) {
             float hover = 0.0f;
-            if (hoverBlend(element.hoverOpacitySourceId, hover)) {
+            bool hovered = false;
+            if (!element.hoverOpacitySourceId.empty()) {
+                hovered = hoverBlend(element.hoverOpacitySourceId, hover);
+            }
+            for (const std::string& extra : element.hoverOpacityExtraIds) {
+                float value = 0.0f;
+                if (hoverBlend(extra, value)) {
+                    hover = hovered ? std::max(hover, value) : value;
+                    hovered = true;
+                }
+            }
+            if (hovered) {
                 hover = std::clamp(hover, 0.0f, 1.0f);
                 result.opacity *= lerpValue(
                     element.hoverHiddenOpacity,

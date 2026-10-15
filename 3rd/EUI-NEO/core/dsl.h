@@ -195,6 +195,10 @@ struct Element {
     float timerSeconds = 0.0f;
     std::string visualStateSourceId;
     std::string hoverOpacitySourceId;
+    // Extra hover sources: the element fades in when ANY of them is hovered. macOS reveals
+    // all three title-bar glyphs as soon as the pointer is over the cluster, which a single
+    // source cannot express.
+    std::vector<std::string> hoverOpacityExtraIds;
     std::string pointerRuntimeSourceId;
     std::string scrollStateId;
     std::string scrollContentSourceId;
@@ -780,6 +784,10 @@ public:
 
     Derived& visualStateFrom(const std::string& id, float pressedScaleValue = 0.965f);
     Derived& hoverOpacityFrom(const std::string& id, float hiddenOpacity = 0.0f, float visibleOpacity = 1.0f);
+    // Fades in while any id in `ids` is hovered. The first id is the primary source, so the
+    // existing single-source bookkeeping and predicates keep working.
+    Derived& hoverOpacityFromAny(std::vector<std::string> ids, float hiddenOpacity = 0.0f,
+                                 float visibleOpacity = 1.0f);
     Derived& runtimePointerTransformFrom(const std::string& id,
                                          float maxRotateXRadians = 0.0f,
                                          float maxRotateYRadians = 0.0f,
@@ -1824,6 +1832,23 @@ Derived& BuilderBase<Derived>::visualStateFrom(const std::string& id, float pres
 template <typename Derived>
 Derived& BuilderBase<Derived>::hoverOpacityFrom(const std::string& id, float hiddenOpacity, float visibleOpacity) {
     element_->hoverOpacitySourceId = ui_->resolveId(id);
+    element_->hoverHiddenOpacity = std::clamp(hiddenOpacity, 0.0f, 1.0f);
+    element_->hoverVisibleOpacity = std::clamp(visibleOpacity, 0.0f, 1.0f);
+    return self();
+}
+
+template <typename Derived>
+Derived& BuilderBase<Derived>::hoverOpacityFromAny(std::vector<std::string> ids,
+                                                  float hiddenOpacity, float visibleOpacity) {
+    element_->hoverOpacityExtraIds.clear();
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const std::string resolved = ui_->resolveId(ids[i]);
+        if (i == 0) {
+            element_->hoverOpacitySourceId = resolved;
+        } else {
+            element_->hoverOpacityExtraIds.push_back(resolved);
+        }
+    }
     element_->hoverHiddenOpacity = std::clamp(hiddenOpacity, 0.0f, 1.0f);
     element_->hoverVisibleOpacity = std::clamp(visibleOpacity, 0.0f, 1.0f);
     return self();
