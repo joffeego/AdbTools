@@ -107,6 +107,16 @@ public:
     ContextMenuBuilder& onSelect(std::function<void(int)> callback) { onSelect_ = std::move(callback); return *this; }
     ContextMenuBuilder& onSelectPath(std::function<void(const std::vector<int>&)> callback) { onSelectPath_ = std::move(callback); return *this; }
     ContextMenuBuilder& onOpenChange(std::function<void(bool)> callback) { onOpenChange_ = std::move(callback); return *this; }
+    // Keyboard highlight. The owner keeps the index and handles the arrow keys; the
+    // component only paints it. -1 means "nothing highlighted", which is where a menu
+    // starts so Enter cannot fire an item the user never chose.
+    ContextMenuBuilder& activeIndex(int value) { activeIndex_ = value; return *this; }
+    // Reports the index the pointer is over, so the owner can move its keyboard index in
+    // step and the menu never shows two highlighted rows at once.
+    ContextMenuBuilder& onHoverItem(std::function<void(int)> callback) {
+        onHoverItem_ = std::move(callback);
+        return *this;
+    }
 
     void build() {
         if (items_.empty()) {
@@ -244,15 +254,33 @@ private:
                 for (int index = 0; index < static_cast<int>(levelItems.size()); ++index) {
                     const ContextMenuItem& item = levelItems[index];
                     const float itemY = inset + static_cast<float>(index) * itemHeight;
+                    // An empty label with no children is a separator: a hairline instead of a
+                    // row. It is not hoverable and not selectable, so the owner's index-based
+                    // action list only has to keep a matching placeholder entry.
+                    if (item.text.empty() && !item.hasChildren()) {
+                        ui_.rect(levelId + ".sep." + std::to_string(index))
+                            .x(inset + metrics_.spacing.content)
+                            .y(itemY + itemHeight * 0.5f)
+                            .size(std::max(0.0f, width - inset * 2.0f - metrics_.spacing.content * 2.0f), 1.0f)
+                            .color(style_.border)
+                            .disabled(!visible)
+                            .build();
+                        continue;
+                    }
                     std::vector<int> path = prefix;
                     path.push_back(index);
+                    const bool active = depth == 0 && index == activeIndex_;
                     ui_.rect(levelId + ".item." + std::to_string(index))
                         .x(inset).y(itemY).size(std::max(0.0f, width - inset * 2.0f), itemHeight)
-                        .states(theme::color(0, 0, 0, 0), style_.hover, style_.pressed)
+                        // An active (keyboard-highlighted) row is painted with the hover
+                        // colour so the two ways of pointing at an item look the same.
+                        .states(active ? style_.hover : theme::color(0, 0, 0, 0), style_.hover, style_.pressed)
                         .radius(std::max(metrics_.radius.tiny, style_.radius - metrics_.radius.tiny)).instantStates()
                         .disabled(!visible)
-                        .onHover([cascadePtr = &cascade, path, hasChildren = item.hasChildren()](bool hovered) {
+                        .onHover([cascadePtr = &cascade, path, index, hasChildren = item.hasChildren(),
+                                  onHoverItem = onHoverItem_](bool hovered) {
                             if (!hovered) return;
+                            if (onHoverItem) onHoverItem(index);
                             cascadePtr->openPath = path;
                             if (hasChildren) {
                                 cascadePtr->renderedPath = path;
@@ -337,6 +365,8 @@ private:
     float width_ = 190.0f;
     float itemHeight_ = 0.0f;
     int zIndex_ = 1050;
+    int activeIndex_ = -1;
+    std::function<void(int)> onHoverItem_;
 };
 
 inline ContextMenuBuilder contextMenu(core::dsl::Ui& ui, const std::string& id) {

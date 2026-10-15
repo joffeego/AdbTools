@@ -125,7 +125,7 @@ constexpr float kRowHeight = 36.0f;
 // Quick-path (bookmark) aliases. The limit is in display columns, not bytes: a
 // Chinese character is two columns wide, so one number keeps both "Download" and
 // "下载文件夹" inside the same menu (see core::shortenColumns).
-constexpr int kAliasColumnsDefault = 20;
+constexpr int kAliasColumnsDefault = 32;
 constexpr int kAliasColumnsMin = 4;
 constexpr int kAliasColumnsMax = 40;
 
@@ -397,6 +397,16 @@ struct AppState {
     std::string currentPath = "/";
     std::string pathInput = "/";
     bool pathEditing = false;
+    // Bumped every time the path editor opens, which makes the input component select the
+    // whole path once (input.revealRange applies a request only when it changes). Typing
+    // then replaces the path the way an address bar does, instead of appending to it -
+    // Ctrl+A could not be relied on here, because the global key handler consumes every
+    // key while pathEditing is true.
+    int pathEditRevealRequest = 0;
+    // True while a text field owns the keyboard. The global shortcuts (Backspace = go up,
+    // F5 = refresh, F2 = rename, arrows = list selection) must not fire while the user is
+    // editing text, or fixing a typo in the filter would navigate to the parent folder.
+    bool textFieldFocused = false;
     std::vector<std::string> pathSuggestions;
     // Which suggestion the arrow keys picked (-1 = none, Enter then commits the typed
     // text). Reset whenever the list changes, so a stale index can never point at a
@@ -490,6 +500,9 @@ struct AppState {
     // Placeholder text of the shared prompt box: "名称" for files, and a hint
     // about the current alias limit when naming a quick path.
     std::string promptPlaceholder = "名称";
+    // Shown under the field while the user types. Only set where the text teaches the
+    // expected format; the generic "名称" placeholder is deliberately not reused here.
+    std::string promptHint;
     // The prompt box is shared by several flows; the mode says which one opened
     // it: 0 = new folder, 1 = rename, 2 = wireless connect, 3 = new quick path,
     // 4 = rename a quick path.
@@ -621,6 +634,28 @@ struct AppState {
     // Generic confirm dialog (title/message + primary action).
     std::string confirmPrimaryText = "删除";
     std::function<void()> confirmAction;
+    // True when the primary action cannot be undone (delete), so composeConfirmDialog can
+    // paint it in the danger colour rather than the ordinary accent.
+    bool confirmDestructive = false;
+
+    // The last directory-listing failure, kept so the list area can keep showing *why* it
+    // is empty after the toast has gone. Empty means the last listing succeeded.
+    std::string listError;
+
+    // logcat: wrap long lines instead of clipping them at the right edge. Session-scoped
+    // view preference, like the other list options.
+    bool logcatWrap = true;
+
+    // Keyboard navigation for the popup menus. The app owns the highlighted row (the
+    // contextMenu component only paints it) so that Up/Down/Enter can drive a menu whose
+    // items and actions are built here each frame: every compose* function publishes the
+    // open menu's size and activation callback, and handleGlobalKey() consumes them.
+    // -1 means "no row highlighted", which is where a freshly opened menu starts so that
+    // Enter cannot fire something the user never selected.
+    int menuActiveIndex = -1;
+    // Indices a user can actually land on: separators are skipped by the arrow keys.
+    std::vector<int> menuSelectable;
+    std::function<void(int)> menuActivate;
 };
 
 AppState state;
@@ -744,6 +779,12 @@ static std::atomic<HANDLE> g_logcatProcess{nullptr};
 
 components::theme::ThemeColorTokens themeTokens() {
     components::theme::ThemeColorTokens t = components::theme::dark();
+    // The palette below is overridden with the active theme colours, but `t.dark` was left
+    // at its dark() default - so every component that branches on tokens.dark took the
+    // dark-only recipe even in light mode. The context menu was the visible casualty: its
+    // background is mix(surface, black, 0.16) when dark, which turned the light theme's
+    // white surface into a flat #D6D6D6 slab (1.43:1 against the page behind it).
+    t.dark = settings.darkMode;
     t.background = kBackground;
     t.primary = kAccent;
     t.surface = kSurface;
@@ -1210,12 +1251,17 @@ void themePalette(bool dark, eui::Color out[kThemeSlotCount]) {
         out[6] = {0.235f, 0.267f, 0.329f, 1.0f};
         out[7] = {0.102f, 0.114f, 0.145f, 1.0f};
     } else {
-        out[0] = {0.945f, 0.949f, 0.957f, 1.0f};
+        // Was 0.945/0.949/0.957 (#F1F2F4): only 1.12:1 against the white card surface,
+        // so cards barely read as raised. Darkened a step to about 1.2:1 with the same hue.
+        out[0] = {0.929f, 0.933f, 0.941f, 1.0f};
         out[1] = {1.0f, 1.0f, 1.0f, 1.0f};
         out[2] = {0.900f, 0.906f, 0.918f, 1.0f};
         out[3] = {0.840f, 0.850f, 0.865f, 1.0f};
         out[4] = {0.070f, 0.090f, 0.120f, 1.0f};
-        out[5] = {0.420f, 0.450f, 0.490f, 1.0f};
+        // 0.42/0.45/0.49 was 4.29:1 against this palette's background (#F1F2F4) - just
+        // under the 4.5:1 minimum for normal text, and it carries the status bar, the
+        // column headers and every secondary label. Darkened to about 6:1.
+        out[5] = {0.325f, 0.353f, 0.392f, 1.0f};
         out[6] = {0.780f, 0.795f, 0.815f, 1.0f};
         out[7] = {0.910f, 0.920f, 0.938f, 1.0f};
     }
@@ -1799,6 +1845,7 @@ void promptBookmarkAlias(int index) {
     state.promptValue = editing ? bookmarks[static_cast<std::size_t>(index)].name
                                 : suggestedAlias(state.promptBookmarkPath);
     state.promptPlaceholder = "别名（最多 " + std::to_string(settings.bookmarkAliasColumns) + " 个字符）";
+    state.promptHint = state.promptPlaceholder;
     state.promptOpen = true;
 }
 
@@ -2082,12 +2129,18 @@ void refreshDevices() {
 void refreshListing(bool force) {
     if (state.selectedDevice.empty() || !state.adbFound) {
         state.entries.clear();
+        state.listError.clear();
         state.loading = false;
         return;
     }
     const std::string serial = state.selectedDevice;
     const std::string path = state.currentPath;
     const std::string cacheKey = serial + "|" + path;
+
+    // A new listing request invalidates the previous failure: without this the error state
+    // could still be showing the *previous* path's message while a fresh request is in
+    // flight (a failed request that never completes leaves the old text on screen).
+    state.listError.clear();
 
     // Serve a cached listing instantly for back/forward navigation.
     if (!force) {
@@ -2140,12 +2193,17 @@ void refreshListing(bool force) {
                 sortEntries(state.entries);
                 applyFileFilter();
                 state.dirWritable = result.value.writable;
+                state.listError.clear();
                 if (state.dirCache.size() >= 128) {
                     state.dirCache.clear();
                 }
                 state.dirCache[cacheKey] = result.value;
             } else {
                 state.entries.clear();
+                // Remember it: the toast is gone in a few seconds, and the list area used to
+                // fall back to "this folder is empty", which is the wrong reason (the folder
+                // was never opened) and gave the user nothing to act on.
+                state.listError = result.error;
                 state.toastTitle = "读取目录失败";
                 state.toastMessage = result.error;
                 state.toastVisible = true;
@@ -2324,6 +2382,10 @@ char keyChar(eui::InputKey key) {
     return '\0';
 }
 
+// What a plain double-click (or Enter) does with a *file*. Defined further down, once the
+// preview entry points exist. Folders are handled inline by the callers.
+void openEntryDefault(const FsEntry& entry);
+
 void onEntryClick(const std::string& name, bool isDir) {
     const auto now = std::chrono::steady_clock::now();
     const bool isDouble = (name == state.lastClickedName) &&
@@ -2333,9 +2395,7 @@ void onEntryClick(const std::string& name, bool isDir) {
     const bool ctrl = state.lastClickCtrl;
     const bool shift = state.lastClickShift;
 
-    if (isDir && isDouble && !ctrl && !shift) {
-        enterDir(name);  // double-click a folder opens it
-    } else if (ctrl) {
+    if (ctrl) {
         // Ctrl+click toggles multi-selection.
         if (state.selectedSet.count(name)) state.selectedSet.erase(name);
         else state.selectedSet.insert(name);
@@ -2362,6 +2422,44 @@ void onEntryClick(const std::string& name, bool isDir) {
     }
     // A click means the mouse is driving again: drop the keyboard focus ring.
     state.keyboardNav = false;
+
+    // A plain double-click opens the entry: a folder is entered, and a *file* used to do
+    // nothing at all - the old condition was `isDir && isDouble`, so the two most
+    // universal file-manager idioms (double-click and Enter) could not open an image or a
+    // text file, and the preview pages were reachable only through the row menu. The
+    // selection above has already settled, so openEntryDefault() can read it.
+    if (isDouble && !ctrl && !shift) {
+        if (isDir) {
+            enterDir(name);
+        } else {
+            const FsEntry* entry = findSelected();
+            if (entry != nullptr) openEntryDefault(*entry);
+        }
+    }
+}
+
+// Starts a menu with nothing highlighted, so the first Enter cannot fire a row the user
+// has not seen highlighted yet (see AppState::menuActiveIndex).
+void resetMenuKeyboard() {
+    state.menuActiveIndex = -1;
+    state.menuSelectable.clear();
+    state.menuActivate = nullptr;
+}
+
+// Announces the menu that is on screen so handleGlobalKey() can drive it. Called by every
+// compose* function that builds a popup menu, with the same callback its pointer path uses.
+//
+// A *closed* menu must not claim the slot: all four menus are composed every frame, so
+// publishing unconditionally let the last one (the command menu) win and Enter fired a
+// saved command instead of the highlighted row item.
+void publishMenuKeyboard(bool open, const std::vector<std::string>& items,
+                          std::function<void(int)> activate) {
+    if (!open) return;
+    state.menuSelectable.clear();
+    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+        if (!items[i].empty()) state.menuSelectable.push_back(i);   // separators are not selectable
+    }
+    state.menuActivate = std::move(activate);
 }
 
 void openRowMenu(float x, float y, const std::string& name) {
@@ -2369,12 +2467,14 @@ void openRowMenu(float x, float y, const std::string& name) {
     state.rowMenuOpen = true;
     state.rowMenuX = x;
     state.rowMenuY = y;
+    resetMenuKeyboard();
 }
 
 void openDeviceMenu(float x, float y) {
     state.deviceMenuOpen = true;
     state.deviceMenuX = x;
     state.deviceMenuY = y;
+    resetMenuKeyboard();
 }
 
 void pullBatchStep(std::vector<std::string> names, std::size_t index, BatchOutcome outcome);
@@ -2498,12 +2598,18 @@ void doDeleteConfirmed();
 
 // Generic confirm dialog helper: shows title/message with a primary button that
 // runs `action` when confirmed.
+//
+// `destructive` paints the primary button in the danger colour instead of the accent.
+// Without it a "delete" confirmation looked exactly like a "save" one - the app already
+// had the red treatment for the inline delete buttons, it just never reached this dialog.
 void showConfirm(const std::string& title, const std::string& message,
-                 const std::string& primaryText, std::function<void()> action) {
+                 const std::string& primaryText, std::function<void()> action,
+                 bool destructive = false) {
     state.confirmTitle = title;
     state.confirmMessage = message;
     state.confirmPrimaryText = primaryText;
     state.confirmAction = std::move(action);
+    state.confirmDestructive = destructive;
     state.confirmDialogOpen = true;
 }
 
@@ -2511,11 +2617,11 @@ void confirmDelete() {
     std::vector<std::string> names = selectedNames();
     if (names.empty()) return;
     if (names.size() == 1) {
-        showConfirm("删除", "确定要删除 \"" + names[0] + "\" 吗？\n此操作无法撤销。", "删除",
-                    [] { doDeleteConfirmed(); });
+        showConfirm("删除", "确定要删除「" + names[0] + "」吗？\n此操作无法撤销。", "删除",
+                    [] { doDeleteConfirmed(); }, true);
     } else {
         showConfirm("删除", "确定要删除选中的 " + std::to_string(names.size()) + " 项吗？\n此操作无法撤销。",
-                    "删除", [] { doDeleteConfirmed(); });
+                    "删除", [] { doDeleteConfirmed(); }, true);
     }
 }
 
@@ -2559,6 +2665,7 @@ void deleteBatchStep(std::vector<std::string> names, std::size_t index, BatchOut
 }
 
 void promptNewFolder() {
+    state.promptHint.clear();
     state.promptTitle = "新建文件夹";
     state.promptValue = "";
     state.promptPlaceholder = "名称";
@@ -2567,6 +2674,7 @@ void promptNewFolder() {
 }
 
 void promptRename() {
+    state.promptHint.clear();
     if (state.selectedEntry.empty()) return;
     state.promptTitle = "重命名";
     state.promptValue = state.selectedEntry;
@@ -2810,11 +2918,16 @@ void openDeviceInfo() {
     app::async::restart(
         "adb.info",
         [adb, serial]() -> app::async::Result<std::string> {
+            // One line per field. Echoing the label and the value separately put them on
+            // alternating lines, which made the panel twice as tall and much harder to read.
             const std::string cmd =
-                "echo '型号:'; getprop ro.product.model; echo '品牌:'; getprop ro.product.brand; "
-                "echo 'Android:'; getprop ro.build.version.release; echo 'SDK:'; getprop ro.build.version.sdk; "
-                "echo 'ABI:'; getprop ro.product.cpu.abi; echo '电量:'; dumpsys battery | grep level; "
-                "echo '存储:'; df /data | tail -1";
+                "echo \"型号: $(getprop ro.product.model)\"; "
+                "echo \"品牌: $(getprop ro.product.brand)\"; "
+                "echo \"Android: $(getprop ro.build.version.release)\"; "
+                "echo \"SDK: $(getprop ro.build.version.sdk)\"; "
+                "echo \"ABI: $(getprop ro.product.cpu.abi)\"; "
+                "echo \"电量: $(dumpsys battery | grep level | tr -d ' ' | cut -d: -f2)%\"; "
+                "echo \"存储: $(df /data | tail -1)\"";
             ProcessResult r = runProcess(adb, {"-s", serial, "shell", cmd}, 30000);
             if (r.exitCode != 0) {
                 std::string msg = core::trim(r.out);
@@ -4045,7 +4158,7 @@ void checkForUpdates() {
                     state.updateStatus = "有更新的版本 " + g_update.appLatest +
                                          "，但该 Release 没有可用的下载包，请到 Releases 页面手动下载。";
                 } else {
-                    state.updateStatus = "发现新版本，点击下方按钮即可更新。";
+                    state.updateStatus = "发现新版本，点击右侧按钮即可更新。";
                 }
             } else if (!g_update.adbLatest.empty() || !g_update.scrcpyLatest.empty() || !g_update.appLatest.empty()) {
                 state.updateStatus = "已是最新版本。";
@@ -4779,6 +4892,7 @@ void promptWirelessConnect() {
     state.promptTitle = "无线连接";
     state.promptValue = "192.168.1.100:5555";
     state.promptPlaceholder = "地址:端口";
+    state.promptHint = state.promptPlaceholder;
     state.promptMode = 2;
     state.promptOpen = true;
 }
@@ -4894,6 +5008,92 @@ void openImagePreview(const std::string& name) {
         });
 }
 
+// --- Opening a file by type -------------------------------------------------
+//
+// One place decides what a double-click / Enter on a *file* does, so the two idioms and
+// the row menu cannot drift apart. Text and images have built-in viewers; anything else
+// falls back to the properties dialog, which is local (no device round-trip) and cannot
+// surprise the user by downloading a 200 MB video into the download folder the way
+// handing it to the external editor would. "用电脑程序打开" stays an explicit menu choice.
+namespace {
+
+// Lowercased extension without the dot, or "" when the name has none. A leading dot
+// (".nomedia") is a hidden-file marker, not an extension.
+std::string lowerExtension(const std::string& name) {
+    const std::size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= name.size()) return {};
+    std::string ext = name.substr(dot + 1);
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext;
+}
+
+bool isTextExtension(const std::string& ext) {
+    static const char* const kText[] = {
+        "txt", "text", "md", "markdown", "log", "json", "xml", "csv", "tsv", "ini", "cfg",
+        "conf", "yml", "yaml", "toml", "properties", "sh", "bash", "bat", "cmd", "ps1",
+        "c", "h", "hpp", "cc", "cpp", "cxx", "java", "kt", "kts", "py", "rb", "go", "rs",
+        "js", "mjs", "cjs", "ts", "tsx", "jsx", "html", "htm", "css", "scss", "sql", "lua",
+        "gradle", "pro", "mk", "makefile", "srt", "vtt", "diff", "patch", "env",
+    };
+    for (const char* candidate : kText) {
+        if (ext == candidate) return true;
+    }
+    return false;
+}
+
+bool isImageExtension(const std::string& ext) {
+    static const char* const kImage[] = {"png", "jpg", "jpeg", "gif", "bmp", "webp"};
+    for (const char* candidate : kImage) {
+        if (ext == candidate) return true;
+    }
+    return false;
+}
+
+// Icon per file type so the list can be scanned by shape instead of read. Every codepoint
+// here is validated against the shipped Font Awesome file by tests/test_icons.cpp.
+// Short human label for the permission column (called from composeFileRow).
+std::string entryPermLabel(const FsEntry& entry) {
+    if (entry.isLink) return "链接";
+    if (entry.isDir) return entry.perms.find('w') != std::string::npos ? "目录" : "只读目录";
+    const std::size_t write = entry.perms.find('w');
+    return (write != std::string::npos && write < 4) ? "可写" : "只读";
+}
+unsigned int fileTypeIcon(const std::string& name) {
+    const std::string ext = lowerExtension(name);
+    if (ext.empty()) return 0xF15B;                       // fa-file
+    if (isImageExtension(ext)) return 0xF03E;             // fa-image
+    if (isTextExtension(ext)) return 0xF15C;              // fa-file-lines
+    if (ext == "pdf") return 0xF1C1;                      // fa-file-pdf
+    if (ext == "doc" || ext == "docx" || ext == "odt" || ext == "rtf") return 0xF1C2;
+    if (ext == "xls" || ext == "xlsx" || ext == "ods") return 0xF1C3;
+    if (ext == "ppt" || ext == "pptx" || ext == "odp") return 0xF1C4;
+    if (ext == "zip" || ext == "rar" || ext == "7z" || ext == "tar" || ext == "gz" ||
+        ext == "bz2" || ext == "xz") return 0xF1C6;       // fa-file-archive
+    if (ext == "mp4" || ext == "mkv" || ext == "mov" || ext == "avi" || ext == "webm" ||
+        ext == "3gp" || ext == "m4v") return 0xF03D;      // fa-video
+    if (ext == "mp3" || ext == "m4a" || ext == "wav" || ext == "flac" || ext == "ogg" ||
+        ext == "aac" || ext == "opus") return 0xF001;     // fa-music
+    // 0xF49E is fa-box-open, the same glyph the toolbar uses for "安装 APK" - fa-android
+    // (0xF17B) is not in the shipped Free-Solid font, which tests/test_icons.cpp caught.
+    if (ext == "apk" || ext == "apks" || ext == "xapk") return 0xF49E;
+    if (ext == "ttf" || ext == "otf" || ext == "woff" || ext == "woff2") return 0xF031;
+    return 0xF15B;
+}
+
+}  // namespace
+
+void openEntryDefault(const FsEntry& entry) {
+    if (state.selectedDevice.empty() || entry.name.empty()) return;
+    const std::string ext = lowerExtension(entry.name);
+    if (isImageExtension(ext)) {
+        openImagePreview(entry.name);
+    } else if (isTextExtension(ext)) {
+        openTextPreview(entry.name);
+    } else {
+        openFileProperties();
+    }
+}
+
 void closeTopmost() {
     // An open dropdown is the innermost thing on screen: Escape closes it first, and only
     // a second Escape closes the dialog that contains it.
@@ -4925,6 +5125,11 @@ void closeTopmost() {
     else if (state.helpOpen) state.helpOpen = false;
     else if (state.bookmarkManageOpen) state.bookmarkManageOpen = false;
     else if (state.commandManageOpen) state.commandManageOpen = false;
+    // The external-edit list is a modal dialog like the rest, so it has to take part in
+    // both this unwind and anyOverlayOpen(). It used to be in neither: Escape could not
+    // close it, and because anyOverlayOpen() also said "nothing is open", every global
+    // shortcut (F5 / Backspace / F2 / arrows / Delete) reached the file list behind it.
+    else if (state.externalEditListOpen) state.externalEditListOpen = false;
     else if (state.deviceMenuOpen) state.deviceMenuOpen = false;
     else if (state.rowMenuOpen) state.rowMenuOpen = false;
     else if (state.bookmarkMenuOpen) state.bookmarkMenuOpen = false;
@@ -4936,13 +5141,53 @@ bool anyOverlayOpen() {
            state.commandOutputOpen || state.deviceInfoOpen || state.logcatOpen ||
            state.textPreviewOpen || state.imagePreviewOpen || state.propertiesOpen ||
            state.appManageOpen || state.helpOpen || state.bookmarkManageOpen ||
-           state.commandManageOpen || state.deviceMenuOpen || state.rowMenuOpen ||
+           state.commandManageOpen || state.externalEditListOpen ||
+           state.deviceMenuOpen || state.rowMenuOpen ||
            state.bookmarkMenuOpen || state.commandMenuOpen;
 }
 
 void handleGlobalKey(const eui::KeyEvent& ev) {
     if (!ev.isDown()) return;
     if (anyOverlayOpen()) {
+        // A popup menu is the innermost overlay, and the contextMenu component itself only
+        // understands the pointer, so the arrow keys and Enter are handled here. This is
+        // what makes the row menu - the only route to the previews, the properties dialog
+        // and the copy-path actions - reachable without a mouse.
+        if (state.rowMenuOpen || state.deviceMenuOpen || state.bookmarkMenuOpen ||
+            state.commandMenuOpen) {
+            if (ev.key == eui::InputKey::Escape) {
+                closeTopmost();
+                return;
+            }
+            if (!state.menuSelectable.empty()) {
+                // Walk the selectable list, so a separator is never highlighted.
+                const std::vector<int>& selectable = state.menuSelectable;
+                if (ev.key == eui::InputKey::Down) {
+                    for (int idx : selectable) {
+                        if (idx > state.menuActiveIndex) { state.menuActiveIndex = idx; return; }
+                    }
+                    state.menuActiveIndex = selectable.front();
+                    return;
+                }
+                if (ev.key == eui::InputKey::Up) {
+                    for (auto it = selectable.rbegin(); it != selectable.rend(); ++it) {
+                        if (*it < state.menuActiveIndex) { state.menuActiveIndex = *it; return; }
+                    }
+                    state.menuActiveIndex = selectable.back();
+                    return;
+                }
+                // Enter only commits a row the user actually highlighted; with nothing
+                // highlighted it does nothing rather than firing the first item.
+                if (ev.key == eui::InputKey::Enter && state.menuActiveIndex >= 0) {
+                    std::function<void(int)> activate = state.menuActivate;
+                    const int index = state.menuActiveIndex;
+                    state.menuActiveIndex = -1;
+                    if (activate) activate(index);
+                    return;
+                }
+            }
+            return;
+        }
         if (ev.key == eui::InputKey::Escape) closeTopmost();
         // Ctrl+F belongs to the text preview while it is open (its own find bar);
         // the file list's search box would be hidden behind the dialog.
@@ -4965,6 +5210,19 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
             // (the one the user is most likely after), further presses walk down it, and
             // Enter commits whichever is selected.
             movePathSuggestion(1);
+        }
+        return;
+    }
+    // A focused text field owns the keyboard. Without this, fixing a typo in the filter
+    // with Backspace went up a directory, F5 reloaded, and the arrows moved the list
+    // selection instead of the caret.
+    if (state.textFieldFocused) {
+        if (ev.key == eui::InputKey::Escape && state.searchOpen) {
+            state.fileFilter.clear();
+            state.searchOpen = false;
+            state.textFieldFocused = false;
+            applyFileFilter();
+            resetListScroll();
         }
         return;
     }
@@ -5004,8 +5262,14 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
             break;
         }
         case eui::InputKey::Enter: {
+            // Enter opens the selection: a folder is entered, a file goes through the same
+            // by-type dispatcher a double-click uses. Right stays folder-only, since it is
+            // documented as "walk the directory tree".
             const FsEntry* e = findSelected();
-            if (e && e->isDir) enterDir(e->name);
+            if (e != nullptr) {
+                if (e->isDir) enterDir(e->name);
+                else openEntryDefault(*e);
+            }
             break;
         }
         case eui::InputKey::Delete: confirmDelete(); break;
@@ -5020,6 +5284,7 @@ void handleGlobalKey(const eui::KeyEvent& ev) {
                 state.pathInput = state.currentPath;
                 state.pathSuggestions.clear();
                 state.pathEditing = true;
+                ++state.pathEditRevealRequest;
                 app::requestFocus("path.edit.input.hit");
             }
             break;
@@ -5464,7 +5729,7 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
     eui::Color hover = selected ? kAccentSoft : kSurfaceHover;
     eui::Color pressed = selected ? kAccentSoft : kSurfaceAct;
 
-    unsigned int icon = e.isDir ? 0xF07B : (e.isLink ? 0xF0C1 : 0xF15B);
+    unsigned int icon = e.isDir ? 0xF07B : (e.isLink ? 0xF0C1 : fileTypeIcon(e.name));
     // Folders follow the accent (theme) colour, like every other icon in the app. This used
         // to be a hard-coded amber, which fought with the accent whenever the user changed it.
         eui::Color iconColor = e.isDir ? kAccent : (e.isLink ? kAccent : kMuted);
@@ -5553,7 +5818,11 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
 
             ui.text(rowId + ".perms")
                 .x(c.permsX).y(0.0f).size(122.0f, h)
-                .text(e.perms)
+                // A raw mode string ("-rw-r--r--") was the widest column for the least
+                // readable information. Android's external storage is a FUSE mount where the
+                // group/other bits carry no meaning, so the useful distinction is just
+                // read-only vs writable.
+                .text(entryPermLabel(e))
                 .fontSize(12.0f)
                 .lineHeight(12.0f)
                 .fontFamily("")
@@ -5618,7 +5887,7 @@ bool uiAnimationsEnabled() {
     return enabled;
 }
 
-void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
+void composeFileList(eui::Ui& ui, float x, float y, float w, float h, float pathRowY) {
     ui.rect("list.bg")
         .x(x).y(y).size(w, h)
         .color(kSurface)
@@ -5700,6 +5969,18 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
         return;
     }
 
+    if (!state.listError.empty()) {
+        // The listing itself failed. Without this the list fell back to "这个文件夹是空的",
+        // which is the wrong reason - the folder was never opened - and left the user with
+        // nothing to act on once the toast had gone.
+        centeredMessage(ui, "list.error", x, y + h * 0.5f - 68.0f, w, 120.0f,
+                        "无法打开此位置\n" + state.listError +
+                        "\n它可能是一个文件、已被删除，或当前没有权限。");
+        toolButton(ui, "list.error.up", x + w * 0.5f - 76.0f, y + h * 0.5f + 56.0f, 152.0f, 36.0f,
+                   0xF062, "返回上一级", false, true, [] { goUp(); });
+        return;
+    }
+
     if (state.entries.empty()) {
         // Say what can be done here, not just that there is nothing: an empty phone
         // folder is the natural moment to mention that dropping files on the window
@@ -5754,7 +6035,10 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
             const float slideX = (1.0f - eased) * 26.0f;  // in from the right
             const float slideY = (1.0f - eased) * -6.0f;  // and slightly down
             ui.stack("list.search.wrap")
-                .x(x + w - 244.0f + slideX).y(y + 4.0f + slideY).size(228.0f, 32.0f)
+                // In the path row rather than over the list: it used to sit at the top of
+                // the list rect, covering the column headers and the first row of files.
+                // 280 leaves the magnifier (which opens this field) clear on the right.
+                .x(x + w - 280.0f + slideX).y(pathRowY + 4.0f + slideY).size(228.0f, 32.0f)
                 .zIndex(20)
             .content([&] {
                 // The field stops 8px short of the X. It used to be 192 wide with the X
@@ -5775,6 +6059,12 @@ void composeFileList(eui::Ui& ui, float x, float y, float w, float h) {
                         state.fileFilter = v;
                         applyFileFilter();
                         resetListScroll();
+                    })
+                    .onFocus([](bool focused) {
+                        // While this field has the keyboard, the global shortcuts must not
+                        // fire: Backspace has to delete a character, not go to the parent
+                        // directory.
+                        state.textFieldFocused = focused;
                     })
                     .build();
                 ui.rect("list.search.close")
@@ -5889,6 +6179,13 @@ void composeTitleBar(eui::Ui& ui, float W, float h) {
     // because its higher luminance leaves its lower edge with the least contrast against a
     // dark bar - measured, the three are pixel-identical (same rows), which is also how
     // macOS draws them, so no optical offset is applied.
+    // Order: minimise, maximise, close (left to right).
+    //
+    // The audit flagged this as "should be macOS order" and I changed it - then found the
+    // README documents the Windows order as deliberate ("位置与顺序仍按 Windows（右上角，
+    // 左→右 最小化 / 最大化 / 关闭）"). The dots *look* macOS but the title bar is on the
+    // right and behaves like Windows, so the order matches where the window actually puts
+    // them. Reverted: this is the owner's call, not a defect.
     const DotSpec dots[3] = {
         {"titlebar.min", 0.996f, 0.737f, 0.180f, 0xF068, 7.0f, [] { app::minimizeWindow(); }},
         {"titlebar.max", 0.157f, 0.784f, 0.251f, 0xF065, 6.5f,
@@ -6039,6 +6336,20 @@ constexpr float kButtonSizes[] = {60.0f, 54.0f, 48.0f, 42.0f};
 
     // Device selector (opens a context menu).
     std::string deviceLabel = state.selectedDevice.empty() ? "无设备" : state.selectedDevice;
+    // Prefer "serial · model": the serial alone is unreadable when several phones are
+    // attached, and `adb devices -l` already hands us the model (the CLI prints it too, so
+    // this also makes the GUI and the CLI agree).
+    if (!state.selectedDevice.empty()) {
+        for (const Device& d : state.devices) {
+            if (d.serial == state.selectedDevice && !d.model.empty()) {
+                // Model first: the selector is narrow, so "Pixel_7 · FAKEDEVICE001"
+                // truncates to the part a human recognises, where a serial first would
+                // truncate the model away entirely.
+                deviceLabel = d.model + " · " + d.serial;
+                break;
+            }
+        }
+    }
     const float menuX = x;
     const float menuY = y + h + 6.0f;
     ui.stack("topbar.device")
@@ -6094,6 +6405,7 @@ constexpr float kButtonSizes[] = {60.0f, 54.0f, 48.0f, 42.0f};
                    state.commandMenuOpen = true;
                    state.commandMenuX = cmdX;
                    state.commandMenuY = y + h + 4.0f;
+                   resetMenuKeyboard();
                }, 16.0f);
     composeHoverTip(ui, "topbar.command.tip", "topbar.command.bg",
                     "常用命令", cmdX + h * 0.5f, y + h + 4.0f);
@@ -6254,10 +6566,38 @@ std::string pickedPathSuggestion() {
     return state.pathSuggestions[static_cast<std::size_t>(index)];
 }
 
+// If `target` names a *file* in a directory we already have cached, open it and stay in
+// that directory. Listing a file fails, and the old behaviour dropped the user onto an
+// empty-looking folder - but "open this path" is plainly what pasting a full file path
+// means. Only the cache is consulted, so this costs no extra round-trip; anything else
+// falls through to a normal navigation (which reports its own error).
+bool openCachedFileTarget(const std::string& target) {
+    if (state.selectedDevice.empty()) return false;
+    const std::size_t slash = target.find_last_of('/');
+    if (slash == std::string::npos) return false;
+    const std::string parent = (slash == 0) ? std::string("/") : target.substr(0, slash);
+    const std::string base = target.substr(slash + 1);
+    if (base.empty()) return false;
+    const auto it = state.dirCache.find(state.selectedDevice + "|" + parent);
+    if (it == state.dirCache.end()) return false;
+    for (const FsEntry& entry : it->second.entries) {
+        if (entry.name != base || entry.isDir) continue;
+        if (state.currentPath != parent) goToPath(parent);
+        state.selectedEntry = base;
+        state.selectedSet.clear();
+        state.selectedSet.insert(base);
+        state.selectAnchor = base;
+        openEntryDefault(entry);
+        return true;
+    }
+    return false;
+}
+
 void commitPathEdit(const std::string& target) {
     state.pathSuggestions.clear();
     state.pathSuggestionIndex = -1;
     state.pathEditing = false;
+    if (openCachedFileTarget(target)) return;
     goToPath(target);
 }
 
@@ -6282,6 +6622,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                    state.bookmarkMenuOpen = true;
                    state.bookmarkMenuX = bookX;
                    state.bookmarkMenuY = y + h + 4.0f;
+                   resetMenuKeyboard();
                }, 16.0f);
     composeHoverTip(ui, "path.bookmark.tip", "path.bookmark.bg",
                     "快捷路径", bookX + h * 0.5f, y + h + 4.0f);
@@ -6303,6 +6644,9 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                     .fontFamily("")
                     .placeholder("/")
                     .value(state.pathInput)
+                    // Select the whole path once, when the editor opens: typing replaces it
+                    // (address-bar behaviour) instead of appending to it.
+                    .revealRange(0, static_cast<int>(state.pathInput.size()), state.pathEditRevealRequest)
                     .onChange([](const std::string& v) {
                         state.pathInput = v;
                         updatePathSuggestions();
@@ -6312,6 +6656,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                     // clicking OK/Cancel must still see what was typed - the Cancel button
                     // clears it, and the next edit re-seeds it from the current path.
                     .onFocus([](bool focused) {
+                        state.textFieldFocused = focused;
                         if (focused) return;
                         state.pathSuggestions.clear();
                         state.pathSuggestionIndex = -1;
@@ -6388,7 +6733,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                 .color(kSurface)
                 .radius(8.0f)
                 .border(1.0f, kBorder)
-                .onClick([] { state.pathInput = state.currentPath; state.pathSuggestions.clear(); state.pathEditing = true; app::requestFocus("path.edit.input.hit"); })
+                .onClick([] { state.pathInput = state.currentPath; state.pathSuggestions.clear(); state.pathEditing = true; ++state.pathEditRevealRequest; app::requestFocus("path.edit.input.hit"); })
                 .build();
 
             ui.stack("breadcrumb.segs")
@@ -6497,7 +6842,7 @@ void composeBreadcrumb(eui::Ui& ui, float x, float y, float w, float h) {
                 .x(crumbW - editW - 4.0f).y(1.0f).size(editW, h - 2.0f)
                 .states(kClear, kSurfaceHover, kSurfaceAct)
                 .radius(6.0f)
-                .onClick([] { state.pathInput = state.currentPath; state.pathSuggestions.clear(); state.pathEditing = true; app::requestFocus("path.edit.input.hit"); })
+                .onClick([] { state.pathInput = state.currentPath; state.pathSuggestions.clear(); state.pathEditing = true; ++state.pathEditRevealRequest; app::requestFocus("path.edit.input.hit"); })
                 .build();
             ui.text("breadcrumb.edit.icon")
                 .x(crumbW - editW - 4.0f).y(1.0f).size(editW, h - 2.0f)
@@ -6660,12 +7005,46 @@ void composeDeviceMenu(eui::Ui& ui, float w, float h) {
         if (d.state == "unauthorized") suffix = "  (未授权)";
         else if (d.state == "offline") suffix = "  (离线)";
         else if (d.state != "device") suffix = "  (" + d.state + ")";
-        items.push_back(d.serial + suffix);
+        items.push_back((d.model.empty() ? d.serial : d.model + " · " + d.serial) + suffix);
     }
     if (items.empty()) items.push_back("（无设备）");
     items.push_back("无线连接");
     items.push_back("应用管理");
     items.push_back("重启 adb 服务");
+
+    // The same activation is used by the pointer (onSelect) and by Enter on the keyboard
+    // highlight, so the two paths can never drift apart.
+    std::function<void(int)> selectDevice = [](int idx) {
+        state.deviceMenuOpen = false;
+        const int n = static_cast<int>(state.devices.size());
+        if (idx >= 0 && idx < n) {
+            const Device& d = state.devices[static_cast<std::size_t>(idx)];
+            if (d.state != "device") {
+                state.selectedDevice.clear();
+                state.toastTitle = "设备未就绪";
+                state.toastMessage = d.state == "unauthorized"
+                    ? "该设备未授权 USB 调试：请在设备屏幕上点“允许”，然后点“重启 adb 服务”重连。"
+                    : "该设备当前离线：请检查 USB 连接后重试。";
+                state.toastVisible = true;
+                return;
+            }
+            state.selectedDevice = d.serial;
+            state.currentPath = "/";
+            state.pathInput = state.currentPath;
+            state.selectedEntry.clear();
+            resetListScroll();
+            refreshListing(true);
+        } else if (idx == n) {
+            promptWirelessConnect();
+        } else if (idx == n + 1) {
+            openAppManage();
+        } else if (idx == n + 2) {
+            // Restarting the server interrupts any running transfer and the log stream.
+            showConfirm("重启 adb 服务", "重启会中断正在进行的文件传输和日志流。\n确定要重启吗？",
+                        "重启", [] { restartAdbServer(); });
+        }
+    };
+    publishMenuKeyboard(state.deviceMenuOpen, items, selectDevice);
 
     components::contextMenu(ui, "device.menu")
         .screen(w, h)
@@ -6674,34 +7053,9 @@ void composeDeviceMenu(eui::Ui& ui, float w, float h) {
         .theme(themeTokens())
         .items(items)
         .zIndex(1200)
-        .onSelect([](int idx) {
-            state.deviceMenuOpen = false;
-            const int n = static_cast<int>(state.devices.size());
-            if (idx >= 0 && idx < n) {
-                const Device& d = state.devices[static_cast<std::size_t>(idx)];
-                if (d.state != "device") {
-                    state.selectedDevice.clear();
-                    state.toastTitle = "设备未就绪";
-                    state.toastMessage = d.state == "unauthorized"
-                        ? "该设备未授权 USB 调试：请在设备屏幕上点“允许”，然后点“重启 adb 服务”重连。"
-                        : "该设备当前离线：请检查 USB 连接后重试。";
-                    state.toastVisible = true;
-                    return;
-                }
-                state.selectedDevice = d.serial;
-                state.currentPath = "/";
-                state.pathInput = state.currentPath;
-                state.selectedEntry.clear();
-                resetListScroll();
-                refreshListing(true);
-            } else if (idx == n) {
-                promptWirelessConnect();
-            } else if (idx == n + 1) {
-                openAppManage();
-            } else if (idx == n + 2) {
-                restartAdbServer();
-            }
-        })
+        .activeIndex(state.menuActiveIndex)
+        .onHoverItem([](int index) { state.menuActiveIndex = index; })
+        .onSelect(selectDevice)
         .onOpenChange([](bool v) { state.deviceMenuOpen = v; })
         .build();
 }
@@ -6712,6 +7066,15 @@ void composeRowMenu(eui::Ui& ui, float w, float h) {
 
     std::vector<std::string> items;
     std::vector<std::function<void()>> actions;
+    // "" is a separator: the menu component draws a rule for it and never reports it as a
+    // selection, so the parallel `actions` entry only has to keep the indices aligned. The
+    // eleven-item flat list was hard to scan, and "删除" sat directly under "重命名" with
+    // identical styling.
+    const auto separator = [&] {
+        items.push_back("");
+        actions.push_back([] {});
+    };
+
     if (isDir) {
         items.push_back("打开"); actions.push_back([] { enterDir(state.selectedEntry); });
     }
@@ -6722,15 +7085,26 @@ void composeRowMenu(eui::Ui& ui, float w, float h) {
         items.push_back("粘贴"); actions.push_back([] { doPaste(); });
     }
     if (!isDir) {
+        separator();
         items.push_back("查看/编辑"); actions.push_back([] { openTextPreview(state.selectedEntry); });
         items.push_back("用电脑程序打开"); actions.push_back([] { openExternalEditor(state.selectedEntry); });
         items.push_back("预览图片"); actions.push_back([] { openImagePreview(state.selectedEntry); });
     }
+    separator();
     items.push_back("复制路径"); actions.push_back([] { copyPathToClipboard(); });
     items.push_back("复制文件名"); actions.push_back([] { copyFileNameToClipboard(); });
     items.push_back("属性"); actions.push_back([] { openFileProperties(); });
+    separator();
     items.push_back("重命名"); actions.push_back([] { promptRename(); });
+    // The one irreversible entry, on its own at the end (and the confirm dialog is drawn in
+    // the danger colour - see composeConfirmDialog).
     items.push_back("删除"); actions.push_back([] { confirmDelete(); });
+
+    std::function<void(int)> selectRow = [actions](int idx) {
+        state.rowMenuOpen = false;
+        if (idx >= 0 && idx < static_cast<int>(actions.size())) actions[static_cast<std::size_t>(idx)]();
+    };
+    publishMenuKeyboard(state.rowMenuOpen, items, selectRow);
 
     components::contextMenu(ui, "row.menu")
         .screen(w, h)
@@ -6739,10 +7113,9 @@ void composeRowMenu(eui::Ui& ui, float w, float h) {
         .theme(themeTokens())
         .items(items)
         .zIndex(1200)
-        .onSelect([actions](int idx) {
-            state.rowMenuOpen = false;
-            if (idx >= 0 && idx < static_cast<int>(actions.size())) actions[static_cast<std::size_t>(idx)]();
-        })
+        .activeIndex(state.menuActiveIndex)
+        .onHoverItem([](int index) { state.menuActiveIndex = index; })
+        .onSelect(selectRow)
         .onOpenChange([](bool v) { state.rowMenuOpen = v; })
         .build();
 }
@@ -6864,9 +7237,28 @@ void composeBookmarkMenu(eui::Ui& ui, float w, float h) {
                                       columnsFitting(labelW, metrics.typography.option, kWideColumnEm));
 
     std::vector<std::string> items;
-    items.push_back("★ 添加当前路径");
+    items.push_back("添加当前路径");
     for (const Bookmark& b : bookmarks) items.push_back(core::shortenColumns(b.name, aliasColumns));
     items.push_back("管理快捷路径");
+
+    std::function<void(int)> selectBookmark = [](int idx) {
+        state.bookmarkMenuOpen = false;
+        const int n = static_cast<int>(bookmarks.size());
+        if (idx == 0) {
+            if (state.selectedDevice.empty()) {
+                toast("请先选择设备", "快捷路径指向手机上的目录。");
+                return;
+            }
+            // Ask for the name first: saving "/sdcard/DCIM/Camera" verbatim
+            // is what made the menu unreadable.
+            promptBookmarkAlias(-1);
+        } else if (idx == n + 1) {
+            state.bookmarkManageOpen = true;
+        } else if (idx >= 1 && idx <= n) {
+            goToPath(bookmarks[static_cast<std::size_t>(idx - 1)].path);
+        }
+    };
+    publishMenuKeyboard(state.bookmarkMenuOpen, items, selectBookmark);
 
     components::contextMenu(ui, "bookmark.menu")
         .screen(w, h)
@@ -6876,23 +7268,9 @@ void composeBookmarkMenu(eui::Ui& ui, float w, float h) {
         .theme(themeTokens())
         .items(items)
         .zIndex(1200)
-        .onSelect([](int idx) {
-            state.bookmarkMenuOpen = false;
-            const int n = static_cast<int>(bookmarks.size());
-            if (idx == 0) {
-                if (state.selectedDevice.empty()) {
-                    toast("请先选择设备", "快捷路径指向手机上的目录。");
-                    return;
-                }
-                // Ask for the name first: saving "/sdcard/DCIM/Camera" verbatim
-                // is what made the menu unreadable.
-                promptBookmarkAlias(-1);
-            } else if (idx == n + 1) {
-                state.bookmarkManageOpen = true;
-            } else if (idx >= 1 && idx <= n) {
-                goToPath(bookmarks[static_cast<std::size_t>(idx - 1)].path);
-            }
-        })
+        .activeIndex(state.menuActiveIndex)
+        .onHoverItem([](int index) { state.menuActiveIndex = index; })
+        .onSelect(selectBookmark)
         .onOpenChange([](bool v) { state.bookmarkMenuOpen = v; })
         .build();
 }
@@ -6902,6 +7280,17 @@ void composeCommandMenu(eui::Ui& ui, float w, float h) {
     for (const CommandEntry& c : commands) items.push_back(c.name);
     items.push_back("管理命令");
 
+    std::function<void(int)> selectCommand = [](int idx) {
+        state.commandMenuOpen = false;
+        const int n = static_cast<int>(commands.size());
+        if (idx == n) {
+            state.commandManageOpen = true;
+        } else if (idx >= 0 && idx < n) {
+            runCommandEntry(commands[static_cast<std::size_t>(idx)]);
+        }
+    };
+    publishMenuKeyboard(state.commandMenuOpen, items, selectCommand);
+
     components::contextMenu(ui, "command.menu")
         .screen(w, h)
         .open(state.commandMenuOpen)
@@ -6909,19 +7298,30 @@ void composeCommandMenu(eui::Ui& ui, float w, float h) {
         .theme(themeTokens())
         .items(items)
         .zIndex(1200)
-        .onSelect([](int idx) {
-            state.commandMenuOpen = false;
-            const int n = static_cast<int>(commands.size());
-            if (idx == n) {
-                state.commandManageOpen = true;
-            } else if (idx >= 0 && idx < n) {
-                runCommandEntry(commands[static_cast<std::size_t>(idx)]);
-            }
-        })
+        .activeIndex(state.menuActiveIndex)
+        .onHoverItem([](int index) { state.menuActiveIndex = index; })
+        .onSelect(selectCommand)
         .onOpenChange([](bool v) { state.commandMenuOpen = v; })
         .build();
 }
 
+// True when a bookmark points at something that no longer exists. Answered from the
+// directory cache only: a stale shortcut is worth flagging, but not worth a device
+// round-trip every time the manager opens. An unknown parent returns false - never guess.
+bool bookmarkPathMissing(const std::string& path) {
+    if (state.selectedDevice.empty()) return false;
+    const std::size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return false;
+    const std::string parent = (slash == 0) ? std::string("/") : path.substr(0, slash);
+    const std::string base = path.substr(slash + 1);
+    if (base.empty()) return false;
+    const auto it = state.dirCache.find(state.selectedDevice + "|" + parent);
+    if (it == state.dirCache.end()) return false;
+    for (const FsEntry& entry : it->second.entries) {
+        if (entry.name == base) return false;
+    }
+    return true;
+}
 void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
     components::dialog(ui, "bookmark.manage")
         .screen(w, h)
@@ -6976,9 +7376,12 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                                         .fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
                                     // Read from the end: the last folder is what
                                     // tells two bookmarks apart.
+                                    const bool missing = bookmarkPathMissing(b.path);
                                     body.text(id + ".path").x(10.0f).y(21.0f).size(textW, 15.0f)
-                                        .text(core::shortenColumnsHead(b.path, pathColumns))
-                                        .fontSize(12.0f).lineHeight(12.0f).color(kMuted).build();
+                                        .text(core::shortenColumnsHead(b.path, pathColumns) +
+                                              (missing ? "（不存在）" : ""))
+                                        .fontSize(12.0f).lineHeight(12.0f)
+                                        .color(missing ? kRose : kMuted).build();
                                     body.rect(id + ".ren").x(cw - 104.0f).y(7.0f).size(46.0f, 26.0f)
                                         .states(kSurfaceHover, kSurfaceAct, kBorder)
                                         .radius(6.0f)
@@ -7081,7 +7484,7 @@ void composeBookmarkManageDialog(eui::Ui& ui, float w, float h) {
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
 
-            toolButton(ui, "bookmark.manage.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+            toolButton(ui, "bookmark.manage.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] { state.bookmarkManageOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.bookmarkManageOpen = v; })
@@ -7214,15 +7617,24 @@ void composeCommandManageDialog(eui::Ui& ui, float w, float h) {
         .build();
 }
 
+// Tall enough to read a command's output, short when there is nothing to read.
+float commandOutputPanelH() {
+    const std::size_t lines = 1 + static_cast<std::size_t>(
+        std::count(state.commandOutputText.begin(), state.commandOutputText.end(), '\n'));
+    const float wanted = 140.0f + static_cast<float>(lines) * 18.0f;
+    return std::clamp(wanted, 220.0f, 460.0f);
+}
 void composeCommandOutputDialog(eui::Ui& ui, float w, float h) {
     components::dialog(ui, "command.output")
         .screen(w, h)
         .open(state.commandOutputOpen)
         .theme(themeTokens())
-        .size(580.0f, 460.0f)
+        // A 460pt panel was mostly empty for a short result ("(无输出)"); it still grows to
+        // the full height once there is actually something to read.
+        .size(580.0f, commandOutputPanelH())
         .zIndex(1300)
         .content([&] {
-            const float pw = 580.0f, ph = 460.0f;
+            const float pw = 580.0f, ph = commandOutputPanelH();
             ui.text("command.output.title")
                 .x(24.0f).y(16.0f).size(pw - 48.0f, 28.0f)
                 .text(state.commandOutputTitle)
@@ -7252,7 +7664,7 @@ void composeCommandOutputDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
 
-            toolButton(ui, "command.output.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+            toolButton(ui, "command.output.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] { state.commandOutputOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.commandOutputOpen = v; })
@@ -7288,6 +7700,9 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .fontWeight(700)
                 .color(kInk)
                 .build();
+            // Every dialog puts its close button in the same place (top-right): it used to be
+            // top-right for some, bottom-right for others and bottom-left for one, so the same
+            // action moved around the screen between screens.
             toolButton(ui, "settings.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] {
                            state.settingsOpen = false;
@@ -7803,6 +8218,23 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
         .build();
 }
 
+
+
+// A status, not a control. When there is nothing to update, "已是最新" is information; it
+// used to be drawn as a full bordered button with a download icon and only the text muted,
+// so it read as a disabled control - the classic "looks tappable but does nothing" pattern.
+// Now the actionable case is a button and the settled case is a quiet check + label.
+void updateStatusLabel(eui::Ui& ui, const std::string& id, float x, float y, float w, float h,
+                       const std::string& text, bool ok) {
+    ui.text(id)
+        .x(x).y(y).size(w, h)
+        .icon(ok ? 0xF00C : 0xF05A)          // check / info
+        .fontSize(12.0f).lineHeight(12.0f)
+        .color(kMuted)
+        .horizontalAlign(eui::HorizontalAlign::Center)
+        .verticalAlign(eui::VerticalAlign::Center)
+        .build();
+}
 void composeUpdateDialog(eui::Ui& ui, float w, float h) {
     // 580: at 500 the form column crowded the card's right edge and every row looked
     // cramped; the extra width is what "less busy" actually needed.
@@ -7876,12 +8308,17 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(appHas ? kAccent : kMuted)
                 .build();
-            toolButton(ui, "update.app.btn", pw - 24.0f - 132.0f, 84.0f, 132.0f, 36.0f,
-                       0xF019, appBtn, appHas, appHas && !busy, [version = g_update.appLatest] {
-                showConfirm("更新本软件",
-                            "确定要更新到 " + version + " 吗？\n更新完成后需要重启程序才能生效。",
-                            "更新", [] { startUpdateApp(); });
-            });
+            if (appHas) {
+                toolButton(ui, "update.app.btn", pw - 24.0f - 132.0f, 84.0f, 132.0f, 36.0f,
+                           0xF019, appBtn, true, !busy, [version = g_update.appLatest] {
+                    showConfirm("更新本软件",
+                                "确定要更新到 " + version + " 吗？\n更新完成后需要重启程序才能生效。",
+                                "更新", [] { startUpdateApp(); });
+                });
+            } else {
+                updateStatusLabel(ui, "update.app.state", pw - 24.0f - 132.0f, 84.0f, 132.0f, 36.0f,
+                                  appBtn, appBtn == "已是最新");
+            }
 
             // --- ADB section ---
             ui.text("update.adb.title")
@@ -7902,12 +8339,17 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(adbHas ? kAccent : kMuted)
                 .build();
-            toolButton(ui, "update.adb.btn", pw - 24.0f - 132.0f, 184.0f, 132.0f, 36.0f,
-                       0xF019, adbBtn, adbHas, adbHas && !busy, [version = g_update.adbLatest] {
-                showConfirm("更新 adb",
-                            "确定要更新 adb 到 " + version + " 吗？\n更新会替换当前的 adb 程序文件。",
-                            "更新", [] { startUpdateAdb(); });
-            });
+            if (adbHas) {
+                toolButton(ui, "update.adb.btn", pw - 24.0f - 132.0f, 184.0f, 132.0f, 36.0f,
+                           0xF019, adbBtn, true, !busy, [version = g_update.adbLatest] {
+                    showConfirm("更新 adb",
+                                "确定要更新 adb 到 " + version + " 吗？\n更新会替换当前的 adb 程序文件。",
+                                "更新", [] { startUpdateAdb(); });
+                });
+            } else {
+                updateStatusLabel(ui, "update.adb.state", pw - 24.0f - 132.0f, 184.0f, 132.0f, 36.0f,
+                                  adbBtn, adbBtn == "已是最新");
+            }
 
             // --- scrcpy section ---
             ui.text("update.scrcpy.title")
@@ -7928,12 +8370,17 @@ void composeUpdateDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(13.0f).lineHeight(13.0f)
                 .color(scHas ? kAccent : kMuted)
                 .build();
-            toolButton(ui, "update.scrcpy.btn", pw - 24.0f - 132.0f, 284.0f, 132.0f, 36.0f,
-                       0xF019, scBtn, scHas, scHas && !busy, [version = g_update.scrcpyLatest] {
-                showConfirm("更新 scrcpy",
-                            "确定要更新 scrcpy 到 " + version + " 吗？\n更新会替换当前的 scrcpy 程序文件。",
-                            "更新", [] { startUpdateScrcpy(); });
-            });
+            if (scHas) {
+                toolButton(ui, "update.scrcpy.btn", pw - 24.0f - 132.0f, 284.0f, 132.0f, 36.0f,
+                           0xF019, scBtn, true, !busy, [version = g_update.scrcpyLatest] {
+                    showConfirm("更新 scrcpy",
+                                "确定要更新 scrcpy 到 " + version + " 吗？\n更新会替换当前的 scrcpy 程序文件。",
+                                "更新", [] { startUpdateScrcpy(); });
+                });
+            } else {
+                updateStatusLabel(ui, "update.scrcpy.state", pw - 24.0f - 132.0f, 284.0f, 132.0f, 36.0f,
+                                  scBtn, scBtn == "已是最新");
+            }
 
             // --- Bottom: re-check + status + progress ---
             toolButton(ui, "update.recheck", 24.0f, 352.0f, 112.0f, 36.0f,
@@ -8047,7 +8494,7 @@ void composeSetupDialog(eui::Ui& ui, float w, float h) {
             // --- adb ---
             ui.text("setup.adb.title")
                 .x(rowX).y(106.0f).size(200.0f, 24.0f)
-                .text("adb（Android 调试桥）")
+                .text("ADB（Android 调试桥）")
                 .fontSize(15.0f).lineHeight(15.0f)
                 .color(kInk)
                 .build();
@@ -8059,13 +8506,20 @@ void composeSetupDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(12.5f).lineHeight(12.5f)
                 .color(adbPresent ? kMuted : kAccent)
                 .build();
-            toolButton(ui, "setup.adb.btn", rowX + rowW - btnW, 120.0f, btnW, 36.0f,
-                       0xF019, adbPresent ? "已安装" : (adbDownloadable ? "下载并安装" : "获取中…"),
-                       !adbPresent, adbDownloadable && !busy, [] {
-                           if (ensureToolsDownloadable(PendingInstall::adb)) {
-                               toast("正在下载 adb", "下载完成后会自动放到程序目录并启用。");
-                           }
-                       });
+            // A settled "已安装" is a status, not an action: it used to be a full button with a
+            // download icon and only its text muted - the same dead-control pattern as the
+            // update dialog's "已是最新" (see updateStatusLabel).
+            if (adbPresent) {
+                updateStatusLabel(ui, "setup.adb.installed", rowX + rowW - btnW, 120.0f, btnW, 36.0f,
+                                  "已安装", true);
+            } else {
+                toolButton(ui, "setup.adb.btn", rowX + rowW - btnW, 120.0f, btnW, 36.0f,
+                           0xF019, adbDownloadable ? "下载并安装" : "获取中…", true, adbDownloadable && !busy, [] {
+                               if (ensureToolsDownloadable(PendingInstall::adb)) {
+                                   toast("正在下载 adb", "下载完成后会自动放到程序目录并启用。");
+                               }
+                           });
+            }
 
             // --- scrcpy ---
             ui.text("setup.scrcpy.title")
@@ -8082,13 +8536,17 @@ void composeSetupDialog(eui::Ui& ui, float w, float h) {
                 .fontSize(12.5f).lineHeight(12.5f)
                 .color(scrcpyPresent ? kMuted : kAccent)
                 .build();
-            toolButton(ui, "setup.scrcpy.btn", rowX + rowW - btnW, 196.0f, btnW, 36.0f,
-                       0xF019, scrcpyPresent ? "已安装" : (scrcpyDownloadable ? "下载并安装" : "获取中…"),
-                       !scrcpyPresent, scrcpyDownloadable && !busy, [] {
-                           if (ensureToolsDownloadable(PendingInstall::scrcpy)) {
-                               toast("正在下载 scrcpy", "下载完成后即可在工具栏点「投屏」。");
-                           }
-                       });
+            if (scrcpyPresent) {
+                updateStatusLabel(ui, "setup.scrcpy.installed", rowX + rowW - btnW, 196.0f, btnW, 36.0f,
+                                  "已安装", true);
+            } else {
+                toolButton(ui, "setup.scrcpy.btn", rowX + rowW - btnW, 196.0f, btnW, 36.0f,
+                           0xF019, scrcpyDownloadable ? "下载并安装" : "获取中…", true, scrcpyDownloadable && !busy, [] {
+                               if (ensureToolsDownloadable(PendingInstall::scrcpy)) {
+                                   toast("正在下载 scrcpy", "下载完成后即可在工具栏点「投屏」。");
+                               }
+                           });
+            }
 
             ui.text("setup.note")
                 .x(rowX).y(248.0f).size(rowW, 16.0f)
@@ -8232,7 +8690,7 @@ void composeExternalEditDialog(eui::Ui& ui, float w, float h) {
                            [index] { stopExternalEdit(index); });
             }
 
-            toolButton(ui, "extedit.close", 24.0f, ph - 42.0f, 32.0f, 28.0f,
+            toolButton(ui, "extedit.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] { state.externalEditListOpen = false; }, 12.0f);
             toolButton(ui, "extedit.syncall", 142.0f, ph - 48.0f, 110.0f, 34.0f,
                        0xF021, "全部同步", false, pending > 0, [] {
@@ -8245,10 +8703,21 @@ void composeExternalEditDialog(eui::Ui& ui, float w, float h) {
         .build();
 }
 
-void composeConfirmDialog(eui::Ui& ui, float w, float h) {    components::dialog(ui, "confirm.dialog")
+void composeConfirmDialog(eui::Ui& ui, float w, float h) {
+    // A destructive confirmation gets the danger colour on its primary button. The dialog
+    // component already exposes the whole button colour set, so no framework change was
+    // needed; only the caller had no way to say "this one is irreversible".
+    components::DialogStyle style(themeTokens());
+    if (state.confirmDestructive) {
+        style.primary = kRose;
+        style.primaryHover = eui::mixColor(kRose, kWhite, 0.12f);
+        style.primaryPressed = eui::mixColor(kRose, {0.0f, 0.0f, 0.0f, 1.0f}, 0.16f);
+    }
+    components::dialog(ui, "confirm.dialog")
         .screen(w, h)
         .open(state.confirmDialogOpen)
         .theme(themeTokens())
+        .style(style)
         .title(state.confirmTitle)
         .message(state.confirmMessage)
         .primaryText(state.confirmPrimaryText)
@@ -8297,7 +8766,19 @@ void composePromptDialog(eui::Ui& ui, float w, float h) {
                 })
                 .build();
 
+            // The field's only label used to be its placeholder, which disappears as soon as
+            // the user types - exactly when a hint about the expected format matters most.
+            if (!state.promptValue.empty() && !state.promptHint.empty()) {
+                ui.text("prompt.hint")
+                    .x(24.0f).y(102.0f).size(412.0f, 20.0f)
+                    .text(state.promptHint)
+                    .fontSize(12.0f).lineHeight(12.0f)
+                    .color(kMuted)
+                    .build();
+            }
+
             toolButton(ui, "prompt.cancel", 24.0f, 140.0f, 120.0f, 40.0f, 0xF00D, "取消",
+
                        false, true, [] { state.promptOpen = false; });
             toolButton(ui, "prompt.ok", 460.0f - 24.0f - 120.0f, 140.0f, 120.0f, 40.0f,
                        0xF00C, "确定", true, true, [] { confirmPrompt(); });
@@ -8359,7 +8840,7 @@ void composeDeviceInfoDialog(eui::Ui& ui, float w, float h) {
                     }
                 })
                 .build();
-            toolButton(ui, "device.info.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+            toolButton(ui, "device.info.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] { state.deviceInfoOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.deviceInfoOpen = v; })
@@ -8379,7 +8860,9 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
 
             ui.text("logcat.title")
                 .x(24.0f).y(16.0f).size(160.0f, 28.0f)
-                .text("logcat（实时）")
+                // The title used to claim "real-time" even while the badge next to it said
+                // 已停止 - the two contradicted each other on screen.
+                .text(streaming ? "logcat（实时）" : "logcat")
                 .fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
             ui.text("logcat.status")
                 .x(150.0f).y(16.0f).size(120.0f, 28.0f)
@@ -8422,6 +8905,13 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
                 toolButton(ui, "logcat.restart", actionX, 52.0f, actionW, 36.0f,
                            0xF021, "重新开始", true, true, [] { startLogcat(); });
             }
+            // Long lines used to be clipped at the right edge with no ellipsis, no wrap and
+            // no horizontal scroll - and a crash stack trace is exactly the text that runs
+            // long. This toggles between the dense one-line-per-entry view and a wrapped
+            // one, so the whole line is always reachable.
+            toolButton(ui, "logcat.wrap", actionX + actionW + 8.0f, 52.0f, actionW, 36.0f,
+                       0xF15C, state.logcatWrap ? "换行：开" : "换行：关", state.logcatWrap, true,
+                       [] { state.logcatWrap = !state.logcatWrap; state.logcatScroll.set(1.0e9f); });
 
             // Build the filtered view under the buffer lock.
             const bool regexOk = logcatEnsureRegex();
@@ -8475,17 +8965,33 @@ void composeLogcatDialog(eui::Ui& ui, float w, float h) {
                             .fontSize(12.0f).lineHeight(12.0f).color(kMuted).build();
                         return;
                     }
+                    const float lineW = cw - 8.0f;
+                    const float pitch = logLinePitch();
+                    // Measure so a wrapped line can be given as many rows as it needs; with
+                    // the fixed pitch the text was simply cut off at the element's width.
+                    const float drawnSize = 12.0f * ::core::runtimeFontScale();
+                    float cursorY = 0.0f;
                     for (std::size_t i = 0; i < shown.size(); ++i) {
                         // Monospace + level colour: a log is column-aligned data, and in the
                         // proportional UI font the timestamp/pid/tag columns wander, which
                         // makes a stream of lines much harder to scan. The level colour
                         // (E red, W amber, everything else ink) is what the eye looks for
                         // first when something went wrong.
+                        float rowH = pitch;
+                        if (state.logcatWrap) {
+                            const float textW = eui::measureTextWidth(shown[i], "Consolas", drawnSize, 400);
+                            const int rows = static_cast<int>(std::ceil(textW / std::max(1.0f, lineW)));
+                            // Cap the growth: one pathological line must not push everything
+                            // else off the screen.
+                            rowH = pitch * static_cast<float>(std::min(std::max(rows, 1), 8));
+                        }
                         body.text("logcat.line." + std::to_string(i))
-                            .x(4.0f).y(static_cast<float>(i) * logLinePitch()).size(cw - 8.0f, logLinePitch())
+                            .x(4.0f).y(cursorY).size(lineW, rowH)
                             .text(shown[i]).fontSize(12.0f).lineHeight(12.0f)
                             .fontFamily("Consolas")
+                            .wrap(state.logcatWrap)
                             .color(logcatLevelColor(shown[i])).build();
+                        cursorY += rowH;
                     }
                 })
                 .build();
@@ -8600,7 +9106,7 @@ void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
                        });
             toolButton(ui, "text.preview.save", pw - 24.0f - 200.0f, ph - 56.0f, 92.0f, 40.0f,
                        0xF0C7, "保存", true, true, [] { saveTextPreview(); });
-            toolButton(ui, "text.preview.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+            toolButton(ui, "text.preview.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] { state.textPreviewOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.textPreviewOpen = v; })
@@ -8671,7 +9177,7 @@ void composePropertiesDialog(eui::Ui& ui, float w, float h) {
                     }
                 })
                 .build();
-            toolButton(ui, "file.properties.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+            toolButton(ui, "file.properties.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] { state.propertiesOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.propertiesOpen = v; })
@@ -8752,10 +9258,10 @@ void composeHelpDialog(eui::Ui& ui, float w, float h) {
         .screen(w, h)
         .open(state.helpOpen)
         .theme(themeTokens())
-        .size(460.0f, 420.0f)
+        .size(430.0f, 440.0f)
         .zIndex(1300)
         .content([&] {
-            const float pw = 460.0f, ph = 420.0f;
+            const float pw = 430.0f, ph = 440.0f;
             ui.text("help.title")
                 .x(24.0f).y(16.0f).size(pw - 48.0f, 28.0f)
                 .text("快捷键").fontSize(17.0f).lineHeight(17.0f).color(kInk).build();
@@ -8767,24 +9273,27 @@ void composeHelpDialog(eui::Ui& ui, float w, float h) {
                     const char* lines[] = {
                         "F5          刷新目录",
                         "F2          重命名",
-                        "Enter       打开选中文件夹",
+                        "Enter       打开选中项",
                         "Backspace   返回上一级",
                         "Delete      删除选中项",
                         "Ctrl+L      编辑路径",
+                        "Ctrl+F      搜索当前目录",
+                        "方向键      移动选择（Shift 连选）",
                         "Ctrl+C      复制",
                         "Ctrl+X      剪切",
                         "Ctrl+V      粘贴",
                         "Ctrl+A      全选",
                         "Esc         关闭弹窗 / 取消编辑",
                     };
-                    for (int i = 0; i < 11; ++i) {
+                    const int lineCount = static_cast<int>(sizeof(lines) / sizeof(lines[0]));
+                    for (int i = 0; i < lineCount; ++i) {
                         body.text("help.line." + std::to_string(i))
                             .x(4.0f).y(static_cast<float>(i) * fontRowPitch()).size(cw - 8.0f, fontRowPitch())
                             .text(lines[i]).fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
                     }
                 })
                 .build();
-            toolButton(ui, "help.close", pw - 24.0f - 32.0f, ph - 44.0f, 32.0f, 28.0f,
+            toolButton(ui, "help.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
                        0xF00D, "", false, true, [] { state.helpOpen = false; }, 12.0f);
         })
         .onOpenChange([](bool v) { state.helpOpen = v; })
@@ -8919,7 +9428,7 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeTopBar(ui, x, topY, contentW, topBarH);
             composeBreadcrumb(ui, x, pathY, contentW, pathBarH);
             composeHeader(ui, x + 6.0f, headerY, contentW - 12.0f, headerH);
-            composeFileList(ui, x, listY, contentW, listH);
+            composeFileList(ui, x, listY, contentW, listH, pathY);
 
             // Scroll edge effect: rows are cut off flat where the list meets the header above
             // and the status bar below. A short gradient of the list's own background makes

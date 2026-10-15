@@ -42,3 +42,8 @@ adb_browser_edit_tmp.txt
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ---- UI/UX audit output (generated; see ui-audit/UI-UX-审查报告.md) ----
+/ui-audit/
+# Design baseline persisted by the ui-ux-pro-max skill.
+/design-system/

@@ -471,15 +471,20 @@ public:
                                     .build();
                             }
                         } else {
+                            // The placeholder must not show through an in-progress
+                            // composition: while an IME is composing, `state.text` is still
+                            // empty and the composition is drawn on top (below), so the two
+                            // used to render over each other.
+                            const bool showPlaceholder = empty && !hasComposition;
                             ui_.text(id_ + ".text")
                                 .position(-state.horizontalScroll, -state.verticalScroll)
                                 .size(layout.visibleTextWidth, renderedTextHeight)
                                 .dirtyKey(textDirtyKey)
-                                .text(empty ? placeholder_ : state.text)
+                                .text(showPlaceholder ? placeholder_ : state.text)
                                 .fontSize(fontSize)
                                 .fontFamily(fontFamily_)
                                 .lineHeight(textLineHeight)
-                                .color(empty ? style_.placeholder : style_.text)
+                                .color(showPlaceholder ? style_.placeholder : style_.text)
                                 .wrap(false)
                                 .verticalAlign(core::VerticalAlign::Top)
                                 .build();
