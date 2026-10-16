@@ -51,6 +51,19 @@ std::vector<std::string> devicesArgs();
 // shows up in the UI instead of silently disappearing.
 std::vector<Device> parseDevices(const std::string& output);
 
+// Device storage usage, from `df -k <path>`.
+struct DfUsage {
+    bool ok = false;
+    long long totalKb = 0;
+    long long usedKb = 0;
+};
+
+// Parse `df -k <path>` output. Tolerant on purpose: toybox prints either a header line plus
+// one line per mount, or just the data line, and the filesystem name may be a device path
+// with digits in it - so the sizes are found by looking for the first all-digit token wide
+// enough to be a size, not by trusting a fixed column.
+DfUsage parseDfKb(const std::string& output);
+
 // Parse `ls -la` / `ls -l` output into entries.
 //
 // Handles both date shapes real devices emit:

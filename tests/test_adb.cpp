@@ -318,6 +318,30 @@ ADB_TEST(command_builders_shape) {
     }
 
 
+    // df -k /data, the two shapes toybox emits.
+    {
+        const DfUsage withHeader = parseDfKb(
+            "Filesystem       1K-blocks       Used  Available Use% Mounted on\n"
+            "/dev/block/dm-6  268435456   90439680  178995776  34% /data\n");
+        ADB_CHECK(withHeader.ok);
+        ADB_CHECK_EQ(withHeader.totalKb, 268435456LL);
+        ADB_CHECK_EQ(withHeader.usedKb, 90439680LL);
+
+        const DfUsage noHeader =
+            parseDfKb("268435456  90439680  178995776  34% /data\n");
+        ADB_CHECK(noHeader.ok);
+        ADB_CHECK_EQ(noHeader.totalKb, 268435456LL);
+
+        // A device path containing digits must not be mistaken for a size.
+        const DfUsage devicePath =
+            parseDfKb("/dev/block/dm-6 4194304 1048576 3145728 26% /data\n");
+        ADB_CHECK(devicePath.ok);
+        ADB_CHECK_EQ(devicePath.totalKb, 4194304LL);
+
+        ADB_CHECK(!parseDfKb("").ok);
+        ADB_CHECK(!parseDfKb("df: /data: No such file or directory\n").ok);
+    }
+
     const std::vector<std::string> connect = connectArgs("192.168.1.5:5555");
     ADB_CHECK_EQ(connect.size(), static_cast<std::size_t>(2));
     if (connect.size() == 2) {

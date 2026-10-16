@@ -68,6 +68,50 @@ std::size_t findWriteMarkerLine(const std::string& output) {
 
 }  // namespace
 
+namespace {
+bool allDigits(const std::string& value) {
+    if (value.empty()) return false;
+    for (char c : value) {
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+}  // namespace
+
+DfUsage parseDfKb(const std::string& output) {
+    DfUsage usage;
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        // Header, in either spelling toybox uses.
+        if (line.find("1K-blocks") != std::string::npos || line.rfind("Filesystem", 0) == 0) continue;
+
+        std::istringstream fields(line);
+        std::vector<std::string> tokens;
+        std::string token;
+        while (fields >> token) tokens.push_back(token);
+
+        // First token that is all digits and at least four wide: "34" (a use percentage) is
+        // too short to be a size in 1K blocks, while a 4 GB device is already 4194304.
+        std::size_t index = tokens.size();
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            if (tokens[i].size() >= 4 && allDigits(tokens[i])) {
+                index = i;
+                break;
+            }
+        }
+        if (index + 1 >= tokens.size() || !allDigits(tokens[index + 1])) continue;
+
+        usage.totalKb = std::strtoll(tokens[index].c_str(), nullptr, 10);
+        usage.usedKb = std::strtoll(tokens[index + 1].c_str(), nullptr, 10);
+        usage.ok = usage.totalKb > 0;
+        if (usage.ok) break;
+    }
+    return usage;
+}
+
 std::vector<FsEntry> parseLsLa(const std::string& output) {
     std::vector<FsEntry> entries;
     std::istringstream in(output);

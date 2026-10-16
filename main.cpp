@@ -506,6 +506,13 @@ struct AppState {
     // Directory cache: key = serial + "|" + path
     std::unordered_map<std::string, ListingResult> dirCache;
 
+    // Device storage for the status bar, from `df -k /data`. Refreshed on a timer rather than
+    // per navigation: it describes the device, not the directory being browsed.
+    long long storageTotalKb = 0;
+    long long storageUsedKb = 0;
+    bool storageBusy = false;
+    double storageCheckedAt = 0.0;
+
     // Device info / text preview
     bool deviceInfoOpen = false;
     std::string deviceInfoText;
@@ -2924,6 +2931,40 @@ void fetchAdbVersion() {
         },
         [](const app::async::Result<std::string>& result) {
             if (result.ok) state.adbVersion = result.value;
+        });
+}
+
+// KB as the status bar shows it: "86.3 GB" / "256 GB" (no decimals once it is three digits).
+std::string formatStorageGb(long long kb) {
+    const double gb = static_cast<double>(kb) / (1024.0 * 1024.0);
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), gb >= 100.0 ? "%.0f GB" : "%.1f GB", gb);
+    return buffer;
+}
+
+void refreshStorage() {
+    if (state.selectedDevice.empty() || state.adbPath.empty() || state.storageBusy) return;
+    state.storageBusy = true;
+    const std::string adb = state.adbPath;
+    const std::string serial = state.selectedDevice;
+    app::async::restart(
+        "adb.storage",
+        [adb, serial]() -> app::async::Result<core::DfUsage> {
+            const ProcessResult r = runProcess(adb, {"-s", serial, "shell", "df", "-k", "/data"}, 15000);
+            if (r.exitCode != 0) {
+                return app::async::failure<core::DfUsage>("df 失败");
+            }
+            return app::async::success(core::parseDfKb(r.out));
+        },
+        [](const app::async::Result<core::DfUsage>& result) {
+            state.storageBusy = false;
+            state.storageCheckedAt = std::chrono::duration<double>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count();
+            if (result.ok && result.value.ok) {
+                state.storageTotalKb = result.value.totalKb;
+                state.storageUsedKb = result.value.usedKb;
+            }
         });
 }
 
@@ -6867,8 +6908,40 @@ void composeStatusBar(eui::Ui& ui, float x, float y, float w, float h) {
             .verticalAlign(eui::VerticalAlign::Center)
             .build();
     } else {
+        // Item count keeps the right edge. Its box is a fixed width now instead of a fraction,
+        // because the storage readout shares this end of the bar - right-aligned either way, so
+        // the rendered position is unchanged.
+        const float countW = 96.0f;
+
+        // Storage usage, when we have it: a thin bar and "86.3 GB / 256 GB" to the left of the
+        // count. Silent until the first successful `df`, so a device that does not answer
+        // leaves the bar as it was rather than showing a zero.
+        if (state.storageTotalKb > 0) {
+            const float labelW = 118.0f;
+            const float barW = 54.0f;
+            const float gap = 10.0f;
+            const float barX = x + w - countW - gap - labelW - gap - barW;
+            const float barY = y + (h - 6.0f) * 0.5f;
+            const float ratio = std::clamp(static_cast<float>(state.storageUsedKb) /
+                                               static_cast<float>(state.storageTotalKb),
+                                           0.0f, 1.0f);
+            ui.rect("status.storage.bg")
+                .x(barX).y(barY).size(barW, 6.0f)
+                .color(kSurfaceHover).radius(3.0f).build();
+            ui.rect("status.storage.fill")
+                .x(barX).y(barY).size(std::max(2.0f, barW * ratio), 6.0f)
+                .color(ratio > 0.9f ? kAmber : kAccent).radius(3.0f).build();
+            ui.text("status.storage.label")
+                .x(barX + barW + gap).y(y).size(labelW, h)
+                .text(formatStorageGb(state.storageUsedKb) + " / " + formatStorageGb(state.storageTotalKb))
+                .fontSize(12.5f).lineHeight(12.5f)
+                .color(kMuted)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
+        }
+
         ui.text("status.right")
-            .x(x + w * 0.62f).y(y).size(w * 0.38f, h)
+            .x(x + w - countW).y(y).size(countW, h)
             .text(count)
             .fontSize(13.0f).lineHeight(13.0f)
             .color(kMuted)
@@ -9320,6 +9393,16 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             // suggest "more rows underneath". It read as a shadow smeared across the card and
             // it fought the corner rounding (the bands are square, the card is not), so it is
             // gone: the scrollbar already says there is more to scroll.
+            // Storage readout: refresh it when it is unknown or older than two minutes, so a
+            // device whose storage changed does not need a manual refresh.
+            if (!state.selectedDevice.empty() && !state.storageBusy) {
+                const double nowSeconds = std::chrono::duration<double>(
+                                              std::chrono::steady_clock::now().time_since_epoch())
+                                              .count();
+                if (state.storageCheckedAt == 0.0 || nowSeconds - state.storageCheckedAt > 120.0) {
+                    refreshStorage();
+                }
+            }
             composeStatusBar(ui, x, statusY, contentW, statusH);
 
             composeToast(ui, W, H);
