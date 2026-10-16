@@ -581,8 +581,14 @@ struct AppState {
     // Chinese labels, and the filter the user is typing. (The family list itself
     // is declared with the rest of the settings state.)
     std::vector<char> fontListHasChinese;  // parallel to fontList
+    std::vector<char> fontListMonospace;   // parallel to fontList: name looks like a monospace family
+    // Fonts the user actually picked, most recent first - the picker shows them as 最近使用.
+    std::vector<std::string> recentFonts;
+    // Which picker tab is active: 0 全部 / 1 支持中文 / 2 等宽. Defaults to 支持中文, which is
+    // what the old "only Chinese" checkbox did - picking a Latin-only font turns every Chinese
+    // character in the interface into an empty box.
+    int fontTab = 1;
     std::string fontFilter;
-    bool fontOnlyChinese = true;
 
     // Window size persistence: the last size observed, and when it last changed
     // (see pollWindowSizeForSave).
@@ -861,6 +867,16 @@ std::string settingsFilePath() {
     return executableDir() + "\\adb_file_browser_settings.txt";
 }
 
+// The 最近使用 list is persisted as one '|'-joined value (font family names cannot contain it).
+std::string joinRecentFonts() {
+    std::string out;
+    for (const std::string& family : state.recentFonts) {
+        if (!out.empty()) out += '|';
+        out += family;
+    }
+    return out;
+}
+
 void saveSettings() {
     // The key=value format and its parsing live in core/store.cpp (round-trip
     // tested); this only decides which keys the app persists.
@@ -884,6 +900,7 @@ void saveSettings() {
         {"windowH", std::to_string(settings.windowH)},
         {"bookmarkAliasColumns", std::to_string(settings.bookmarkAliasColumns)},
         {"setupPromptDismissed", state.setupPromptDismissed ? "1" : "0"},
+        {"recentFonts", joinRecentFonts()},
     };
     core::writeFileAtomic(settingsFilePath(), core::serializeKeyValues(values));
 }
@@ -1131,12 +1148,34 @@ const std::string& fontPreviewFile(const std::string& family, int weight) {
     return inserted.first->second;
 }
 #else
+
 // No system font enumeration off Windows; the picker shows a short fixed list.
 std::vector<std::string> listSystemFonts(std::vector<char>& hasChinese) {
     hasChinese.assign(3, 1);
     return {"Sans", "Serif", "Monospace"};
 }
 #endif
+// Does this family look like a monospace one? The framework reports no advance widths, and
+// measuring 300+ families against a pair of glyphs every time the list opens would cost far
+// more than the filter is worth. So this is a name heuristic over the families Windows ships
+// plus the usual programming fonts - good enough for a filter tab that shows its own count.
+bool fontNameLooksMonospace(const std::string& name) {
+    const std::string lower = core::lower(name);
+    // Monotype is a foundry, not a monospace family ("Monotype Corsiva" is a script face).
+    if (lower.find("monotype") != std::string::npos) return false;
+    static const char* kMarkers[] = {
+        "mono",     "code",     "consol",   "courier",  "menlo",    "hack",
+        "iosevka",  "fira",     "cascadia", "terminal", "console",  "等宽",
+        "mingw",    "sarasa",   "cica",     "maple",    "jetbrains", "lucida console",
+        "dejavu",   "ubuntu",   "inconsolata", "source code", "victor mono", "space mono",
+        "roboto mono", "noto sans mono", "ibm plex mono", "anonymous pro",
+    };
+    for (const char* marker : kMarkers) {
+        if (lower.find(marker) != std::string::npos) return true;
+    }
+    return false;
+}
+
 
 struct AccentPreset {
     const char* name;
@@ -1525,6 +1564,18 @@ void loadSettings() {
         else if (key == "windowW") settings.windowW = std::atoi(value.c_str());
         else if (key == "windowH") settings.windowH = std::atoi(value.c_str());
         else if (key == "bookmarkAliasColumns") settings.bookmarkAliasColumns = std::atoi(value.c_str());
+        else if (key == "recentFonts") {
+            state.recentFonts.clear();
+            std::size_t start = 0;
+            while (start < value.size()) {
+                const std::size_t sep = value.find('|', start);
+                const std::string item =
+                    value.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+                if (!item.empty() && state.recentFonts.size() < 5) state.recentFonts.push_back(item);
+                if (sep == std::string::npos) break;
+                start = sep + 1;
+            }
+        }
         else if (key == "setupPromptDismissed") state.setupPromptDismissed = (std::atoi(value.c_str()) != 0);
     }
 #ifdef _WIN32
@@ -1589,6 +1640,12 @@ void openSettingsDialog() {
                     }
                     state.fontList = std::move(names);
                     state.fontListHasChinese = std::move(hasChinese);
+                    state.fontListMonospace.clear();
+                    state.fontListMonospace.reserve(state.fontList.size());
+                    for (const std::string& family : state.fontList) {
+                        state.fontListMonospace.push_back(
+                            fontNameLooksMonospace(family) ? static_cast<char>(1) : static_cast<char>(0));
+                    }
                 }
             });
     }
@@ -1615,6 +1672,11 @@ void selectFontFamily(const std::string& family) {
 #else
     settings.fontFamily = family;
 #endif
+    // Remember it for the picker's 最近使用 group: most recent first, no duplicates, capped.
+    state.recentFonts.erase(std::remove(state.recentFonts.begin(), state.recentFonts.end(), family),
+                            state.recentFonts.end());
+    state.recentFonts.insert(state.recentFonts.begin(), family);
+    if (state.recentFonts.size() > 5) state.recentFonts.resize(5);
     applySettingsNow();
 }
 
@@ -7844,9 +7906,11 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 .build();
             ui.text("settings.font.label")
                 .x(24.0f).y(370.0f).size(68.0f, 34.0f)
-                // Four characters, because the label column is 68px wide and the text is
-                // right-aligned: a longer label overflows into the card margin.
-                .text("中文字体")
+                // Two characters, because the label column is 68px wide and the text is
+                // right-aligned: a longer label overflows into the card margin. "筛选" names
+                // what the tabs beside it do; the old "中文字体" named the checkbox they
+                // replaced.
+                .text("筛选")
                 .fontSize(12.5f).lineHeight(12.5f)
                 .color(kMuted)
                 .horizontalAlign(eui::HorizontalAlign::Right)
@@ -7883,24 +7947,45 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                 }
                 return name;
             };
+            auto hiddenAsWeightVariant = [&](std::size_t i) {
+                const std::string base = baseFamily(state.fontList[i]);
+                return base != state.fontList[i] &&
+                       std::find(state.fontList.begin(), state.fontList.end(), base) !=
+                           state.fontList.end();
+            };
             for (std::size_t i = 0; i < state.fontList.size(); ++i) {
                 const bool chinese = i < state.fontListHasChinese.size() &&
                                      state.fontListHasChinese[i] != 0;
-                if (state.fontOnlyChinese && !chinese && state.fontList[i] != settings.fontFamily) {
+                const bool monospace = i < state.fontListMonospace.size() &&
+                                       state.fontListMonospace[i] != 0;
+                // Tab filter. The family in use is always kept, so the list can always show
+                // where the current choice sits.
+                if (state.fontTab == 1 && !chinese && state.fontList[i] != settings.fontFamily) {
+                    continue;
+                }
+                if (state.fontTab == 2 && !monospace && state.fontList[i] != settings.fontFamily) {
                     continue;
                 }
                 if (!needle.empty() && core::lower(state.fontList[i]).find(needle) == std::string::npos) {
                     continue;
                 }
-                if (collapseWeights) {
-                    const std::string base = baseFamily(state.fontList[i]);
-                    if (base != state.fontList[i] &&
-                        std::find(state.fontList.begin(), state.fontList.end(), base) !=
-                            state.fontList.end()) {
-                        continue;  // a weight variant of a family that is listed anyway
-                    }
+                if (collapseWeights && hiddenAsWeightVariant(i)) {
+                    continue;  // a weight variant of a family that is listed anyway
                 }
                 visibleFonts.push_back(i);
+            }
+            // Counts for the tab labels: over the whole list (not over what the search box has
+            // narrowed down to, so the numbers hold still while you type) but with the same
+            // weight-variant de-duplication the list applies - otherwise the tab promises more
+            // fonts than the list then shows.
+            int collapsedTotal = 0;
+            int chineseCount = 0;
+            int monospaceCount = 0;
+            for (std::size_t i = 0; i < state.fontList.size(); ++i) {
+                if (hiddenAsWeightVariant(i)) continue;
+                ++collapsedTotal;
+                if (i < state.fontListHasChinese.size() && state.fontListHasChinese[i] != 0) ++chineseCount;
+                if (i < state.fontListMonospace.size() && state.fontListMonospace[i] != 0) ++monospaceCount;
             }
 
             ui.stack("settings.font.search.wrap")
@@ -7916,31 +8001,42 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                         .build();
                 })
                 .build();
-            // Back in the control column, not at the right margin: this row carries two
-            // controls (the checkbox and the search box), so the "label left, switch right"
-            // rule for single-control rows does not apply here.
-            ui.stack("settings.font.cjk.wrap")
-                .x(104.0f).y(370.0f).size(34.0f, 34.0f)
-                .content([&] {
-                    components::checkbox(ui, "settings.font.cjk")
-                        // Same height as the wrapper, so the component's own vertical
-                        // centring lines up exactly with the label box beside it.
-                        .size(34.0f, 34.0f)
-                        .text("")
-                        .fontSize(12.5f)
-                        .theme(themeTokens())
-                        .checked(state.fontOnlyChinese)
-                        .onChange([](bool v) { state.fontOnlyChinese = v; })
-                        .build();
-                })
-                .build();
+            // Tabs instead of the old "only Chinese" checkbox. The checkbox could express one
+            // filter; 等宽 answers the other question people actually have when picking a UI
+            // font (path/permission columns read better in a fixed pitch). Same row, same
+            // geometry as the control it replaces - the search box at the right is untouched.
+            {
+                const std::string tabLabels[3] = {
+                    "全部 " + std::to_string(collapsedTotal),
+                    "支持中文 " + std::to_string(chineseCount),
+                    "等宽 " + std::to_string(monospaceCount),
+                };
+                // Derived from the search box's left edge, not fixed at 360: at that width the
+                // tabs ran underneath the box (this dialog is narrower than the mockup's).
+                const float fontTabsW = std::max(240.0f, pw - 24.0f - 190.0f - 8.0f - 104.0f);
+                ui.stack("settings.font.tabs.wrap")
+                    .x(104.0f).y(370.0f).size(fontTabsW, 34.0f)
+                    .content([&] {
+                        components::segmented(ui, "settings.font.tabs")
+                            .theme(themeTokens())
+                            .size(fontTabsW, 34.0f)
+                            .items({tabLabels[0], tabLabels[1], tabLabels[2]})
+                            .selected(state.fontTab)
+                            .fontSize(12.5f)
+                            .onChange([](int idx) { state.fontTab = std::clamp(idx, 0, 2); })
+                            .build();
+                    })
+                    .build();
+            }
 
             // Fills what is left: with the wider, taller card it reads as the page's last
             // section rather than as a small stray box.
-            const float fontListH = std::max(60.0f, ph - 448.0f);
+            // The list yields one line's height to the count, which now sits under it as a
+            // footer (the dialog's own height and every other section are unchanged).
+            const float fontListH = std::max(60.0f, ph - 466.0f);
             if (state.fontList.empty()) {
                 ui.text("settings.font.loading")
-                    .x(24.0f).y(416.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(414.0f).size(pw - 48.0f, fontListH)
                     .text("正在加载字体…")
                     .fontSize(14.0f).lineHeight(14.0f)
                     .color(kMuted)
@@ -7949,9 +8045,9 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .build();
             } else {
                 ui.text("settings.font.count")
-                    // 34: aligned with the list rows' text, not with the control column - this
-                    // line describes the list below it.
-                    .x(34.0f).y(410.0f).size(pw - 58.0f, 16.0f)
+                    // 34: aligned with the list rows' text, not with the control column. It is
+                    // the list's footer now, right under the box rather than above it.
+                    .x(34.0f).y(ph - 34.0f).size(pw - 58.0f, 16.0f)
                     .text(visibleFonts.size() == state.fontList.size()
                               ? ("共 " + std::to_string(state.fontList.size()) + " 个字体")
                               : ("匹配 " + std::to_string(visibleFonts.size()) + " / " +
@@ -7960,7 +8056,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                     .color(kMuted)
                     .build();
                 ui.stack("settings.font.wrap")
-                    .x(24.0f).y(430.0f).size(pw - 48.0f, fontListH)
+                    .x(24.0f).y(414.0f).size(pw - 48.0f, fontListH)
                     .content([&] {
                         ui.rect("settings.font.wrap.bg")
                             .size(pw - 48.0f, fontListH)
@@ -7976,28 +8072,33 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                             // The key includes the filter and the visible count so the
                             // scroll view rebuilds when the list changes.
                             .contentKey("settings.fonts." + std::to_string(visibleFonts.size()) +
-                                        "." + state.fontFilter +
-                                        (state.fontOnlyChinese ? ".cjk" : ".all"))
+                                        "." + state.fontFilter + "." + std::to_string(state.fontTab) +
+                                        "." + std::to_string(state.recentFonts.size()))
                             .content([&](eui::Ui& body, float cw, float) {
                                 const float rowH = 30.0f;
-                                // Rows are cut by the rounded container bottom because the
-                                // viewport height is not a multiple of rowH: the last row
-                                // arrived sliced in half with no hint that the list simply
-                                // continues. A little breathing room below the last row
-                                // makes the cut read as "there is more" instead of "broken".
-                                body.rect("settings.font.tailpad")
-                                    .x(0.0f).y(static_cast<float>(visibleFonts.size()) * rowH)
-                                    .size(cw, 14.0f)
-                                    .color(kClear)
-                                    .build();
-                                for (std::size_t r = 0; r < visibleFonts.size(); ++r) {
-                                    const std::size_t index = visibleFonts[r];
+                                const float headerH = 24.0f;
+                                float cursorY = 0.0f;
+                                auto groupHeader = [&](const std::string& id, const std::string& label) {
+                                    body.text(id)
+                                        .x(10.0f).y(cursorY).size(cw - 20.0f, headerH)
+                                        .text(label)
+                                        .fontSize(11.5f).lineHeight(11.5f)
+                                        .color(kMuted)
+                                        .verticalAlign(eui::VerticalAlign::Center)
+                                        .build();
+                                    cursorY += headerH;
+                                };
+                                auto drawFontRow = [&](std::size_t index) {
                                     const std::string& name = state.fontList[index];
                                     const bool selected = (name == settings.fontFamily);
                                     const std::string id = "settings.font.row." + std::to_string(index);
-                                    const float y = static_cast<float>(r) * rowH;
+                                    // A font that cannot draw Chinese shows a sample it *can*
+                                    // draw, instead of a row of empty boxes.
+                                    const bool hasCjk = index < state.fontListHasChinese.size() &&
+                                                        state.fontListHasChinese[index] != 0;
+                                    const std::string sample = hasCjk ? "文件 Aa 123" : "Aa 123 Bb";
                                     body.stack(id)
-                                        .y(y).size(cw, rowH)
+                                        .y(cursorY).size(cw, rowH)
                                         .content([&] {
                                             body.rect(id + ".bg")
                                                 .size(cw, rowH - 2.0f)
@@ -8008,7 +8109,7 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                                 .onClick([name] { selectFontFamily(name); })
                                                 .build();
                                             body.text(id + ".label")
-                                                .x(10.0f).y(0.0f).size(cw - 20.0f, rowH)
+                                                .x(10.0f).y(0.0f).size(cw - 140.0f, rowH)
                                                 .text(name)
                                                 // Rendered in the family it names, so the
                                                 // list shows what each choice looks like.
@@ -8018,9 +8119,54 @@ void composeSettingsDialog(eui::Ui& ui, float w, float h) {
                                                 .color(selected ? kInk : kMuted)
                                                 .verticalAlign(eui::VerticalAlign::Center)
                                                 .build();
+                                            // 文件 Aa 123 on the right: the three things an
+                                            // interface font has to get right (CJK, Latin,
+                                            // digits) side by side, in that font.
+                                            body.text(id + ".sample")
+                                                .x(0.0f).y(0.0f).size(cw - 10.0f, rowH)
+                                                .text(sample)
+                                                .fontFamily(fontPreviewFile(name, settings.fontWeight))
+                                                .fontSize(12.5f).lineHeight(12.5f)
+                                                .color(selected ? kInk : kMuted)
+                                                .horizontalAlign(eui::HorizontalAlign::Right)
+                                                .verticalAlign(eui::VerticalAlign::Center)
+                                                .build();
                                         })
                                         .build();
+                                    cursorY += rowH;
+                                };
+                                // 最近使用 first: the fonts you actually picked, so the second
+                                // visit is one click. They are repeated in the group below,
+                                // which keeps the list itself complete and alphabetically
+                                // stable instead of moving rows around.
+                                std::vector<std::size_t> recentIndices;
+                                for (const std::string& recent : state.recentFonts) {
+                                    const auto it = std::find(state.fontList.begin(),
+                                                              state.fontList.end(), recent);
+                                    if (it != state.fontList.end()) {
+                                        recentIndices.push_back(
+                                            static_cast<std::size_t>(it - state.fontList.begin()));
+                                    }
                                 }
+                                if (!recentIndices.empty()) {
+                                    groupHeader("settings.font.recent.header", "最近使用");
+                                    for (std::size_t index : recentIndices) drawFontRow(index);
+                                    groupHeader("settings.font.group.header",
+                                                state.fontTab == 1   ? "支持中文 · 按名称排序"
+                                                : state.fontTab == 2 ? "等宽 · 按名称排序"
+                                                                     : "全部 · 按名称排序");
+                                }
+                                for (std::size_t index : visibleFonts) drawFontRow(index);
+                                // Rows are cut by the rounded container bottom because the
+                                // viewport height is not a multiple of rowH: the last row
+                                // arrived sliced in half with no hint that the list simply
+                                // continues. A little breathing room below the last row
+                                // makes the cut read as "there is more" instead of "broken".
+                                body.rect("settings.font.tailpad")
+                                    .x(0.0f).y(cursorY)
+                                    .size(cw, 14.0f)
+                                    .color(kClear)
+                                    .build();
                             })
                             .build();
                     })
