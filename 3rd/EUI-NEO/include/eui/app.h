@@ -19,6 +19,12 @@ struct DslWindowRequest {
     int width = 640;
     int height = 420;
     bool modal = false;
+    // Optional explicit screen position, in physical pixels. A new window is queued and only
+    // created on the next frame, so without this it appears wherever the platform puts it and
+    // can only be moved afterwards - which is one frame in the wrong place, i.e. a flash.
+    bool positioned = false;
+    int x = 0;
+    int y = 0;
     std::function<void(const eui::KeyEvent&)> onKeyEvent;
     DslWindowCompose compose;
 };

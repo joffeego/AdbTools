@@ -189,9 +189,6 @@ std::vector<std::string> screencapArgs(const std::string& serial) {
     return {"-s", serial, "exec-out", "screencap", "-p"};
 }
 
-std::vector<std::string> logcatClearArgs(const std::string& serial) {
-    return {"-s", serial, "logcat", "-c"};
-}
 
 std::vector<std::string> connectArgs(const std::string& hostPort) {
     return {"connect", hostPort};

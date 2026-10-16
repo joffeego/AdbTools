@@ -51,7 +51,7 @@ std::wstring quoteWinArg(const std::wstring& arg);
 //
 // Why this is needed: adb is a client/server program, and a client that finds no
 // server starts one, which then outlives the client. If the app is killed while
-// such a child is starting (or while `adb logcat` runs, or while scrcpy mirrors),
+// such a child is starting (or while a transfer runs, or while scrcpy mirrors),
 // those processes are orphaned. They are not merely untidy: a running adb.exe
 // cannot be overwritten, so they keep the adb updater from replacing it, and they
 // hold a device connection open. Measured before this existed: eighteen adb

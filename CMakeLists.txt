@@ -123,7 +123,6 @@ add_executable(adb_browser
     app_main.cpp
     main.cpp
     cli/cli.cpp
-    regex_wrap.cpp
     ${ADBTOOLS_CORE_SOURCES}
     ${ADB_BROWSER_RC}
 )
@@ -162,10 +161,6 @@ set_source_files_properties(${ADBTOOLS_CORE_SOURCES} PROPERTIES
     COMPILE_OPTIONS "-fexceptions;-fno-rtti"
 )
 
-# regex_wrap.cpp uses std::regex, whose constructor throws on invalid patterns.
-# The app template compiles with -fno-exceptions, so compile this one TU with
-# exceptions enabled to isolate that behavior.
-set_source_files_properties(regex_wrap.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions")
 
 # WinHTTP drives the built-in adb/scrcpy/app update checker; bcrypt (CNG)
 # provides the SHA-256/SHA-1 verification of the downloaded packages.

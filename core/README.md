@@ -25,7 +25,7 @@ file-system helpers, all inside one anonymous namespace. Two consequences:
 ## Rules for anything added here
 
 - No `#include "eui_neo.h"`, no `<windows.h>`, no GLFW, no `<regex>` (the app is
-  built `-fno-exceptions`; exceptions are isolated in `regex_wrap.cpp`).
+  built `-fno-exceptions`).
   Windows-specific hashing is the one documented exception, guarded by
   `#ifdef _WIN32` in `sha256.cpp`, because CNG has no portable equivalent.
 - No access to `state`, `settings` or any other global. Pass what you need in.
@@ -102,8 +102,7 @@ The remaining pure logic that is still in `main.cpp`:
 
 - The update download layer (WinHTTP) sits next to the GUI code; the verification
   half is already here in `sha256.h`.
-- `logcat` filtering has its regex isolated in `regex_wrap.cpp`, but the line
-  filtering itself lives in the GUI's streaming loop.
+
 
 With `core/adb`, `core/batch` and the CLI in place, a new command is now a thin
 function in `cli/cli.cpp` rather than a new copy of the logic - and the device

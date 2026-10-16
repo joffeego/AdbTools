@@ -52,28 +52,10 @@ Two details that are easy to get wrong, and both are handled in
 | `uninstall <package>` | Uninstall an app |
 | `packages` | List third-party package names |
 | `screenshot [file]` | Capture the screen and save it locally |
-| `logcat` | Stream logcat; requires `-n <lines>` or `--timeout <seconds>` |
+ |
 | `version` | Show the app and adb versions |
 | `help` | Usage |
 
-### logcat
-
-Streams as lines arrive rather than buffering, so `-n` / `--timeout` can stop it
-and output appears immediately. It deliberately does not use `core::runProcess`:
-that returns only after the child exits, which for a log stream means "in an hour,
-with a gigabyte".
-
-```bash
-adb_browser logcat -n 100                    # first 100 lines, then exit
-adb_browser logcat --timeout 10              # collect for 10 seconds
-adb_browser logcat --timeout 5 --grep crash  # substring, case-insensitive
-adb_browser logcat --clear -n 50             # clear the buffer first
-adb_browser logcat --timeout 5 -s ActivityManager   # extra args go to adb logcat
-```
-
-`-n <lines>` or `--timeout <seconds>` is required: without one the command would
-stream forever. Ctrl+C also works. Any unrecognised argument is passed straight
-to `adb logcat`, so tag/priority filters (`-s TAG`, `*:W`) work as usual.
 
 ## Conventions
 
@@ -134,6 +116,6 @@ recorded rather than hidden.
 
 - `pull`/`push` of whole directory trees recursively (adb handles it, but there
   is no progress reporting).
-- `logcat` streaming, scrcpy mirroring, wireless pairing.
+
 - The app's own update check/install (the download layer still lives in
   `main.cpp` next to the WinHTTP code).

@@ -444,6 +444,12 @@ std::unique_ptr<ManagedWindow> createManagedWindow(const app::DslWindowRequest& 
     if (!childWindow) {
         return {};
     }
+    // Place an explicitly positioned window before it is composited for the first time. The
+    // application used to position the mirror window by polling for it after creation, which
+    // left it at the framework default spot for a frame and then jumped - the visible flash.
+    if (request.positioned) {
+        glfwSetWindowPos(childWindow, request.x, request.y);
+    }
 #ifdef _WIN32
     // Match the main window: dark frame + Windows 11 rounded corners.
     applyDarkTitleBar(childWindow);

@@ -95,6 +95,9 @@ struct DslWindowConfig {
     int windowWidthValue = 640;
     int windowHeightValue = 420;
     bool modalValue = false;
+    bool positionedValue = false;
+    int xValue = 0;
+    int yValue = 0;
     std::function<void(const eui::KeyEvent&)> keyEventHandler;
 
     DslWindowConfig& title(std::string value) { titleValue = std::move(value); return *this; }
@@ -109,6 +112,14 @@ struct DslWindowConfig {
     DslWindowConfig& windowWidth(int value) { windowWidthValue = value; return *this; }
     DslWindowConfig& windowHeight(int value) { windowHeightValue = value; return *this; }
     DslWindowConfig& modal(bool value = true) { modalValue = value; return *this; }
+    // Physical screen position for the new window. Passed at creation so the window is never
+    // composited anywhere else first.
+    DslWindowConfig& windowPosition(int x, int y) {
+        positionedValue = true;
+        xValue = x;
+        yValue = y;
+        return *this;
+    }
     DslWindowConfig& onKeyEvent(std::function<void(const eui::KeyEvent&)> handler) {
         keyEventHandler = std::move(handler);
         return *this;

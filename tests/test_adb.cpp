@@ -317,12 +317,6 @@ ADB_TEST(command_builders_shape) {
         ADB_CHECK_EQ(ADB_AT(screencap, 4), std::string("-p"));
     }
 
-    const std::vector<std::string> logcatClear = logcatClearArgs("S1");
-    ADB_CHECK_EQ(logcatClear.size(), static_cast<std::size_t>(4));
-    if (logcatClear.size() == 4) {
-        ADB_CHECK_EQ(ADB_AT(logcatClear, 2), std::string("logcat"));
-        ADB_CHECK_EQ(ADB_AT(logcatClear, 3), std::string("-c"));
-    }
 
     const std::vector<std::string> connect = connectArgs("192.168.1.5:5555");
     ADB_CHECK_EQ(connect.size(), static_cast<std::size_t>(2));

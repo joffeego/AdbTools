@@ -67,11 +67,6 @@
 #include <winhttp.h>
 #endif
 
-// Exception-isolated std::regex wrapper (regex_wrap.cpp). Returns nullptr /
-// -1 on invalid patterns instead of throwing.
-extern "C" void* adbRegexCompile(const char* pattern, int ignoreCase);
-extern "C" int adbRegexSearchHandle(void* handle, const char* text);
-extern "C" void adbRegexFree(void* handle);
 
 namespace app {
 namespace {
@@ -180,12 +175,11 @@ constexpr float kWideColumnEm = 0.72f;
 // glyphs still overshoots it. Every alias is additionally capped by the user's
 // own length setting, and the menu reserves 24px of margin on the right, which
 // absorbs the difference in every realistic case.
-// Row pitches for the list-style dialogs (logcat, command output, font list). They are
-// functions, not constants: the user's 字号 can change while the app runs, and a pitch
-// captured once would leave every later line drawn into a box it no longer fits - which
-// is what "a line looks cut off by an invisible border" was.
-float logLinePitch() { return 20.0f * ::core::runtimeFontScale(); }
-float commandLinePitch() { return 24.0f * ::core::runtimeFontScale(); }
+// Row pitches for the list-style dialogs (file properties, font list). They are functions, not
+// constants: the user's 字号 can change while the app runs, and a pitch captured once would
+// leave every later line drawn into a box it no longer fits - which is what "a line looks cut
+// off by an invisible border" was.
+float detailLinePitch() { return 20.0f * ::core::runtimeFontScale(); }
 float fontRowPitch() { return 28.0f * ::core::runtimeFontScale(); }
 // Toolbar animation state: the button size and the device selector's width ease toward
 // their targets so resizing the window does not make the icons jump between steps.
@@ -253,33 +247,6 @@ std::string ellipsizeToWidth(const std::string& text, float maxWidth, float font
     return text.substr(0, best) + kEllipsis;
 }
 
-// Log level of a logcat line, for colouring.
-//
-// The default (threadtime) format is "MM-DD HH:MM:SS.mmm  PID  TID LEVEL TAG: msg", so
-// the level is the letter right after the fifth field. Anything that does not look
-// like that reports ' ' and is drawn in the normal colour, which keeps `logcat -v` with
-// some other format from being painted at random.
-char logcatLevel(const std::string& line) {
-    std::size_t i = 0;
-    for (int field = 0; field < 4; ++field) {
-        while (i < line.size() && line[i] == ' ') ++i;
-        while (i < line.size() && line[i] != ' ') ++i;
-    }
-    while (i < line.size() && line[i] == ' ') ++i;
-    if (i >= line.size()) return ' ';
-    switch (line[i]) {
-        case 'V': case 'D': case 'I': case 'W': case 'E': case 'F': case 'A': return line[i];
-        default: return ' ';
-    }
-}
-
-eui::Color logcatLevelColor(const std::string& line) {
-    switch (logcatLevel(line)) {
-        case 'E': case 'F': case 'A': return kRose;
-        case 'W': return kAmber;
-        default: return kInk;
-    }
-}
 
 // Subprocess execution now lives in core/process.cpp so the GUI and the CLI
 // share one implementation (and one place to fix process-handling bugs).
@@ -539,17 +506,9 @@ struct AppState {
     // Directory cache: key = serial + "|" + path
     std::unordered_map<std::string, ListingResult> dirCache;
 
-    // Device info / logcat / text preview
+    // Device info / text preview
     bool deviceInfoOpen = false;
     std::string deviceInfoText;
-    bool logcatOpen = false;
-    std::string logcatFilter;
-    std::string logcatRegexError;      // non-empty when the regex is invalid
-    bool logcatStreaming = false;
-    long long logcatLastSeq = 0;       // last-seen line sequence (auto-scroll)
-    eui::Signal<float> logcatScroll;
-    void* logcatRegexHandle = nullptr; // compiled std::regex (owned)
-    std::string logcatCompiledFilter;  // filter the handle was built from
     bool textPreviewOpen = false;
     std::string textPreviewPath;
     std::string textPreviewContent;
@@ -641,10 +600,6 @@ struct AppState {
     // The last directory-listing failure, kept so the list area can keep showing *why* it
     // is empty after the toast has gone. Empty means the last listing succeeded.
     std::string listError;
-
-    // logcat: wrap long lines instead of clipping them at the right edge. Session-scoped
-    // view preference, like the other list options.
-    bool logcatWrap = true;
 
     // Keyboard navigation for the popup menus. The app owns the highlighted row (the
     // contextMenu component only paints it) so that Up/Down/Enter can drive a menu whose
@@ -763,19 +718,6 @@ std::atomic<long long> g_dlTotal{0};
 std::atomic<long long> g_dlReceived{0};
 std::atomic<int> g_dlStage{0};  // 0 idle, 1 download, 2 extract, 3 install
 
-// logcat streaming buffer + lifecycle (fed by a detached reader thread).
-std::mutex g_logcatMutex;
-std::deque<std::string> g_logcatLines;
-std::atomic<long long> g_logcatSeq{0};
-std::atomic<bool> g_logcatStop{false};
-std::atomic<bool> g_logcatRunning{false};
-#ifdef _WIN32
-// Handle of the running `adb logcat` process. Written by the logcat reader
-// thread (#ifdef branch below) and read by stopLogcat() on the UI thread, so it
-// is atomic: a plain HANDLE read concurrently with a write is a data race, and
-// the reads here must never be able to take a stale value.
-static std::atomic<HANDLE> g_logcatProcess{nullptr};
-#endif
 
 components::theme::ThemeColorTokens themeTokens() {
     components::theme::ThemeColorTokens t = components::theme::dark();
@@ -2150,6 +2092,10 @@ void refreshListing(bool force) {
             state.entries = it->second.entries;
             sortEntries(state.entries);
             applyFileFilter();
+            // The scroll resets here, in the same frame the new rows arrive. Doing it earlier
+            // (in navigateTo) moved the *previous* rows to the top for a frame - the reported
+            // flash when entering a folder.
+            resetListScroll();
             state.dirWritable = it->second.writable;
             state.selectedEntry.clear();
             state.selectedSet.clear();
@@ -2192,6 +2138,7 @@ void refreshListing(bool force) {
                 state.entries = result.value.entries;
                 sortEntries(state.entries);
                 applyFileFilter();
+                resetListScroll();   // see the cache-hit path above
                 state.dirWritable = result.value.writable;
                 state.listError.clear();
                 if (state.dirCache.size() >= 128) {
@@ -2222,7 +2169,10 @@ void navigateTo(const std::string& path) {
     state.pathInput = path;
     state.selectedEntry.clear();
     state.selectedSet.clear();
-    resetListScroll();
+    // No scroll reset here on purpose: the previous listing stays on screen at its own scroll
+    // offset until the new one is installed (both install paths in refreshListing reset the
+    // scroll in that same frame). Resetting here is what produced the one-frame jump to the
+    // top when entering a folder or going back/forward.
     rememberLastPath();
     refreshListing();
 }
@@ -2250,7 +2200,10 @@ void goBack() {
     state.pathInput = state.currentPath;
     state.selectedEntry.clear();
     state.selectedSet.clear();
-    resetListScroll();
+    // No scroll reset here on purpose: the previous listing stays on screen at its own scroll
+    // offset until the new one is installed (both install paths in refreshListing reset the
+    // scroll in that same frame). Resetting here is what produced the one-frame jump to the
+    // top when entering a folder or going back/forward.
     rememberLastPath();
     refreshListing();
 }
@@ -2263,7 +2216,10 @@ void goForward() {
     state.pathInput = state.currentPath;
     state.selectedEntry.clear();
     state.selectedSet.clear();
-    resetListScroll();
+    // No scroll reset here on purpose: the previous listing stays on screen at its own scroll
+    // offset until the new one is installed (both install paths in refreshListing reset the
+    // scroll in that same frame). Resetting here is what produced the one-frame jump to the
+    // top when entering a folder or going back/forward.
     rememberLastPath();
     refreshListing();
 }
@@ -2941,201 +2897,6 @@ void openDeviceInfo() {
         });
 }
 
-// --- Logcat (continuous streaming) ---
-void logcatRegexClear() {
-    if (state.logcatRegexHandle != nullptr) {
-        adbRegexFree(state.logcatRegexHandle);
-        state.logcatRegexHandle = nullptr;
-    }
-    state.logcatCompiledFilter.clear();
-    state.logcatRegexError.clear();
-}
-
-// Ensure the compiled regex matches the current filter. Returns true when the
-// filter is empty or valid; false when it is an invalid regex.
-bool logcatEnsureRegex() {
-    const std::string& filter = state.logcatFilter;
-    if (filter.empty()) {
-        logcatRegexClear();
-        return true;
-    }
-    if (state.logcatRegexHandle != nullptr && state.logcatCompiledFilter == filter) {
-        return state.logcatRegexError.empty();
-    }
-    logcatRegexClear();
-    // Case-insensitive matching.
-    state.logcatRegexHandle = adbRegexCompile(filter.c_str(), 1);
-    state.logcatCompiledFilter = filter;
-    if (state.logcatRegexHandle == nullptr) {
-        state.logcatRegexError = "正则表达式无效";
-        return false;
-    }
-    return true;
-}
-
-bool logcatLineMatches(const std::string& line) {
-    if (state.logcatFilter.empty()) return true;
-    if (state.logcatRegexHandle == nullptr) return false;
-    return adbRegexSearchHandle(state.logcatRegexHandle, line.c_str()) == 1;
-}
-
-void stopLogcat() {
-    g_logcatStop = true;
-#ifdef _WIN32
-    // Force the adb logcat process to exit so the reader thread unblocks. The
-    // reader owns the process handle and closes it on exit, so don't close it
-    // here (that would double-close a handle the reader is still using).
-    // A handle that the reader closed meanwhile simply makes TerminateProcess
-    // fail harmlessly.
-    HANDLE proc = g_logcatProcess.load();
-    if (proc != nullptr) {
-        TerminateProcess(proc, 0);
-    }
-#endif
-    g_logcatRunning = false;
-    state.logcatStreaming = false;
-}
-
-#ifdef _WIN32
-void streamLogcatWorker(const std::string& adb, const std::string& serial) {
-    // Clear the device log buffer so the stream starts fresh (no old history).
-    runProcess(adb, core::logcatClearArgs(serial), 15000);
-
-    const std::wstring cmd = core::quoteWinArg(core::toWide(adb)) + L" -s " + core::quoteWinArg(core::toWide(serial)) + L" logcat";
-    HANDLE readPipe = nullptr;
-    HANDLE writePipe = nullptr;
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) {
-        g_logcatRunning = false;
-        return;
-    }
-    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    si.hStdOutput = writePipe;
-    si.hStdError = writePipe;
-    PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
-    mutableCmd.push_back(L'\0');
-    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
-                        nullptr, nullptr, &si, &pi)) {
-        CloseHandle(readPipe);
-        CloseHandle(writePipe);
-        g_logcatRunning = false;
-        return;
-    }
-    CloseHandle(writePipe);
-    core::adoptChildProcess(pi.hProcess);  // die with us, not after us
-    CloseHandle(pi.hThread);
-    g_logcatProcess = pi.hProcess;
-
-    constexpr std::size_t kMaxLines = 3000;
-    std::string pending;
-    char buffer[8192];
-    auto lastWake = std::chrono::steady_clock::now();
-
-    auto drain = [&](const char* data, DWORD len) {
-        pending.append(data, len);
-        std::size_t pos = 0;
-        while ((pos = pending.find('\n')) != std::string::npos) {
-            std::string line = pending.substr(0, pos);
-            pending.erase(0, pos + 1);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            {
-                std::lock_guard<std::mutex> lock(g_logcatMutex);
-                g_logcatLines.push_back(std::move(line));
-                if (g_logcatLines.size() > kMaxLines) {
-                    const std::size_t excess = g_logcatLines.size() - kMaxLines;
-                    g_logcatLines.erase(g_logcatLines.begin(),
-                                        g_logcatLines.begin() + static_cast<std::ptrdiff_t>(excess));
-                }
-            }
-            g_logcatSeq.fetch_add(1);
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastWake).count() >= 30) {
-            lastWake = now;
-            app::requestUpdate();
-        }
-    };
-
-    for (;;) {
-        if (g_logcatStop.load()) break;
-        DWORD available = 0;
-        if (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
-            const DWORD toRead = available > static_cast<DWORD>(sizeof(buffer))
-                                     ? static_cast<DWORD>(sizeof(buffer)) : available;
-            DWORD read = 0;
-            if (ReadFile(readPipe, buffer, toRead, &read, nullptr) && read > 0) {
-                drain(buffer, read);
-            }
-            continue;
-        }
-        const DWORD wait = WaitForSingleObject(pi.hProcess, 0);
-        if (wait == WAIT_OBJECT_0) break;
-        Sleep(20);
-    }
-    // Drain the remaining tail before tearing down.
-    for (;;) {
-        DWORD available = 0;
-        if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) || available == 0) break;
-        const DWORD toRead = available > static_cast<DWORD>(sizeof(buffer))
-                                 ? static_cast<DWORD>(sizeof(buffer)) : available;
-        DWORD read = 0;
-        if (!ReadFile(readPipe, buffer, toRead, &read, nullptr) || read == 0) break;
-        drain(buffer, read);
-    }
-    // Publish "no process" BEFORE closing the handle: once stopLogcat() on the
-    // UI thread can no longer observe this value, nobody else holds it and it
-    // is safe for the reader thread to close.
-    HANDLE expected = pi.hProcess;
-    g_logcatProcess.compare_exchange_strong(expected, nullptr);
-    // TerminateProcess is a request: wait for the process to actually be gone
-    // before closing the handle and reporting, so we never leave a half-killed
-    // adb behind.
-    TerminateProcess(pi.hProcess, 0);
-    WaitForSingleObject(pi.hProcess, 5000);
-    CloseHandle(pi.hProcess);
-    CloseHandle(readPipe);
-    g_logcatRunning = false;
-    app::requestUpdate();
-}
-#endif  // _WIN32
-
-void startLogcat() {
-    if (state.selectedDevice.empty()) return;
-    stopLogcat();
-    {
-        std::lock_guard<std::mutex> lock(g_logcatMutex);
-        g_logcatLines.clear();
-    }
-    g_logcatSeq = 0;
-    state.logcatLastSeq = 0;
-    state.logcatScroll.set(0.0f);
-    logcatRegexClear();  // recompile with the current filter on next render
-    g_logcatStop = false;
-    g_logcatRunning = true;
-    state.logcatStreaming = true;
-    const std::string adb = state.adbPath;
-    const std::string serial = state.selectedDevice;
-#ifdef _WIN32
-    std::thread([](std::string a, std::string s) { streamLogcatWorker(a, s); }, adb, serial).detach();
-#else
-    g_logcatRunning = false;
-    state.logcatStreaming = false;
-#endif
-}
-
-void openLogcat() {
-    if (state.selectedDevice.empty()) return;
-    state.logcatOpen = true;
-    startLogcat();
-}
-
 // --- Screen mirroring (launch scrcpy) ---
 std::string executableDir() {
 #ifdef _WIN32
@@ -3291,34 +3052,21 @@ void mirrorDefaultSize(int& outW, int& outH) {
                                           (static_cast<float>(devW) / static_cast<float>(devH))));
 }
 
-// Applies the mirror window geometry: two thirds of the whole screen height, phone aspect
-// ratio, centred. Size AND position are both set here rather than relying on the numbers
-// passed to openWindow, whose unit convention (logical vs physical) is easy to get wrong.
-void applyMirrorGeometry(HWND hwnd) {
-    if (hwnd == nullptr) return;
+// Size and screen position for the mirror window: two thirds of the whole screen height at
+// the phone aspect ratio, centred.
+//
+// Both go to openWindow so the window is *created* there. Doing it afterwards is what caused
+// the reported flash: openWindow only queues a request, the framework creates the window on
+// the next frame at its default spot, and the previous implementation then needed a thread
+// polling for the window before it could call SetWindowPos - so at least one frame was always
+// drawn in the wrong place.
+void mirrorDefaultGeometry(int& outW, int& outH, int& outX, int& outY) {
     int screenW = 0;
     int screenH = 0;
     primaryScreenSize(screenW, screenH);
-    int w = 0;
-    int h = 0;
-    mirrorDefaultSize(w, h);
-    const int x = (screenW - w) / 2;
-    const int y = (screenH - h) / 2;
-    SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-// The mirror window is created by the framework shortly after openWindow, and scrcpyEmbedLoop
-// cannot be used for this: it waits for the scrcpy video window too, which never appears when
-// scrcpy cannot connect. This watcher only needs the mirror window itself.
-void watchMirrorWindow() {
-    for (int attempt = 0; attempt < 120; ++attempt) {
-        HWND hwnd = FindWindowW(nullptr, L"adb_browser_mirror");
-        if (hwnd != nullptr) {
-            applyMirrorGeometry(hwnd);
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    mirrorDefaultSize(outW, outH);
+    outX = (screenW - outW) / 2;
+    outY = (screenH - outH) / 2;
 }
 
 struct FindWindowByPid {
@@ -3553,13 +3301,19 @@ void openMirror() {
     core::adoptChildProcess(pi.hProcess);  // the mirror window closes with the app
     g_scrcpyProcess = pi.hProcess;
     state.scrcpyOpen = true;
-    // Two thirds of the whole screen height at the phone aspect ratio, then centred (see
-    // mirrorDefaultSize / centreMirrorWindow).
+    // Two thirds of the whole screen height at the phone aspect ratio, centred - and passed at
+    // creation so the first frame is already in the right place.
     int mirrorW = 0;
     int mirrorH = 0;
-    mirrorDefaultSize(mirrorW, mirrorH);
-    app::openWindow("adb_browser_mirror", mirrorW, mirrorH, composeMirrorWindow);
-    std::thread([] { watchMirrorWindow(); }).detach();
+    int mirrorX = 0;
+    int mirrorY = 0;
+    mirrorDefaultGeometry(mirrorW, mirrorH, mirrorX, mirrorY);
+    app::openWindow(app::DslWindowConfig{}
+                        .title("adb_browser_mirror")
+                        .pageId("adb_browser_mirror")
+                        .windowSize(mirrorW, mirrorH)
+                        .windowPosition(mirrorX, mirrorY),
+                    composeMirrorWindow);
     std::thread([] { scrcpyEmbedLoop(); }).detach();
 #else
     state.scrcpyOpen = true;
@@ -5207,7 +4961,6 @@ void closeTopmost() {
     else if (state.promptOpen) state.promptOpen = false;
     else if (state.commandOutputOpen) state.commandOutputOpen = false;
     else if (state.deviceInfoOpen) state.deviceInfoOpen = false;
-    else if (state.logcatOpen) state.logcatOpen = false;
     // The preview's find bar sits inside the dialog, so Escape closes it first and a
     // second Escape closes the dialog itself.
     else if (state.textPreviewSearchOpen) closeTextPreviewSearch();
@@ -5231,7 +4984,7 @@ void closeTopmost() {
 
 bool anyOverlayOpen() {
     return state.settingsOpen || state.updateOpen || state.confirmDialogOpen || state.promptOpen ||
-           state.commandOutputOpen || state.deviceInfoOpen || state.logcatOpen ||
+           state.commandOutputOpen || state.deviceInfoOpen ||
            state.textPreviewOpen || state.imagePreviewOpen || state.propertiesOpen ||
            state.appManageOpen || state.helpOpen || state.bookmarkManageOpen ||
            state.commandManageOpen || state.externalEditListOpen ||
@@ -6296,7 +6049,7 @@ void composeTitleBar(eui::Ui& ui, float W, float h) {
         {"titlebar.max", 0.157f, 0.784f, 0.251f, 0xF065, 6.5f,
          [] { app::toggleMaximizeWindow(); }},
         {"titlebar.close", 1.000f, 0.373f, 0.341f, 0xF00D, 7.0f,
-         [] { stopLogcat(); saveWindowState(); app::closeWindow(); }},
+         [] { saveWindowState(); app::closeWindow(); }},
     };
     // macOS shows all three glyphs at once, as soon as the pointer is anywhere over the
     // cluster - not only over the dot under the cursor. Every glyph is bound to all three
@@ -6558,8 +6311,8 @@ constexpr float kButtonSizes[] = {60.0f, 54.0f, 48.0f, 42.0f};
     toolButton(ui, "topbar.info", infoX, y, h, h, 0xF05A, "", false, !state.selectedDevice.empty(),
                [] { openDeviceInfo(); }, 16.0f);
     composeHoverTip(ui, "topbar.info.tip", "topbar.info.bg", "设备信息", infoX + h * 0.5f, y + h + 4.0f);
-    const float logcatX = infoX + h + 6.0f;
-    // Thin separators so fifteen equally sized icons read as groups (devices / tools /
+    const float hiddenX = infoX + h + 6.0f;
+    // Thin separators so fourteen equally sized icons read as groups (devices / tools /
     // editing) instead of one undifferentiated wall.
     const auto groupSeparator = [&](float sx) {
         ui.rect("topbar.sep." + std::to_string(static_cast<int>(sx)))
@@ -6567,11 +6320,7 @@ constexpr float kButtonSizes[] = {60.0f, 54.0f, 48.0f, 42.0f};
             .color(kBorder)
             .build();
     };
-    groupSeparator(logcatX);
-    toolButton(ui, "topbar.logcat", logcatX, y, h, h, 0xF15C, "", false, !state.selectedDevice.empty(),
-               [] { openLogcat(); }, 16.0f);
-    composeHoverTip(ui, "topbar.logcat.tip", "topbar.logcat.bg", "logcat", logcatX + h * 0.5f, y + h + 4.0f);
-    const float hiddenX = logcatX + h + 6.0f;
+    groupSeparator(hiddenX);
     toolButton(ui, "topbar.hidden", hiddenX, y, h, h, state.showHidden ? 0xF06E : 0xF070, "", false, true,
                [] { state.showHidden = !state.showHidden; refreshListing(); saveSettings(); }, 16.0f);
     composeHoverTip(ui, "topbar.hidden.tip", "topbar.hidden.bg",
@@ -7171,6 +6920,8 @@ void composeDeviceMenu(eui::Ui& ui, float w, float h) {
             state.currentPath = "/";
             state.pathInput = state.currentPath;
             state.selectedEntry.clear();
+            state.entries.clear();
+            state.displayEntries.clear();
             resetListScroll();
             refreshListing(true);
         } else if (idx == n) {
@@ -8995,165 +8746,6 @@ void composeDeviceInfoDialog(eui::Ui& ui, float w, float h) {
         .build();
 }
 
-void composeLogcatDialog(eui::Ui& ui, float w, float h) {
-    components::dialog(ui, "logcat.dialog")
-        .screen(w, h)
-        .open(state.logcatOpen)
-        .theme(themeTokens())
-        .size(760.0f, 560.0f)
-        .zIndex(1300)
-        .content([&] {
-            const float pw = 760.0f, ph = 560.0f;
-            const bool streaming = g_logcatRunning.load();
-
-            ui.text("logcat.title")
-                .x(24.0f).y(16.0f).size(160.0f, 28.0f)
-                // The title used to claim "real-time" even while the badge next to it said
-                // 已停止 - the two contradicted each other on screen.
-                .text(streaming ? "logcat（实时）" : "logcat")
-                .fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
-            ui.text("logcat.status")
-                .x(150.0f).y(16.0f).size(120.0f, 28.0f)
-                .text(streaming ? "\xE2\x97\x8F 运行中" : "\xE2\x97\x8B 已停止")
-                .fontSize(13.0f).lineHeight(13.0f)
-                .color(streaming ? kGreen : kMuted)
-                .verticalAlign(eui::VerticalAlign::Center).build();
-            toolButton(ui, "logcat.close", pw - 24.0f - 32.0f, 12.0f, 32.0f, 28.0f,
-                       0xF00D, "", false, true, [] {
-                           state.logcatOpen = false;
-                           stopLogcat();
-                           logcatRegexClear();
-                       }, 12.0f);
-
-            // Filter (case-insensitive regex).
-            const float actionW = 104.0f;
-            const float filterW = pw - 24.0f * 2.0f - actionW - 8.0f;
-            ui.stack("logcat.filter.wrap")
-                .x(24.0f).y(52.0f).size(filterW, 36.0f)
-                .content([&] {
-                    components::input(ui, "logcat.filter")
-                        .theme(themeTokens()).size(filterW, 36.0f).fontSize(13.0f)
-                        .placeholder("正则过滤，不区分大小写（如 error|fatal）")
-                        .value(state.logcatFilter)
-                        .onChange([](const std::string& v) { state.logcatFilter = v; })
-                        .build();
-                }).build();
-
-            const float actionX = 24.0f + filterW + 8.0f;
-            if (streaming) {
-                toolButton(ui, "logcat.clear", actionX, 52.0f, actionW, 36.0f,
-                           0xF12D, "清空", false, true, [] {
-                    std::lock_guard<std::mutex> lock(g_logcatMutex);
-                    g_logcatLines.clear();
-                    g_logcatSeq = 0;
-                    state.logcatLastSeq = 0;
-                    state.logcatScroll.set(0.0f);
-                });
-            } else {
-                toolButton(ui, "logcat.restart", actionX, 52.0f, actionW, 36.0f,
-                           0xF021, "重新开始", true, true, [] { startLogcat(); });
-            }
-            // Long lines used to be clipped at the right edge with no ellipsis, no wrap and
-            // no horizontal scroll - and a crash stack trace is exactly the text that runs
-            // long. This toggles between the dense one-line-per-entry view and a wrapped
-            // one, so the whole line is always reachable.
-            toolButton(ui, "logcat.wrap", actionX + actionW + 8.0f, 52.0f, actionW, 36.0f,
-                       0xF15C, state.logcatWrap ? "换行：开" : "换行：关", state.logcatWrap, true,
-                       [] { state.logcatWrap = !state.logcatWrap; state.logcatScroll.set(1.0e9f); });
-
-            // Build the filtered view under the buffer lock.
-            const bool regexOk = logcatEnsureRegex();
-            std::vector<std::string> shown;
-            {
-                std::lock_guard<std::mutex> lock(g_logcatMutex);
-                shown.reserve(g_logcatLines.size());
-                for (const std::string& line : g_logcatLines) {
-                    if (logcatLineMatches(line)) shown.push_back(line);
-                }
-                if (shown.size() > 800) {
-                    const std::size_t excess = shown.size() - 800;
-                    shown.erase(shown.begin(), shown.begin() + static_cast<std::ptrdiff_t>(excess));
-                }
-            }
-
-            std::size_t totalLines = 0;
-            { std::lock_guard<std::mutex> lock(g_logcatMutex); totalLines = g_logcatLines.size(); }
-            std::string meta;
-            if (!state.logcatRegexError.empty()) {
-                meta = "正则表达式无效，请修改过滤条件";
-            } else if (state.logcatFilter.empty()) {
-                meta = "共 " + std::to_string(totalLines) + " 行";
-            } else {
-                meta = "共 " + std::to_string(totalLines) + " 行，匹配 " + std::to_string(shown.size()) + " 行";
-            }
-            ui.text("logcat.meta")
-                .x(24.0f).y(94.0f).size(pw - 48.0f, 20.0f)
-                .text(meta)
-                .fontSize(12.0f).lineHeight(12.0f)
-                .color(state.logcatRegexError.empty() ? kMuted : kRose)
-                .build();
-
-            // Auto-scroll to the tail whenever new lines arrived since last frame.
-            const long long seq = g_logcatSeq.load();
-            if (seq != state.logcatLastSeq) {
-                state.logcatLastSeq = seq;
-                state.logcatScroll.set(1.0e9f);  // clamped to the max offset -> bottom
-            }
-
-            components::scrollView(ui, "logcat.list")
-                .x(24.0f).y(118.0f).size(pw - 48.0f, ph - 118.0f - 16.0f)
-                .theme(themeTokens()).scrollbarWidth(8.0f).scrollbarGap(2.0f)
-                .bind(state.logcatScroll)
-                .contentKey("logcat." + std::to_string(shown.size()) + "." + state.logcatFilter)
-                .content([&](eui::Ui& body, float cw, float) {
-                    if (shown.empty()) {
-                        body.text("logcat.empty")
-                            .x(4.0f).y(0.0f).size(cw - 8.0f, 40.0f)
-                            .text(regexOk ? "（等待日志…）" : "（无匹配）")
-                            .fontSize(12.0f).lineHeight(12.0f).color(kMuted).build();
-                        return;
-                    }
-                    const float lineW = cw - 8.0f;
-                    const float pitch = logLinePitch();
-                    // Measure so a wrapped line can be given as many rows as it needs; with
-                    // the fixed pitch the text was simply cut off at the element's width.
-                    const float drawnSize = 12.0f * ::core::runtimeFontScale();
-                    float cursorY = 0.0f;
-                    for (std::size_t i = 0; i < shown.size(); ++i) {
-                        // Monospace + level colour: a log is column-aligned data, and in the
-                        // proportional UI font the timestamp/pid/tag columns wander, which
-                        // makes a stream of lines much harder to scan. The level colour
-                        // (E red, W amber, everything else ink) is what the eye looks for
-                        // first when something went wrong.
-                        float rowH = pitch;
-                        if (state.logcatWrap) {
-                            const float textW = eui::measureTextWidth(shown[i], "Consolas", drawnSize, 400);
-                            const int rows = static_cast<int>(std::ceil(textW / std::max(1.0f, lineW)));
-                            // Cap the growth: one pathological line must not push everything
-                            // else off the screen.
-                            rowH = pitch * static_cast<float>(std::min(std::max(rows, 1), 8));
-                        }
-                        body.text("logcat.line." + std::to_string(i))
-                            .x(4.0f).y(cursorY).size(lineW, rowH)
-                            .text(shown[i]).fontSize(12.0f).lineHeight(12.0f)
-                            .fontFamily("Consolas")
-                            .wrap(state.logcatWrap)
-                            .color(logcatLevelColor(shown[i])).build();
-                        cursorY += rowH;
-                    }
-                })
-                .build();
-        })
-        .onOpenChange([](bool v) {
-            state.logcatOpen = v;
-            if (!v) {
-                stopLogcat();
-                logcatRegexClear();
-            }
-        })
-        .build();
-}
-
 void composeTextPreviewDialog(eui::Ui& ui, float w, float h) {
     components::dialog(ui, "text.preview")
         .screen(w, h)
@@ -9319,7 +8911,7 @@ void composePropertiesDialog(eui::Ui& ui, float w, float h) {
                     int i = 0;
                     while (std::getline(iss, line) && i < 40) {
                         body.text("file.properties.line." + std::to_string(i))
-                            .x(4.0f).y(static_cast<float>(i) * logLinePitch()).size(cw - 8.0f, logLinePitch())
+                            .x(4.0f).y(static_cast<float>(i) * detailLinePitch()).size(cw - 8.0f, detailLinePitch())
                             .text(line).fontSize(13.0f).lineHeight(13.0f).color(kInk).build();
                         ++i;
                     }
@@ -9613,17 +9205,6 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeCommandMenu(ui, W, H);
             composeConfirmDialog(ui, W, H);
             composePromptDialog(ui, W, H);
-            // The logcat stream belongs to the dialog being open - not to whichever code
-            // path happened to close it. The X button and Escape both set the flag
-            // directly, and DialogBuilder::onOpenChange only fires when the *dialog*
-            // closes itself, so neither path ever called stopLogcat(). The reader thread
-            // then kept draining a flooding pipe at full speed and kept asking for a
-            // repaint every 30ms, which pinned a whole core and made the entire UI feel
-            // slow long after logcat was closed. Deriving it from the state covers every
-            // close path, including ones added later.
-            if (!state.logcatOpen && g_logcatRunning.load()) {
-                stopLogcat();
-            }
             // Click-away layer for the settings dropdowns: while one is open, a
             // full-window transparent rect sits under the dialog (zIndex below the
             // dialog's 1300, above the rest of the UI) and closes it. Without this the
@@ -9649,7 +9230,6 @@ void compose(eui::Ui& ui, const eui::Screen& screen) {
             composeCommandManageDialog(ui, W, H);
             composeCommandOutputDialog(ui, W, H);
             composeDeviceInfoDialog(ui, W, H);
-            composeLogcatDialog(ui, W, H);
             composeTextPreviewDialog(ui, W, H);
             composeImagePreviewDialog(ui, W, H);
             composePropertiesDialog(ui, W, H);

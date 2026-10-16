@@ -81,7 +81,7 @@ $exe = "$env:LOCALAPPDATA\Programs\AdbTools\adb_browser.exe"
 | `uninstall` | `uninstall <包名>` | 需要 | **什么都不打印** |
 | `packages` | `packages` | 需要 | 字符串数组 |
 | `screenshot` | `screenshot [输出文件]` | 需要 | 对象 |
-| `logcat` | `logcat -n <行数>` 或 `logcat --timeout <秒>` | 需要 | **无效**（原样输出日志行） |
+ |
 | `version` | `version` | 不需要 | 对象 |
 
 ### devices
@@ -174,22 +174,6 @@ $ adb_browser.exe screenshot --json
   返回的是绝对路径（注意实测输出里用的是反斜杠加正斜杠混排：`C:\Users\me\Downloads/screenshot.png`，
   直接用 `Path` 类处理即可，不要手动拼字符串）。
 
-### logcat
-
-```console
-$ adb_browser.exe logcat -n 2
-01-01 12:00:00.000  1234  5678 I FakeTag : fake logcat line 1
-01-01 12:00:00.100  1234  5678 W FakeTag : fake logcat line 2
-$ adb_browser.exe logcat --timeout 5 --grep crash
-$ adb_browser.exe logcat --clear -n 50
-```
-
-- **必须给 `-n <行数>` 或 `--timeout <秒>`**，否则会一直流式输出（这也是它跟别的命令不一样的地方：
-  它是边收边打印的，不是收完再打印）。
-- `--grep <文本>` 是**大小写不敏感的包含匹配**（不是正则）。
-- `--clear` 先清空设备日志缓冲。
-- **无法识别的参数原样传给 `adb logcat`**，所以 `-s ActivityManager`、`*:W` 这些过滤语法照常可用。
-- 无匹配时 stdout 为空、退出码仍是 0。
 
 ### 内置超时（实测自 `cli/cli.cpp`）
 
@@ -415,7 +399,7 @@ $env:FAKE_PHONE_ROOT  = "$PWD\build\fake-phone"  # "手机"的文件系统
 ```
 
 假 adb 支持：`devices` / `version` / `shell cat|ls -la|mkdir|rm|pm list packages|screencap|echo` /
-`push` / `pull` / `logcat`。**它的行为跟真机一致的部分**：列表格式、写入标记协议、
+`push` / `pull`。**它的行为跟真机一致的部分**：列表格式、写入标记协议、
 `push` 到目录补文件名、`ls` 不存在的路径返回非 0。**不一致的部分**：数据不真实（时间戳固定、
 包名是假的）、没有权限/离线/未授权等真实故障模拟。所以它适合验证"我的代码有没有正确解析和判定"，
 不适合验证"这根线插好了没有"。
@@ -431,7 +415,7 @@ $env:FAKE_PHONE_ROOT  = "$PWD\build\fake-phone"  # "手机"的文件系统
 - **大文件/目录树没有进度输出**：`push`/`pull` 只在结束时给结果。要进度就自己分片或改用
   `adb` 原生命令并自行解析。
 - **没有递归目录 pull/push 的语义封装**：`pull <目录>` 依赖 adb 自己递归，程序不报告每文件结果。
-- **`logcat` 不支持 `--json`**：它是流，请自己解析文本行（格式就是 `adb logcat` 的默认格式）。
+
 - **`mkdir` / `uninstall` 的 `--json` 不输出 JSON**（见第 3 节）。
 - **`--serial` 不校验设备是否存在**：写了就照用，所以 `list --serial 不存在的序列号` 会拿到 adb 的报错。
 - **路径里的引号由调用方处理**：`adb_browser.exe` 自己不会帮你转义 shell 元字符
@@ -458,8 +442,7 @@ $env:FAKE_PHONE_ROOT  = "$PWD\build\fake-phone"  # "手机"的文件系统
 6. 参数按数组传（不要拼 shell 字符串）；路径可能含空格与非 ASCII 字符。
 7. 设备选择：只有一台可用设备时可省略 --serial；多台必须指定，否则退出码 1 并列出候选。
 8. push/pull/rm 是批量命令：每个都会尝试，用 JSON 里的 failed / failures 判断部分失败。
-9. 需要超时保护：外壳自己设超时（push/pull 内部上限 10 分钟，install 5 分钟，
-   logcat 必须给 -n 或 --timeout 否则永不返回）。
+9. 需要超时保护：外壳自己设超时（push/pull 内部上限 10 分钟，install 5 分钟）。
 10. 没有真机时可以按 cli/AI-INTEGRATION.md 第 7 节用 tools/fakeadb.cpp 造一个假 adb 自测，
     但最终要在一台真机上跑一遍冒烟测试：version --json、devices --json、list /sdcard --json。
 ```
@@ -481,7 +464,7 @@ foreach ($case in @(
     @('rm','/sdcard/CliTest','--json'), @('shell','echo','hello'),
     @('packages','--json'), @('install','.\dummy.apk','--json'),
     @('uninstall','com.example.alpha','--json'), @('screenshot','.\shot.png','--json'),
-    @('logcat','-n','2'), @('list'))) {
+    @('list'))) {
   $o = "$env:TEMP\o.txt"; $e = "$env:TEMP\e.txt"
   $p = Start-Process $exe -ArgumentList $case -NoNewWindow -Wait -PassThru `
        -RedirectStandardOutput $o -RedirectStandardError $e

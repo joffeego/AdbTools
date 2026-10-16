@@ -121,8 +121,6 @@ std::vector<std::string> clearAppDataArgs(const std::string& serial, const std::
 // screenshot hop: `adb -s <serial> exec-out screencap -p`
 std::vector<std::string> screencapArgs(const std::string& serial);
 
-// `adb -s <serial> logcat -c`
-std::vector<std::string> logcatClearArgs(const std::string& serial);
 
 // `adb connect <host:port>`
 std::vector<std::string> connectArgs(const std::string& hostPort);
