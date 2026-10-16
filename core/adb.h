@@ -29,6 +29,7 @@ struct FsEntry {
     bool isOther = false;  // not a regular file, directory or symlink
     long long size = 0;
     std::string perms;
+    std::string owner;  // `ls -la` field 3 (the user that owns it)
     std::string date;
     std::string linkTarget;
 };

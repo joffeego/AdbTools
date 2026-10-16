@@ -98,6 +98,7 @@ ADB_TEST(parseLsLa_reads_iso_dates_and_skips_total) {
     ADB_CHECK_EQ(ADB_AT(entries, 0).name, std::string(".7934039b"));
     ADB_CHECK(ADB_AT(entries, 0).isDir);
     ADB_CHECK(!ADB_AT(entries, 0).isLink);
+    ADB_CHECK_EQ(ADB_AT(entries, 0).owner, std::string("media_rw"));
     ADB_CHECK_EQ(ADB_AT(entries, 0).date, std::string("2025-12-29 03:11"));
     ADB_CHECK_EQ(ADB_AT(entries, 1).size, 32LL);
     ADB_CHECK(!ADB_AT(entries, 1).isDir);
@@ -112,6 +113,7 @@ ADB_TEST(parseLsLa_reads_month_dates_and_year_only) {
     const std::vector<FsEntry> entries = parseLsLa(kLsMonthDate);
     ADB_CHECK_EQ(entries.size(), static_cast<std::size_t>(3));
     ADB_CHECK_EQ(ADB_AT(entries, 0).name, std::string("dcim"));
+    ADB_CHECK_EQ(ADB_AT(entries, 0).owner, std::string("root"));
     ADB_CHECK_EQ(ADB_AT(entries, 0).date, std::string("Jan 12 09:30"));
     // "Dec  3  2024" - the double space collapses into the date as well.
     ADB_CHECK_EQ(ADB_AT(entries, 1).name, std::string("notes.txt"));

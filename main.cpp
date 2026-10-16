@@ -5603,14 +5603,19 @@ struct Columns {
     float sizeX = 0.0f;
     float dateX = 0.0f;
     float permsX = 0.0f;
+    float ownerX = 0.0f;
 };
 
 Columns columns(float contentWidth) {
+    const float ownerW = 92.0f;
     const float permsW = 128.0f;
     const float dateW = 130.0f;
     const float sizeW = 84.0f;
     Columns c;
-    c.permsX = contentWidth - permsW;
+    // Laid out right to left, owner last: the same order the file listing reads in, and the
+    // narrowest column at the edge where a truncated value costs the least.
+    c.ownerX = contentWidth - ownerW;
+    c.permsX = c.ownerX - permsW;
     c.dateX = c.permsX - dateW;
     c.sizeX = c.dateX - sizeW;
     c.nameW = c.sizeX - 34.0f - 8.0f;
@@ -5779,6 +5784,19 @@ void composeFileRow(eui::Ui& ui, const std::string& rowId, std::int64_t index, f
                 .horizontalAlign(eui::HorizontalAlign::Right)
                 .verticalAlign(eui::VerticalAlign::Center)
                 .build();
+
+            // Owner (root / shell / u0_a123...): short, so it gets truncation rather than a
+            // tooltip - the useful part of these names is at the front.
+            ui.text(rowId + ".owner")
+                .x(c.ownerX).y(0.0f).size(86.0f, h)
+                .text(ellipsizeToWidth(e.owner, 84.0f, 12.0f))
+                .fontSize(12.0f)
+                .lineHeight(12.0f)
+                .fontFamily("")
+                .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
         })
         .build();
 }
@@ -5821,6 +5839,16 @@ void composeHeader(eui::Ui& ui, float x, float y, float w, float h) {
     ui.text("hdr.perms")
         .x(x + c.permsX).y(y).size(122.0f, h)
         .text("权限")
+        .fontSize(13.0f)
+        .lineHeight(13.0f)
+        .color(kMuted)
+        .horizontalAlign(eui::HorizontalAlign::Right)
+        .verticalAlign(eui::VerticalAlign::Center)
+        .build();
+    // Not sortable: the header row only offers the three orders the listing supports.
+    ui.text("hdr.owner")
+        .x(x + c.ownerX).y(y).size(86.0f, h)
+        .text("所有者")
         .fontSize(13.0f)
         .lineHeight(13.0f)
         .color(kMuted)

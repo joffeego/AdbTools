@@ -127,6 +127,7 @@ std::vector<FsEntry> parseLsLa(const std::string& output) {
 
         FsEntry e;
         e.perms = tokens[0];
+        e.owner = tokens[2];  // perms links owner group size ...
         if (!e.perms.empty()) {
             char c = e.perms[0];
             e.isDir = (c == 'd');
