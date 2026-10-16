@@ -6914,6 +6914,40 @@ void composeStatusBar(eui::Ui& ui, float x, float y, float w, float h) {
             .build();
     }
 
+    // Between the writable note and the storage readout: one slot, most important first.
+    // While a transfer runs the progress bar and its label (drawn below, at the right) already
+    // say what is happening, so this slot is only used when nothing is transferring.
+    if (!state.busy) {
+        const float storageW = state.storageTotalKb > 0 ? 288.0f : 96.0f;
+        const float extraX = x + w * 0.59f;
+        // 8px short of the storage group: right-aligned text that ends exactly where the bar
+        // begins reads as if the two were joined.
+        const float extraW = (x + w - storageW - 8.0f) - extraX;
+        std::string extra;
+        if (!state.selectedSet.empty()) {
+            long long selectedBytes = 0;
+            for (const FsEntry& entry : state.entries) {
+                if (state.selectedSet.count(entry.name) != 0) selectedBytes += entry.size;
+            }
+            extra = "已选 " + std::to_string(state.selectedSet.size()) + " 项";
+            if (selectedBytes > 0) extra += " · " + core::formatSize(selectedBytes);
+        } else if (!state.selectedDevice.empty() && !state.loading) {
+            // Nothing selected: the queue is idle by definition (one transfer at a time), and
+            // saying so is the point of the element in the mockup.
+            extra = "传输队列：空闲";
+        }
+        if (!extra.empty() && extraW > 70.0f) {
+            ui.text("status.extra")
+                .x(extraX).y(y).size(extraW, h)
+                .text(ellipsizeToWidth(extra, extraW - 8.0f, 12.5f))
+                .fontSize(12.5f).lineHeight(12.5f)
+                .color(kMuted)
+                .horizontalAlign(eui::HorizontalAlign::Right)
+                .verticalAlign(eui::VerticalAlign::Center)
+                .build();
+        }
+    }
+
     if (state.busy) {
         const float barW = std::min(w * 0.22f, 260.0f);
         const float barX = x + w - barW - 8.0f;
