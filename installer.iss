@@ -6,7 +6,7 @@
 ;   iscc installer.iss /DMyAppVersion=X.Y.Z   (the CI passes the tag version here)
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.10.28"
+  #define MyAppVersion "0.10.29"
 #endif
 
 ; VERSIONINFO wants four components; the release tag only has three.
